@@ -1,0 +1,40 @@
+name: Release ARM 32-bit Binaries
+permissions:
+  "contents": "write"
+
+on:
+  pull_request:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+
+jobs:
+  release:
+    name: Release - ${{ matrix.platform.os-name }}
+    strategy:
+      matrix:
+        platform:
+          - os-name: Linux-x86_64
+            runs-on: ubuntu-24.04
+            target: arm-unknown-linux-gnueabihf
+
+          - os-name: Linux-x86_64
+            runs-on: ubuntu-24.04
+            target: arm-unknown-linux-musleabihf
+
+    runs-on: ${{ matrix.platform.runs-on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.platform.target }}
+          args: "--locked --release"
+          strip: true
+      - name: Publish artifacts and release
+        uses: houseabsolute/actions-rust-release@v0
+        with:
+          executable-name: picture-frame-ui
+          target: ${{ matrix.platform.target }}
