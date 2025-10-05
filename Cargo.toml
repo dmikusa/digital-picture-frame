@@ -2,6 +2,7 @@
 name = "picture-frame-ui"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/dmikusa/digital-picture-frame"
 
 [dependencies]
 eframe = "0.32.3"
@@ -13,3 +14,11 @@ retry = "2.1.0"
 log = "0.4.28"
 anyhow = "1.0.100"
 url = "2.5.7"
+
+[dev-dependencies]
+tempfile = "3.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
