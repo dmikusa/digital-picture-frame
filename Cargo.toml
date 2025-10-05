@@ -17,8 +17,3 @@ url = "2.5.7"
 
 [dev-dependencies]
 tempfile = "3.0"
-
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
