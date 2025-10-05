@@ -29,7 +29,7 @@ pub fn run<T: PhotoLoader + 'static>(mut photo_loader: T) -> result::Result<(), 
         Ok(p) => p,
         Err(e) => {
             return Err(UiErrors::FailedToLoadPhoto(
-                format!("Failed to load initial photo"),
+                "Failed to load initial photo".to_string(),
                 e,
             ));
         }
@@ -107,21 +107,19 @@ pub fn run<T: PhotoLoader + 'static>(mut photo_loader: T) -> result::Result<(), 
             });
 
             // Draw next image on top if we're in transition (fading in)
-            if let Some(next) = &next_pic {
-                if next_alpha > 0.0 {
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        ui.centered_and_justified(|ui| {
-                            ui.add(
-                                Image::new(next.to_string())
-                                    .maintain_aspect_ratio(true)
-                                    .show_loading_spinner(false)
-                                    .tint(egui::Color32::from_white_alpha(
-                                        (next_alpha * 255.0) as u8,
-                                    )),
-                            );
-                        });
+            if let Some(next) = &next_pic
+                && next_alpha > 0.0
+            {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.add(
+                            Image::new(next.to_string())
+                                .maintain_aspect_ratio(true)
+                                .show_loading_spinner(false)
+                                .tint(egui::Color32::from_white_alpha((next_alpha * 255.0) as u8)),
+                        );
                     });
-                }
+                });
             }
         });
 

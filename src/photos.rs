@@ -78,7 +78,6 @@ mod tests {
     #[test]
     fn test_load_next_photo_with_single_file() {
         let temp_dir = create_test_directory_with_files(&["photo1.jpg"]);
-        println!("Temp dir path: {}", temp_dir.path().display());
         let mut loader = FilePhotoLoader::new(temp_dir.path().to_string_lossy().to_string());
 
         let result = loader.load_next_photo();
@@ -106,12 +105,6 @@ mod tests {
         let result3 = loader.load_next_photo();
         assert!(result3.is_ok());
 
-        println!(
-            "Loaded URLs: {}, {}, {}",
-            result1.as_ref().unwrap(),
-            result2.as_ref().unwrap(),
-            result3.as_ref().unwrap()
-        );
         // Verify they're different URLs
         let url1 = result1.unwrap();
         let url2 = result2.unwrap();
