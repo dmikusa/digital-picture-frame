@@ -58,3 +58,6 @@ jobs:
         with:
           executable-name: picture-frame-ui
           target: ${{ matrix.platform.target }}
+          extra-files: |
+            LICENSE
+            README.md
