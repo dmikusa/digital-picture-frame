@@ -1,4 +1,4 @@
-name: Release ARM 32-bit Binaries
+name: Release Binaries
 permissions:
   "contents": "write"
 
