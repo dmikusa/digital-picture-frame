@@ -16,28 +16,54 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use log::{debug, error};
+use log::{debug, error, info};
+use picture_frame_ui::memory::MemoryMonitor;
 use picture_frame_ui::photos::FilePhotoLoader;
 use picture_frame_ui::ui;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 fn main() {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
 
+    // Initialize memory monitoring
+    let memory_monitor = Rc::new(RefCell::new(MemoryMonitor::new()));
+    let initial_stats = memory_monitor.borrow_mut().check_memory();
+    info!(
+        "Application started. Initial memory: {}",
+        MemoryMonitor::format_memory_human(initial_stats.current_memory_kb)
+    );
+
     debug!("Creating Photo Loader from base directory");
     let photo_loader = FilePhotoLoader::new(String::from("/Users/dmikusa/Pictures/BackgroundPics"));
 
+    // Check memory after photo loader creation
+    let after_loader_stats = memory_monitor.borrow_mut().check_memory();
+    info!(
+        "Photo loader created. Memory: {} (growth: +{})",
+        MemoryMonitor::format_memory_human(after_loader_stats.current_memory_kb),
+        MemoryMonitor::format_memory_human(after_loader_stats.memory_growth_kb)
+    );
+
     debug!("Starting UI");
-    match ui::run(photo_loader) {
+    match ui::run(photo_loader, memory_monitor.clone()) {
         Ok(_) => (),
         Err(e) => match e {
-            ui::UiErrors::FailedToLoadPhoto(msg, err) => {
-                error!("Photo Loading Error: {}: {}", msg, err);
+            ui::UiErrors::InitializationError => {
+                error!("UI Initialization Error");
             }
-            ui::UiErrors::UiError(res) => {
-                if let Err(err) = res {
-                    error!("UI Error: {}", err);
-                }
+            ui::UiErrors::RuntimeError => {
+                error!("UI Runtime Error");
             }
         },
     }
+
+    // Final memory check
+    let final_stats = memory_monitor.borrow_mut().check_memory();
+    info!(
+        "Application finished. Final memory: {} (peak: {}, total growth: +{})",
+        MemoryMonitor::format_memory_human(final_stats.current_memory_kb),
+        MemoryMonitor::format_memory_human(final_stats.peak_memory_kb),
+        MemoryMonitor::format_memory_human(final_stats.memory_growth_kb)
+    );
 }

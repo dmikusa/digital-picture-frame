@@ -16,14 +16,36 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use crate::memory::MemoryMonitor;
 use anyhow::Result;
 use log::{debug, info};
+use std::cell::RefCell;
 use std::fs;
 use std::iter::Peekable;
+use std::rc::Rc;
 use url::Url;
 
 pub trait PhotoLoader {
     fn load_next_photo(&mut self) -> Result<Url>;
+
+    /// Load next photo with optional memory monitoring
+    fn load_next_photo_with_monitoring(
+        &mut self,
+        memory_monitor: Option<&Rc<RefCell<MemoryMonitor>>>,
+    ) -> Result<Url> {
+        let url = self.load_next_photo()?;
+
+        if let Some(monitor) = memory_monitor {
+            let stats = monitor.borrow_mut().check_memory();
+            debug!(
+                "Photo loaded: {}. Memory: {}",
+                url,
+                MemoryMonitor::format_memory_human(stats.current_memory_kb)
+            );
+        }
+
+        Ok(url)
+    }
 }
 
 pub struct FilePhotoLoader {

@@ -16,138 +16,177 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use crate::photos::PhotoLoader;
-use std::{
-    result,
-    time::{Duration, Instant, SystemTime},
-};
+use std::{cell::RefCell, rc::Rc, result};
 
-use anyhow::Error;
-use eframe::{Result, egui};
-use egui::Image;
-use egui_extras;
-use log::{debug, error};
+use iced::{
+    Element, Length, Size, Task, Theme,
+    widget::{column, container, image, text},
+};
+use log::{error, info};
+use url::Url;
+
+use crate::{memory::MemoryMonitor, photos::PhotoLoader};
 
 pub enum UiErrors {
-    FailedToLoadPhoto(String, Error),
-    UiError(Result),
+    InitializationError,
+    RuntimeError,
 }
 
-pub fn run<T: PhotoLoader + 'static>(mut photo_loader: T) -> result::Result<(), UiErrors> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_active(true)
-            .with_always_on_top()
-            .with_fullscreen(true),
+#[derive(Debug, Clone)]
+pub enum Message {
+    ImageLoaded(Result<iced::widget::image::Handle, String>),
+}
+
+pub struct PictureFrameApp {
+    current_image: Option<iced::widget::image::Handle>,
+    loading_error: Option<String>,
+}
+
+impl PictureFrameApp {
+    pub fn new(
+        flags: (impl PhotoLoader + 'static, Rc<RefCell<MemoryMonitor>>),
+    ) -> (Self, Task<Message>) {
+        let (mut photo_loader, memory_monitor) = flags;
+
+        // Load the first image
+        let task = match photo_loader.load_next_photo_with_monitoring(Some(&memory_monitor)) {
+            Ok(url) => {
+                info!("Loading first image: {}", url);
+                Task::perform(load_image_async(url), Message::ImageLoaded)
+            }
+            Err(e) => {
+                error!("Failed to load first image: {}", e);
+                Task::none()
+            }
+        };
+
+        (
+            Self {
+                current_image: None,
+                loading_error: None,
+            },
+            task,
+        )
+    }
+
+    pub fn title(&self) -> String {
+        "Digital Picture Frame".to_string()
+    }
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::ImageLoaded(result) => match result {
+                Ok(handle) => {
+                    self.current_image = Some(handle);
+                    self.loading_error = None;
+                    info!("Image loaded successfully");
+                }
+                Err(error) => {
+                    self.loading_error = Some(error);
+                    error!("Failed to load image: {:?}", self.loading_error);
+                }
+            },
+        }
+        Task::none()
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let content: Element<Message> = if let Some(ref image_handle) = self.current_image {
+            // Display the image, scaling it to fit the window
+            image(image_handle.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if let Some(ref error) = self.loading_error {
+            // Display error message
+            text(format!("Error loading image: {}", error))
+                .size(24)
+                .into()
+        } else {
+            // Display loading message
+            text("Loading image...").size(24).into()
+        };
+
+        container(column![content])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill)
+            .into()
+    }
+
+    pub fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+}
+
+async fn load_image_async(url: Url) -> Result<iced::widget::image::Handle, String> {
+    let start_time = std::time::Instant::now();
+
+    match url.to_file_path() {
+        Ok(path) => {
+            info!("Reading image file: {}", path.display());
+            let read_start = std::time::Instant::now();
+
+            match tokio::fs::read(&path).await {
+                Ok(data) => {
+                    let read_duration = read_start.elapsed();
+                    info!(
+                        "File read completed in {:?} (size: {} bytes)",
+                        read_duration,
+                        data.len()
+                    );
+
+                    let decode_start = std::time::Instant::now();
+                    let handle = iced::widget::image::Handle::from_bytes(data);
+                    let decode_duration = decode_start.elapsed();
+
+                    let total_duration = start_time.elapsed();
+                    info!(
+                        "Image decode completed in {:?}, total loading time: {:?}",
+                        decode_duration, total_duration
+                    );
+
+                    Ok(handle)
+                }
+                Err(e) => Err(format!(
+                    "Failed to read image file {}: {}",
+                    path.display(),
+                    e
+                )),
+            }
+        }
+        Err(_) => Err(format!("Invalid file URL: {}", url)),
+    }
+}
+
+pub fn run<T: PhotoLoader + 'static>(
+    photo_loader: T,
+    memory_monitor: Rc<RefCell<MemoryMonitor>>,
+) -> result::Result<(), UiErrors> {
+    info!("Starting Iced-based picture frame UI");
+
+    let window_settings = iced::window::Settings {
+        size: Size::new(800.0, 600.0),
+        position: iced::window::Position::Centered,
         ..Default::default()
     };
 
-    // App State would go here
-    let mut current_pic = match photo_loader.load_next_photo() {
-        Ok(p) => p,
+    match iced::application(
+        "Digital Picture Frame",
+        PictureFrameApp::update,
+        PictureFrameApp::view,
+    )
+    .window(window_settings)
+    .theme(PictureFrameApp::theme)
+    .run_with(move || PictureFrameApp::new((photo_loader, memory_monitor)))
+    {
+        Ok(()) => {
+            info!("Picture frame UI closed successfully");
+            Ok(())
+        }
         Err(e) => {
-            return Err(UiErrors::FailedToLoadPhoto(
-                "Failed to load initial photo".to_string(),
-                e,
-            ));
+            error!("Picture frame UI error: {}", e);
+            Err(UiErrors::RuntimeError)
         }
-    };
-    let mut next_pic: Option<url::Url> = None;
-    let mut last_update = Instant::now();
-    let mut transition_start: Option<Instant> = None;
-    let photo_duration = Duration::from_secs(10);
-    let fade_duration = Duration::from_secs(2);
-
-    debug!(
-        "Loaded initial photo: {} at {:?}",
-        current_pic,
-        SystemTime::now()
-    );
-
-    eframe::run_simple_native("Photo Frame UI", options, move |ctx, _frame| {
-        egui_extras::install_image_loaders(ctx);
-
-        // Check if it's time to start a transition
-        if last_update.elapsed() > photo_duration && next_pic.is_none() {
-            match photo_loader.load_next_photo() {
-                Ok(p) => {
-                    next_pic = Some(p.clone());
-                    transition_start = Some(Instant::now());
-                    debug!(
-                        "Starting transition to new photo: {} at {:?}",
-                        p,
-                        SystemTime::now()
-                    );
-                }
-                Err(e) => {
-                    error!("Failed to load next photo: {}", e);
-                }
-            }
-        }
-
-        // Handle transition animation
-        let (current_alpha, next_alpha) =
-            if let (Some(next), Some(start)) = (&next_pic, transition_start) {
-                let elapsed = start.elapsed();
-                if elapsed >= fade_duration {
-                    // Transition complete - swap photos
-                    current_pic = next.clone();
-                    next_pic = None;
-                    transition_start = None;
-                    last_update = Instant::now();
-                    debug!("Transition complete, now showing: {}", current_pic);
-                    (1.0, 0.0)
-                } else {
-                    // In transition - crossfade
-                    let progress = elapsed.as_secs_f32() / fade_duration.as_secs_f32();
-                    (1.0 - progress, progress) // Current fades out, next fades in
-                }
-            } else {
-                (1.0, 0.0) // Normal display - current image fully visible
-            };
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Use a custom painter for proper layering
-            let rect = ui.available_rect_before_wrap();
-
-            ui.centered_and_justified(|ui| {
-                // Draw current image (fading out during transition)
-                if current_alpha > 0.0 {
-                    ui.add(
-                        Image::new(current_pic.to_string())
-                            .maintain_aspect_ratio(true)
-                            .show_loading_spinner(false)
-                            .tint(egui::Color32::from_white_alpha(
-                                (current_alpha * 255.0) as u8,
-                            )),
-                    );
-                }
-            });
-
-            // Draw next image on top if we're in transition (fading in)
-            if let Some(next) = &next_pic
-                && next_alpha > 0.0
-            {
-                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.add(
-                            Image::new(next.to_string())
-                                .maintain_aspect_ratio(true)
-                                .show_loading_spinner(false)
-                                .tint(egui::Color32::from_white_alpha((next_alpha * 255.0) as u8)),
-                        );
-                    });
-                });
-            }
-        });
-
-        // Schedule repaints
-        if next_pic.is_some() {
-            ctx.request_repaint(); // Keep animating during transition
-        } else {
-            let time_until_next = photo_duration.saturating_sub(last_update.elapsed());
-            ctx.request_repaint_after(time_until_next);
-        }
-    })
-    .map_err(|e| UiErrors::UiError(Err(e)))
+    }
 }
