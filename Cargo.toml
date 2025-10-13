@@ -8,7 +8,7 @@ repository = "https://github.com/dmikusa/digital-picture-frame"
 [dependencies]
 eframe = "0.32.3"
 egui = "0.32.3"
-egui_extras = { version = "0.32.3", features = ["all_loaders"] }
+egui_extras = { version = "0.33.0", features = ["all_loaders"] }
 image = { version = "0.25.8" }
 env_logger = "0.11.8"
 retry = "2.1.0"
