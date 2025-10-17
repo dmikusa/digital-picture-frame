@@ -16,8 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use gio::File;
-use glib::{ControlFlow, ExitCode};
+use gtk4::gio::File;
+use gtk4::glib::{ControlFlow, ExitCode};
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box, Orientation, Picture, Stack, StackTransitionType};
 use log::{debug, error, info, warn};
@@ -127,9 +127,9 @@ fn build_ui(
     let memory_monitor_clone = memory_monitor.clone();
     let current_picture = Rc::new(RefCell::new(1)); // Track which picture is currently visible
 
-    glib::timeout_add_local(std::time::Duration::from_secs(5), move || {
+    gtk4::glib::timeout_add_local(std::time::Duration::from_secs(5), move || {
         debug!("Timer triggered - loading next photo with crossfade");
-        
+
         let current = *current_picture.borrow();
         let (next_picture, next_name) = if current == 1 {
             (&picture2_clone, "picture2")
@@ -155,11 +155,11 @@ fn build_ui(
 fn create_picture_widget() -> Picture {
     let picture = Picture::new();
     picture.set_can_shrink(true);
-    
+
     // Set content fit to scale down while preserving aspect ratio (GTK 4.8+)
     // For now, we'll just use the deprecated keep_aspect_ratio for compatibility
     picture.set_keep_aspect_ratio(true);
-    
+
     picture.set_alternative_text(Some("Digital Picture Frame Display"));
     picture
 }
