@@ -11,9 +11,12 @@ log = "0.4.28"
 anyhow = "1.0.100"
 url = "2.5.7"
 sysinfo = "0.37.2"
-iced = { version = "0.13.1", features = ["image", "tokio"] }
 image = "0.25"
-tokio = { version = "1.0", features = ["full"] }
+gtk4 = "0.10"
+gdk4 = "0.10"
+gdk-pixbuf = "0.21"
+gio = "0.21"
+glib = "0.21"
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -16,177 +16,123 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::{cell::RefCell, rc::Rc, result};
+use gio::File;
+use glib::ExitCode;
+use gtk4::prelude::*;
+use gtk4::{Application, ApplicationWindow, Box, Orientation, Picture};
+use log::{debug, error, info};
+use std::cell::RefCell;
+use std::rc::Rc;
 
-use iced::{
-    Element, Length, Size, Task, Theme,
-    widget::{column, container, image, text},
-};
-use log::{error, info};
-use url::Url;
+use crate::memory::MemoryMonitor;
+use crate::photos::{FilePhotoLoader, PhotoLoader};
 
-use crate::{memory::MemoryMonitor, photos::PhotoLoader};
-
+#[derive(Debug)]
 pub enum UiErrors {
     InitializationError,
     RuntimeError,
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    ImageLoaded(Result<iced::widget::image::Handle, String>),
-}
-
-pub struct PictureFrameApp {
-    current_image: Option<iced::widget::image::Handle>,
-    loading_error: Option<String>,
-}
-
-impl PictureFrameApp {
-    pub fn new(
-        flags: (impl PhotoLoader + 'static, Rc<RefCell<MemoryMonitor>>),
-    ) -> (Self, Task<Message>) {
-        let (mut photo_loader, memory_monitor) = flags;
-
-        // Load the first image
-        let task = match photo_loader.load_next_photo_with_monitoring(Some(&memory_monitor)) {
-            Ok(url) => {
-                info!("Loading first image: {}", url);
-                Task::perform(load_image_async(url), Message::ImageLoaded)
-            }
-            Err(e) => {
-                error!("Failed to load first image: {}", e);
-                Task::none()
-            }
-        };
-
-        (
-            Self {
-                current_image: None,
-                loading_error: None,
-            },
-            task,
-        )
-    }
-
-    pub fn title(&self) -> String {
-        "Digital Picture Frame".to_string()
-    }
-
-    pub fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::ImageLoaded(result) => match result {
-                Ok(handle) => {
-                    self.current_image = Some(handle);
-                    self.loading_error = None;
-                    info!("Image loaded successfully");
-                }
-                Err(error) => {
-                    self.loading_error = Some(error);
-                    error!("Failed to load image: {:?}", self.loading_error);
-                }
-            },
-        }
-        Task::none()
-    }
-
-    pub fn view(&self) -> Element<'_, Message> {
-        let content: Element<Message> = if let Some(ref image_handle) = self.current_image {
-            // Display the image, scaling it to fit the window
-            image(image_handle.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if let Some(ref error) = self.loading_error {
-            // Display error message
-            text(format!("Error loading image: {}", error))
-                .size(24)
-                .into()
-        } else {
-            // Display loading message
-            text("Loading image...").size(24).into()
-        };
-
-        container(column![content])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center(Length::Fill)
-            .into()
-    }
-
-    pub fn theme(&self) -> Theme {
-        Theme::Dark
-    }
-}
-
-async fn load_image_async(url: Url) -> Result<iced::widget::image::Handle, String> {
-    let start_time = std::time::Instant::now();
-
-    match url.to_file_path() {
-        Ok(path) => {
-            info!("Reading image file: {}", path.display());
-            let read_start = std::time::Instant::now();
-
-            match tokio::fs::read(&path).await {
-                Ok(data) => {
-                    let read_duration = read_start.elapsed();
-                    info!(
-                        "File read completed in {:?} (size: {} bytes)",
-                        read_duration,
-                        data.len()
-                    );
-
-                    let decode_start = std::time::Instant::now();
-                    let handle = iced::widget::image::Handle::from_bytes(data);
-                    let decode_duration = decode_start.elapsed();
-
-                    let total_duration = start_time.elapsed();
-                    info!(
-                        "Image decode completed in {:?}, total loading time: {:?}",
-                        decode_duration, total_duration
-                    );
-
-                    Ok(handle)
-                }
-                Err(e) => Err(format!(
-                    "Failed to read image file {}: {}",
-                    path.display(),
-                    e
-                )),
-            }
-        }
-        Err(_) => Err(format!("Invalid file URL: {}", url)),
-    }
-}
-
-pub fn run<T: PhotoLoader + 'static>(
-    photo_loader: T,
+pub fn run(
+    photo_loader: FilePhotoLoader,
     memory_monitor: Rc<RefCell<MemoryMonitor>>,
-) -> result::Result<(), UiErrors> {
-    info!("Starting Iced-based picture frame UI");
+) -> Result<(), UiErrors> {
+    info!("Initializing GTK4 application");
 
-    let window_settings = iced::window::Settings {
-        size: Size::new(800.0, 600.0),
-        position: iced::window::Position::Centered,
-        ..Default::default()
-    };
+    let app = Application::builder()
+        .application_id("com.mikusa.picture-frame-ui")
+        .build();
 
-    match iced::application(
-        "Digital Picture Frame",
-        PictureFrameApp::update,
-        PictureFrameApp::view,
-    )
-    .window(window_settings)
-    .theme(PictureFrameApp::theme)
-    .run_with(move || PictureFrameApp::new((photo_loader, memory_monitor)))
-    {
-        Ok(()) => {
-            info!("Picture frame UI closed successfully");
+    let photo_loader = Rc::new(RefCell::new(photo_loader));
+    let memory_monitor_clone = memory_monitor.clone();
+
+    app.connect_activate(move |app| {
+        build_ui(app, photo_loader.clone(), memory_monitor_clone.clone());
+    });
+
+    info!("Running GTK4 application");
+    match app.run() {
+        ExitCode::SUCCESS => {
+            info!("GTK4 application exited successfully");
             Ok(())
         }
-        Err(e) => {
-            error!("Picture frame UI error: {}", e);
+        _ => {
+            error!("GTK4 application exited with error");
             Err(UiErrors::RuntimeError)
         }
     }
+}
+
+fn build_ui(
+    app: &Application,
+    photo_loader: Rc<RefCell<FilePhotoLoader>>,
+    memory_monitor: Rc<RefCell<MemoryMonitor>>,
+) {
+    debug!("Building UI");
+
+    // Create the main application window
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("Digital Picture Frame")
+        .default_width(800)
+        .default_height(600)
+        .build();
+
+    // Create a vertical box to hold our UI elements
+    let vbox = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .build();
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    // Create a Picture widget to display images
+    let picture = Picture::new();
+    picture.set_can_shrink(true);
+
+    // Set content fit to scale down while preserving aspect ratio (GTK 4.8+)
+    // For now, we'll just use the deprecated keep_aspect_ratio for compatibility
+    picture.set_keep_aspect_ratio(true);
+
+    picture.set_alternative_text(Some("Digital Picture Frame Display"));
+
+    // Try to load the first available image
+    let mut photo_loader_ref = photo_loader.borrow_mut();
+    match photo_loader_ref.load_next_photo() {
+        Ok(photo_url) => {
+            debug!("Loading first image: {}", photo_url);
+            if let Ok(file_path) = photo_url.to_file_path() {
+                let file = File::for_path(&file_path);
+                picture.set_file(Some(&file));
+
+                // Check memory after loading first image
+                let stats = memory_monitor.borrow_mut().check_memory();
+                info!(
+                    "Image loaded. Memory: {} (growth: +{})",
+                    MemoryMonitor::format_memory_human(stats.current_memory_kb),
+                    MemoryMonitor::format_memory_human(stats.memory_growth_kb)
+                );
+            } else {
+                error!("Failed to convert URL to file path: {}", photo_url);
+                picture.set_alternative_text(Some("Failed to load image"));
+            }
+        }
+        Err(e) => {
+            error!("Failed to load photo: {}", e);
+            picture.set_alternative_text(Some("No images found"));
+        }
+    }
+
+    // Add the picture to the box (it will expand to fill available space)
+    vbox.append(&picture);
+
+    // Set the box as the window's child
+    window.set_child(Some(&vbox));
+
+    // Show the window
+    window.present();
+
+    info!("UI built and presented successfully");
 }
