@@ -67,7 +67,12 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: |
+      - if: matrix.os == 'macos-latest'
+        run: |
+          brew update
+          brew install gtk4
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
           sudo apt update
           sudo apt install -y libgtk-4-dev build-essential
       - run: cargo test
