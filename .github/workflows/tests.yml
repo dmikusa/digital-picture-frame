@@ -38,8 +38,8 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
       - run: |
-          apt update
-          apt install -y libgtk-4-dev build-essential
+          sudo apt update
+          sudo apt install -y libgtk-4-dev build-essential
       - run: cargo check
       - run: cargo fmt --all -- --check
       - run: cargo clippy -- -D warnings
@@ -68,7 +68,7 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
       - uses: dtolnay/rust-toolchain@stable
       - run: |
-          apt update
-          apt install -y libgtk-4-dev build-essential
+          sudo apt update
+          sudo apt install -y libgtk-4-dev build-essential
       - run: cargo test
       - run: cargo run -- -h
