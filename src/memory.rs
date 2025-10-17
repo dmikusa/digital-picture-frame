@@ -121,6 +121,12 @@ impl MemoryMonitor {
     }
 }
 
+impl Default for MemoryMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryStats {
     pub current_memory_kb: u64,
