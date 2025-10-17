@@ -19,7 +19,7 @@
 use gio::File;
 use glib::{ControlFlow, ExitCode};
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Box, Orientation, Picture};
+use gtk4::{Application, ApplicationWindow, Box, Orientation, Picture, Stack, StackTransitionType};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -68,7 +68,7 @@ fn build_ui(
     photo_loader: Rc<RefCell<FilePhotoLoader>>,
     memory_monitor: Rc<RefCell<MemoryMonitor>>,
 ) {
-    debug!("Building UI");
+    debug!("Building UI with crossfade animation");
 
     // Create the main application window
     let window = ApplicationWindow::builder()
@@ -88,21 +88,30 @@ fn build_ui(
     vbox.set_margin_start(12);
     vbox.set_margin_end(12);
 
-    // Create a Picture widget to display images
-    let picture = Picture::new();
-    picture.set_can_shrink(true);
+    // Create a Stack widget for crossfade animation between images
+    let stack = Stack::builder()
+        .transition_type(StackTransitionType::Crossfade)
+        .transition_duration(1000) // 1 second crossfade
+        .hhomogeneous(true)
+        .vhomogeneous(true)
+        .build();
 
-    // Set content fit to scale down while preserving aspect ratio (GTK 4.8+)
-    // For now, we'll just use the deprecated keep_aspect_ratio for compatibility
-    picture.set_keep_aspect_ratio(true);
+    // Create two Picture widgets for double buffering the animation
+    let picture1 = create_picture_widget();
+    let picture2 = create_picture_widget();
 
-    picture.set_alternative_text(Some("Digital Picture Frame Display"));
+    // Add both pictures to the stack with names
+    stack.add_named(&picture1, Some("picture1"));
+    stack.add_named(&picture2, Some("picture2"));
 
-    // Load the first image
-    load_next_image(&picture, &photo_loader, &memory_monitor);
+    // Start with picture1 visible
+    stack.set_visible_child_name("picture1");
 
-    // Add the picture to the box (it will expand to fill available space)
-    vbox.append(&picture);
+    // Load the first image into picture1
+    load_image_into_picture(&picture1, &photo_loader, &memory_monitor);
+
+    // Add the stack to the box (it will expand to fill available space)
+    vbox.append(&stack);
 
     // Set the box as the window's child
     window.set_child(Some(&vbox));
@@ -110,21 +119,52 @@ fn build_ui(
     // Show the window
     window.present();
 
-    // Set up automatic photo progression every 5 seconds
-    let picture_clone = picture.clone();
+    // Set up automatic photo progression with crossfade every 5 seconds
+    let stack_clone = stack.clone();
+    let picture1_clone = picture1.clone();
+    let picture2_clone = picture2.clone();
     let photo_loader_clone = photo_loader.clone();
     let memory_monitor_clone = memory_monitor.clone();
+    let current_picture = Rc::new(RefCell::new(1)); // Track which picture is currently visible
 
     glib::timeout_add_local(std::time::Duration::from_secs(5), move || {
-        debug!("Timer triggered - loading next photo");
-        load_next_image(&picture_clone, &photo_loader_clone, &memory_monitor_clone);
+        debug!("Timer triggered - loading next photo with crossfade");
+        
+        let current = *current_picture.borrow();
+        let (next_picture, next_name) = if current == 1 {
+            (&picture2_clone, "picture2")
+        } else {
+            (&picture1_clone, "picture1")
+        };
+
+        // Load the next image into the hidden picture
+        load_image_into_picture(next_picture, &photo_loader_clone, &memory_monitor_clone);
+
+        // Trigger crossfade to the newly loaded picture
+        stack_clone.set_visible_child_name(next_name);
+
+        // Toggle the current picture tracker
+        *current_picture.borrow_mut() = if current == 1 { 2 } else { 1 };
+
         ControlFlow::Continue
     });
 
-    info!("UI built and slideshow timer started");
+    info!("UI built with crossfade animation and slideshow timer started");
 }
 
-fn load_next_image(
+fn create_picture_widget() -> Picture {
+    let picture = Picture::new();
+    picture.set_can_shrink(true);
+    
+    // Set content fit to scale down while preserving aspect ratio (GTK 4.8+)
+    // For now, we'll just use the deprecated keep_aspect_ratio for compatibility
+    picture.set_keep_aspect_ratio(true);
+    
+    picture.set_alternative_text(Some("Digital Picture Frame Display"));
+    picture
+}
+
+fn load_image_into_picture(
     picture: &Picture,
     photo_loader: &Rc<RefCell<FilePhotoLoader>>,
     memory_monitor: &Rc<RefCell<MemoryMonitor>>,
