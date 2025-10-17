@@ -17,10 +17,10 @@
  */
 
 use gio::File;
-use glib::ExitCode;
+use glib::{ControlFlow, ExitCode};
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box, Orientation, Picture};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -98,32 +98,8 @@ fn build_ui(
 
     picture.set_alternative_text(Some("Digital Picture Frame Display"));
 
-    // Try to load the first available image
-    let mut photo_loader_ref = photo_loader.borrow_mut();
-    match photo_loader_ref.load_next_photo() {
-        Ok(photo_url) => {
-            debug!("Loading first image: {}", photo_url);
-            if let Ok(file_path) = photo_url.to_file_path() {
-                let file = File::for_path(&file_path);
-                picture.set_file(Some(&file));
-
-                // Check memory after loading first image
-                let stats = memory_monitor.borrow_mut().check_memory();
-                info!(
-                    "Image loaded. Memory: {} (growth: +{})",
-                    MemoryMonitor::format_memory_human(stats.current_memory_kb),
-                    MemoryMonitor::format_memory_human(stats.memory_growth_kb)
-                );
-            } else {
-                error!("Failed to convert URL to file path: {}", photo_url);
-                picture.set_alternative_text(Some("Failed to load image"));
-            }
-        }
-        Err(e) => {
-            error!("Failed to load photo: {}", e);
-            picture.set_alternative_text(Some("No images found"));
-        }
-    }
+    // Load the first image
+    load_next_image(&picture, &photo_loader, &memory_monitor);
 
     // Add the picture to the box (it will expand to fill available space)
     vbox.append(&picture);
@@ -134,5 +110,49 @@ fn build_ui(
     // Show the window
     window.present();
 
-    info!("UI built and presented successfully");
+    // Set up automatic photo progression every 5 seconds
+    let picture_clone = picture.clone();
+    let photo_loader_clone = photo_loader.clone();
+    let memory_monitor_clone = memory_monitor.clone();
+
+    glib::timeout_add_local(std::time::Duration::from_secs(5), move || {
+        debug!("Timer triggered - loading next photo");
+        load_next_image(&picture_clone, &photo_loader_clone, &memory_monitor_clone);
+        ControlFlow::Continue
+    });
+
+    info!("UI built and slideshow timer started");
+}
+
+fn load_next_image(
+    picture: &Picture,
+    photo_loader: &Rc<RefCell<FilePhotoLoader>>,
+    memory_monitor: &Rc<RefCell<MemoryMonitor>>,
+) {
+    let mut photo_loader_ref = photo_loader.borrow_mut();
+    match photo_loader_ref.load_next_photo() {
+        Ok(photo_url) => {
+            debug!("Loading image: {}", photo_url);
+            if let Ok(file_path) = photo_url.to_file_path() {
+                let file = File::for_path(&file_path);
+                picture.set_file(Some(&file));
+
+                // Check memory after loading image
+                let stats = memory_monitor.borrow_mut().check_memory();
+                info!(
+                    "Image loaded: {} - Memory: {} (growth: +{})",
+                    file_path.display(),
+                    MemoryMonitor::format_memory_human(stats.current_memory_kb),
+                    MemoryMonitor::format_memory_human(stats.memory_growth_kb)
+                );
+            } else {
+                error!("Failed to convert URL to file path: {}", photo_url);
+                picture.set_alternative_text(Some("Failed to load image"));
+            }
+        }
+        Err(e) => {
+            warn!("Failed to load next photo: {} - cycling back to start", e);
+            picture.set_alternative_text(Some("End of slideshow - restarting"));
+        }
+    }
 }

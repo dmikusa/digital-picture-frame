@@ -34,8 +34,8 @@ fn main() {
         MemoryMonitor::format_memory_human(initial_stats.current_memory_kb)
     );
 
-    debug!("Creating Photo Loader from base directory");
-    let photo_loader = FilePhotoLoader::new(String::from("/Users/dmikusa/Pictures/BackgroundPics"));
+    debug!("Creating Photo Loader from test images directory");
+    let photo_loader = FilePhotoLoader::new(String::from("test_images"));
 
     // Check memory after photo loader creation
     let after_loader_stats = memory_monitor.borrow_mut().check_memory();
