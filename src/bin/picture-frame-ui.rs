@@ -17,6 +17,7 @@
  */
 
 use log::{debug, error, info};
+use picture_frame_ui::config::FrameConfig;
 use picture_frame_ui::memory::MemoryMonitor;
 use picture_frame_ui::photos::FilePhotoLoader;
 use picture_frame_ui::ui;
@@ -34,8 +35,21 @@ fn main() {
         MemoryMonitor::format_memory_human(initial_stats.current_memory_kb)
     );
 
-    debug!("Creating Photo Loader from test images directory");
-    let photo_loader = FilePhotoLoader::new(String::from("test_images"));
+    // Load configuration
+    debug!("Loading configuration");
+    let config = match FrameConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Failed to load configuration: {}", e);
+            return;
+        }
+    };
+
+    debug!(
+        "Creating Photo Loader from configured directory: {}",
+        config.photos_directory
+    );
+    let photo_loader = FilePhotoLoader::new(config.photos_directory.clone());
 
     // Check memory after photo loader creation
     let after_loader_stats = memory_monitor.borrow_mut().check_memory();
