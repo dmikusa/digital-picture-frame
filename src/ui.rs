@@ -215,6 +215,6 @@ fn setup_app_menu(app: &Application) {
 
     // Set up standard keyboard accelerator (Cmd+Q on macOS, Ctrl+Q on Linux)
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
-    
+
     debug!("Application quit action set up with keyboard shortcut");
 }
