@@ -202,7 +202,7 @@ fn load_image_into_picture(
 }
 
 fn setup_app_menu(app: &Application) {
-    // Create the quit action with standard keyboard shortcut
+    // Create the quit action with OS-specific keyboard shortcut
     let quit_action = SimpleAction::new("quit", None);
     let app_weak = app.downgrade();
     quit_action.connect_activate(move |_, _| {
@@ -213,8 +213,17 @@ fn setup_app_menu(app: &Application) {
     });
     app.add_action(&quit_action);
 
-    // Set up standard keyboard accelerator (Cmd+Q on macOS, Ctrl+Q on Linux)
-    app.set_accels_for_action("app.quit", &["<Primary>q"]);
+    // Set up OS-specific keyboard accelerator
+    let (accelerator, description) = if cfg!(target_os = "macos") {
+        ("<Meta>q", "Cmd+Q") // Cmd+Q on macOS
+    } else {
+        ("<Control>q", "Ctrl+Q") // Ctrl+Q on Windows/Linux
+    };
 
-    debug!("Application quit action set up with keyboard shortcut");
+    app.set_accels_for_action("app.quit", &[accelerator]);
+
+    debug!(
+        "Application quit action set up with keyboard shortcut: {} ({})",
+        description, accelerator
+    );
 }
