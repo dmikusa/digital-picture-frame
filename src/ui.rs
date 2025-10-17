@@ -17,6 +17,7 @@
  */
 
 use gtk4::gio::File;
+use gtk4::gio::SimpleAction;
 use gtk4::glib::{ControlFlow, ExitCode};
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box, Orientation, Picture, Stack, StackTransitionType};
@@ -47,6 +48,9 @@ pub fn run(
     let memory_monitor_clone = memory_monitor.clone();
 
     app.connect_activate(move |app| {
+        debug!("App activation callback called");
+        // Set up application menu now that the app is registered
+        setup_app_menu(app);
         build_ui(app, photo_loader.clone(), memory_monitor_clone.clone());
     });
 
@@ -195,4 +199,22 @@ fn load_image_into_picture(
             picture.set_alternative_text(Some("End of slideshow - restarting"));
         }
     }
+}
+
+fn setup_app_menu(app: &Application) {
+    // Create the quit action with standard keyboard shortcut
+    let quit_action = SimpleAction::new("quit", None);
+    let app_weak = app.downgrade();
+    quit_action.connect_activate(move |_, _| {
+        debug!("Quit action triggered from keyboard shortcut");
+        if let Some(app) = app_weak.upgrade() {
+            app.quit();
+        }
+    });
+    app.add_action(&quit_action);
+
+    // Set up standard keyboard accelerator (Cmd+Q on macOS, Ctrl+Q on Linux)
+    app.set_accels_for_action("app.quit", &["<Primary>q"]);
+    
+    debug!("Application quit action set up with keyboard shortcut");
 }
