@@ -48,7 +48,7 @@ jobs:
           command: build
           target: ${{ matrix.platform.target }}
           args: "--locked --release"
-          strip: true
+          force-use-cross: true
       - name: Publish artifacts and release
         uses: houseabsolute/actions-rust-release@v0
         with:
