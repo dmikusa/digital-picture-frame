@@ -32,3 +32,10 @@ dev = [
 [tool.pyright]
 include = ["src/picture_frame_ui"]
 exclude = ["**/__pycache__"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/picture_frame_ui"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+]

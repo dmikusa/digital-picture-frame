@@ -127,10 +127,36 @@ cd digital-picture-frame
 uv sync --dev
 
 # Run tests
-uv run python -m pytest
+uv run pytest
 
 # Run with debug logging
 DEBUG=1 uv run python main.py
+```
+
+### Testing
+
+The project includes comprehensive test coverage for the core library modules:
+
+```bash
+# Run all tests
+uv run pytest
+
+# Run tests with verbose output
+uv run pytest -v
+
+# Run specific test file
+uv run pytest src/picture_frame_ui/config_test.py
+
+# Run tests using justfile
+just test-all
+
+# Run specific test
+just test src/picture_frame_ui/photos_test.py
+```
+
+**Test Coverage:**
+- **Config module**: Configuration loading, saving, validation, fallback behavior
+- **Photos module**: Directory scanning, image filtering, cycling, error handling
 ```
 
 ### Project Structure
