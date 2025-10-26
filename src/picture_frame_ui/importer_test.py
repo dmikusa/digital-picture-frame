@@ -101,6 +101,29 @@ class TestPhotoImporter:
         expected_ratio = 2400 / 1600
         assert abs(aspect_ratio - expected_ratio) < 0.01
 
+    def test_calculate_resize_dimensions_custom_screen_size(self, temp_dirs):
+        """Test dimension calculation with custom screen dimensions"""
+        import_dir, photos_dir = temp_dirs
+        # Test with a smaller screen size
+        importer = PhotoImporter(import_dir, photos_dir, max_width=1366, max_height=768)
+
+        # Test image larger than custom max dimensions
+        new_width, new_height = importer.calculate_resize_dimensions(2400, 1600)
+
+        # Should scale down to fit within 1366x768
+        assert new_width <= 1366
+        assert new_height <= 768
+
+        # Should maintain aspect ratio (2400:1600 = 1.5:1)
+        aspect_ratio = new_width / new_height
+        expected_ratio = 2400 / 1600
+        assert abs(aspect_ratio - expected_ratio) < 0.01
+
+        # For this specific case, height should be the limiting factor
+        # 1366/768 = 1.78, 2400/1600 = 1.5, so height is more restrictive
+        assert new_height == 768
+        assert new_width == int(768 * (2400 / 1600))  # 1152
+
     def test_calculate_resize_width_needs_resize(self, temp_dirs):
         """Test dimension calculation when width resize is needed"""
         import_dir, photos_dir = temp_dirs
@@ -352,6 +375,39 @@ class TestConvenienceFunction:
             assert count == 1
             photo_files = list(photos_dir.glob("*.jpg"))
             assert len(photo_files) == 1
+
+    def test_import_photos_from_directory_custom_dimensions(self):
+        """Test the convenience function with custom screen dimensions"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            import_dir = temp_path / "import"
+            photos_dir = temp_path / "photos"
+            import_dir.mkdir()
+            photos_dir.mkdir()
+
+            # Create test image that would need resizing with smaller screen
+            img = Image.new("RGB", (2560, 1440), color="purple")
+            img.save(import_dir / "test.jpg", "JPEG")
+
+            # Import with custom small screen dimensions
+            count = import_photos_from_directory(
+                import_dir, photos_dir, max_width=1024, max_height=768
+            )
+
+            assert count == 1
+            photo_files = list(photos_dir.glob("*.jpg"))
+            assert len(photo_files) == 1
+
+            # Verify the image was resized to fit the smaller screen
+            created_file = photo_files[0]
+            with Image.open(created_file) as resized_img:
+                width, height = resized_img.size
+                assert width <= 1024
+                assert height <= 768
+                # Should maintain aspect ratio
+                original_ratio = 2560 / 1440
+                new_ratio = width / height
+                assert abs(original_ratio - new_ratio) < 0.01
 
 
 class TestErrorHandling:

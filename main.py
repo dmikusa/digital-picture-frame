@@ -25,7 +25,12 @@ from pathlib import Path
 from picture_frame_ui.config import FrameConfig
 from picture_frame_ui.photos import create_photo_loader
 from picture_frame_ui.importer import import_photos_from_directory
-from picture_frame_ui.ui import run_app, InitializationError, RuntimeError
+from picture_frame_ui.ui import (
+    run_app,
+    InitializationError,
+    RuntimeError,
+    get_screen_dimensions,
+)
 
 
 def setup_logging():
@@ -68,7 +73,15 @@ def main():
             photos_path.mkdir(parents=True, exist_ok=True)
 
             try:
-                imported_count = import_photos_from_directory(import_path, photos_path)
+                # Get screen dimensions for optimal photo resizing
+                screen_width, screen_height = get_screen_dimensions()
+                logger.debug(
+                    f"Using screen dimensions for photo import: {screen_width}x{screen_height}"
+                )
+
+                imported_count = import_photos_from_directory(
+                    import_path, photos_path, screen_width, screen_height
+                )
                 if imported_count > 0:
                     logger.info(f"Successfully imported {imported_count} new photos")
                 else:

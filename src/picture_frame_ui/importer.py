@@ -41,22 +41,28 @@ class PhotoImporter:
         ".webp",
     }
 
-    # Maximum dimensions for resized images
-    MAX_WIDTH = 1920
-    MAX_HEIGHT = 1080
-
-    def __init__(self, import_directory: Path, photos_directory: Path):
+    def __init__(
+        self,
+        import_directory: Path,
+        photos_directory: Path,
+        max_width: int = 1920,
+        max_height: int = 1080,
+    ):
         """
         Initialize the photo importer
 
         Args:
             import_directory: Directory to scan for new photos
             photos_directory: Directory where processed photos are stored
+            max_width: Maximum width for resized images (defaults to 1920)
+            max_height: Maximum height for resized images (defaults to 1080)
         """
         self.import_directory = import_directory
         self.photos_directory = photos_directory
+        self.max_width = max_width
+        self.max_height = max_height
         logger.info(
-            f"PhotoImporter initialized - import: {import_directory}, photos: {photos_directory}"
+            f"PhotoImporter initialized - import: {import_directory}, photos: {photos_directory}, max_size: {max_width}x{max_height}"
         )
 
     def calculate_sha1(self, file_path: Path) -> str:
@@ -114,15 +120,15 @@ class PhotoImporter:
             Tuple of (new_width, new_height)
         """
         # If image is already within bounds, return original dimensions
-        if original_width <= self.MAX_WIDTH and original_height <= self.MAX_HEIGHT:
+        if original_width <= self.max_width and original_height <= self.max_height:
             logger.debug(
                 f"Image {original_width}x{original_height} is within bounds, no resize needed"
             )
             return original_width, original_height
 
         # Calculate scaling factor - use the more restrictive dimension
-        width_scale = self.MAX_WIDTH / original_width
-        height_scale = self.MAX_HEIGHT / original_height
+        width_scale = self.max_width / original_width
+        height_scale = self.max_height / original_height
         scale_factor = min(width_scale, height_scale)
 
         new_width = int(original_width * scale_factor)
@@ -338,16 +344,23 @@ class PhotoImporter:
         return processed_count
 
 
-def import_photos_from_directory(import_directory: Path, photos_directory: Path) -> int:
+def import_photos_from_directory(
+    import_directory: Path,
+    photos_directory: Path,
+    max_width: int = 1920,
+    max_height: int = 1080,
+) -> int:
     """
     Convenience function to import photos from a directory
 
     Args:
         import_directory: Directory to scan for new photos
         photos_directory: Directory where processed photos are stored
+        max_width: Maximum width for resized images (defaults to 1920)
+        max_height: Maximum height for resized images (defaults to 1080)
 
     Returns:
         Number of photos successfully imported
     """
-    importer = PhotoImporter(import_directory, photos_directory)
+    importer = PhotoImporter(import_directory, photos_directory, max_width, max_height)
     return importer.import_photos()

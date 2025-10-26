@@ -23,8 +23,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
+gi.require_version("Gdk", "4.0")
 
-from gi.repository import Gtk, Gio, GLib  # type: ignore[import-untyped]
+from gi.repository import Gtk, Gio, GLib, Gdk  # type: ignore[import-untyped]
 from pathlib import Path
 from typing import Optional, Any
 from .config import FrameConfig
@@ -272,3 +273,41 @@ def run_app(config: FrameConfig, photo_loader: PhotoLoader) -> int:
     except Exception as e:
         logger.error(f"Failed to run GTK4 application: {e}")
         raise RuntimeError(f"UI runtime error: {e}") from e
+
+
+def get_screen_dimensions() -> tuple[int, int]:
+    """
+    Get the primary screen dimensions
+
+    Returns:
+        Tuple of (width, height) in pixels
+    """
+    try:
+        # For GTK4, we need to use the GDK display and monitor information
+        display = Gdk.Display.get_default()
+        if display is None:
+            logger.warning("Could not get default display, using fallback dimensions")
+            return 1920, 1080
+
+        # Get the primary monitor
+        monitors = display.get_monitors()
+        if monitors.get_n_items() == 0:
+            logger.warning("No monitors found, using fallback dimensions")
+            return 1920, 1080
+
+        monitor = monitors.get_item(0)  # Get first monitor
+        if monitor is None:
+            logger.warning("Could not get monitor, using fallback dimensions")
+            return 1920, 1080
+
+        # Get the geometry
+        geometry = monitor.get_geometry()
+        width = geometry.width
+        height = geometry.height
+
+        logger.info(f"Detected screen dimensions: {width}x{height}")
+        return width, height
+
+    except Exception as e:
+        logger.warning(f"Failed to get screen dimensions, using fallback: {e}")
+        return 1920, 1080
