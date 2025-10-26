@@ -108,6 +108,9 @@ class PictureFrameApp(Gtk.Application):
             logger.debug("Setting window to full screen mode")
             self.window.fullscreen()
 
+            # Hide the mouse cursor in full screen mode
+            self._hide_mouse_cursor()
+
         # Create a vertical box to hold our UI elements
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
@@ -201,6 +204,32 @@ class PictureFrameApp(Gtk.Application):
         )
 
         logger.debug(f"Applied black background to widget: {type(widget).__name__}")
+
+    def _hide_mouse_cursor(self) -> None:
+        """Hide the mouse cursor when in full screen mode"""
+        try:
+            # Ensure window is initialized
+            assert self.window is not None  # Type checker hint
+
+            # Get the window's surface
+            surface = self.window.get_surface()
+            if surface is not None:
+                # Create an empty cursor to hide the mouse
+                display = self.window.get_display()
+                cursor = Gdk.Cursor.new_from_name("none", None)
+                if cursor is None:
+                    # Fallback: create a blank cursor
+                    cursor = Gdk.Cursor.new_from_name("blank", None)
+
+                if cursor is not None:
+                    surface.set_cursor(cursor)
+                    logger.debug("Mouse cursor hidden in full screen mode")
+                else:
+                    logger.warning("Failed to create blank cursor")
+            else:
+                logger.warning("Could not get window surface to hide cursor")
+        except Exception as e:
+            logger.warning(f"Failed to hide mouse cursor: {e}")
 
     def _load_image_into_picture(self, picture: Any):  # picture: Gtk.Picture
         """Load the next image into the specified Picture widget"""
