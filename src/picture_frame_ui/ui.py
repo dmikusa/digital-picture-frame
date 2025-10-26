@@ -96,6 +96,9 @@ class PictureFrameApp(Gtk.Application):
         self.window.set_title("Digital Picture Frame")
         self.window.set_default_size(800, 600)
 
+        # Set black background for the window
+        self._apply_black_background(self.window)
+
         # Set full screen mode if configured
         if self.config.full_screen:
             logger.debug("Setting window to full screen mode")
@@ -103,6 +106,7 @@ class PictureFrameApp(Gtk.Application):
 
         # Create a vertical box to hold our UI elements
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
         # Remove margins for full-screen picture frame display
         vbox.set_margin_top(0)
         vbox.set_margin_bottom(0)
@@ -113,6 +117,9 @@ class PictureFrameApp(Gtk.Application):
         vbox.set_hexpand(True)
         vbox.set_vexpand(True)
 
+        # Set black background for the container
+        self._apply_black_background(vbox)
+
         # Create a Stack widget for crossfade animation between images
         self.stack = Gtk.Stack()
         assert self.stack is not None  # Type checker hint
@@ -120,6 +127,9 @@ class PictureFrameApp(Gtk.Application):
         self.stack.set_transition_duration(self.config.fade_duration)
         self.stack.set_hhomogeneous(True)
         self.stack.set_vhomogeneous(True)
+
+        # Set black background for the stack
+        self._apply_black_background(self.stack)
 
         # Center the stack contents
         self.stack.set_halign(Gtk.Align.FILL)
@@ -168,6 +178,25 @@ class PictureFrameApp(Gtk.Application):
         picture.set_vexpand(True)
 
         return picture
+
+    def _apply_black_background(self, widget: Any) -> None:
+        """Apply black background to a widget using CSS"""
+        css_provider = Gtk.CssProvider()
+        css_data = """
+        * {
+            background-color: black;
+            background: black;
+        }
+        """
+        css_provider.load_from_string(css_data)
+
+        # Apply the CSS to the widget
+        style_context = widget.get_style_context()
+        style_context.add_provider(
+            css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        logger.debug(f"Applied black background to widget: {type(widget).__name__}")
 
     def _load_image_into_picture(self, picture: Any):  # picture: Gtk.Picture
         """Load the next image into the specified Picture widget"""
