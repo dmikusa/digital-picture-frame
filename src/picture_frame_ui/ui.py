@@ -95,6 +95,11 @@ class PictureFrameApp(Gtk.Application):
         self.window.set_title("Digital Picture Frame")
         self.window.set_default_size(800, 600)
 
+        # Set full screen mode if configured
+        if self.config.full_screen:
+            logger.debug("Setting window to full screen mode")
+            self.window.fullscreen()
+
         # Create a vertical box to hold our UI elements
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         # Remove margins for full-screen picture frame display

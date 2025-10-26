@@ -23,6 +23,7 @@ class TestFrameConfig:
         assert config.slideshow_duration == 5
         assert config.fade_duration == 1000
         assert config.import_directory is None
+        assert config.full_screen is False
 
     def test_config_serialization(self):
         """Test converting config to dictionary"""
@@ -31,6 +32,7 @@ class TestFrameConfig:
             slideshow_duration=10,
             fade_duration=2000,
             import_directory="/home/user/import",
+            full_screen=True,
         )
 
         config_dict = config.to_dict()
@@ -39,6 +41,7 @@ class TestFrameConfig:
             "slideshow_duration": 10,
             "fade_duration": 2000,
             "import_directory": "/home/user/import",
+            "full_screen": True,
         }
         assert config_dict == expected
 
@@ -214,6 +217,7 @@ class TestFrameConfig:
                 "slideshow_duration": 15,
                 "fade_duration": 2500,
                 "import_directory": None,
+                "full_screen": False,
             }
             assert saved_data == expected
 
@@ -287,5 +291,20 @@ class TestFrameConfig:
             "slideshow_duration": 5,
             "fade_duration": 1000,
             "import_directory": None,
+            "full_screen": False,
         }
         assert config_dict == expected
+
+    def test_full_screen_config(self):
+        """Test full screen configuration"""
+        # Test default (false)
+        config = FrameConfig()
+        assert config.full_screen is False
+
+        # Test explicitly set to true
+        config_true = FrameConfig(full_screen=True)
+        assert config_true.full_screen is True
+
+        # Test serialization includes full_screen
+        config_dict = config_true.to_dict()
+        assert config_dict["full_screen"] is True

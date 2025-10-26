@@ -34,6 +34,7 @@ class FrameConfig:
     slideshow_duration: int = 5  # seconds between photo changes
     fade_duration: int = 1000  # milliseconds for crossfade transition
     import_directory: Optional[str] = None  # directory to import new photos from
+    full_screen: bool = False  # whether to start in full screen mode
 
     @classmethod
     def load(cls) -> "FrameConfig":
@@ -118,6 +119,7 @@ class FrameConfig:
             "slideshow_duration": self.slideshow_duration,
             "fade_duration": self.fade_duration,
             "import_directory": self.import_directory,
+            "full_screen": self.full_screen,
         }
 
     def save(self, config_path: Optional[Path] = None) -> None:
