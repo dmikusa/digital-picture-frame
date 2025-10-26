@@ -51,9 +51,6 @@ class PictureFrameApp(Gtk.Application):
         self.picture2: Optional[Any] = None  # Gtk.Picture
         self.current_picture = 1  # Track which picture is currently visible
         self.slideshow_source_id: Optional[int] = None
-        self.software_rendering = (
-            False  # Track if we've fallen back to software rendering
-        )
 
         # Set up application-level actions
         self.setup_actions()
@@ -91,40 +88,7 @@ class PictureFrameApp(Gtk.Application):
         if self.window is None:
             self.build_ui()
         assert self.window is not None  # Type checker hint
-
-        try:
-            self.window.present()
-            if not self.software_rendering:
-                logger.debug("Window presented successfully with hardware acceleration")
-            else:
-                logger.debug("Window presented successfully with software rendering")
-        except Exception as e:
-            if not self.software_rendering:
-                logger.warning(
-                    f"Failed to present window with hardware acceleration: {e}"
-                )
-                logger.info("Falling back to software rendering...")
-
-                # Force software rendering
-                os.environ["GSK_RENDERER"] = "cairo"
-                os.environ["GDK_RENDERING"] = "image"
-                self.software_rendering = True
-
-                try:
-                    # Rebuild the UI with software rendering
-                    self.window = None  # Clear the window to force rebuild
-                    self.build_ui()
-                    assert self.window is not None  # Type checker hint
-                    self.window.present()
-                    logger.info("Successfully fell back to software rendering")
-                except Exception as e2:
-                    logger.error(
-                        f"Failed to present window even with software rendering: {e2}"
-                    )
-                    raise InitializationError(f"Cannot display window: {e2}") from e2
-            else:
-                logger.error(f"Failed to present window with software rendering: {e}")
-                raise InitializationError(f"Cannot display window: {e}") from e
+        self.window.present()
 
     def build_ui(self):
         """Build the main UI components"""
@@ -326,6 +290,24 @@ class RuntimeError(UiError):
 def run_app(config: FrameConfig, photo_loader: PhotoLoader) -> int:
     """Run the GTK4 application"""
     logger.info("Initializing GTK4 application")
+
+    # Configure rendering based on configuration
+    if config.rendering_type == "CPU":
+        logger.info("Configuring for CPU (software) rendering")
+        os.environ["GSK_RENDERER"] = "cairo"
+        os.environ["GDK_RENDERING"] = "image"
+    elif config.rendering_type == "GPU":
+        logger.info("Configuring for GPU (hardware) rendering")
+        # Let GTK4 use its default hardware-accelerated rendering
+        # Remove any software rendering overrides if they exist
+        if "GSK_RENDERER" in os.environ and os.environ["GSK_RENDERER"] == "cairo":
+            del os.environ["GSK_RENDERER"]
+        if "GDK_RENDERING" in os.environ and os.environ["GDK_RENDERING"] == "image":
+            del os.environ["GDK_RENDERING"]
+    else:
+        logger.warning(
+            f"Unknown rendering_type '{config.rendering_type}', defaulting to GPU"
+        )
 
     try:
         app = PictureFrameApp(config, photo_loader)

@@ -35,6 +35,7 @@ class FrameConfig:
     fade_duration: int = 1000  # milliseconds for crossfade transition
     import_directory: Optional[str] = None  # directory to import new photos from
     full_screen: bool = False  # whether to start in full screen mode
+    rendering_type: str = "GPU"  # rendering type: "GPU" or "CPU"
 
     @classmethod
     def load(cls) -> "FrameConfig":
@@ -75,7 +76,13 @@ class FrameConfig:
             config = cls()
             for key, value in config_data.items():
                 if hasattr(config, key):
-                    setattr(config, key, value)
+                    if key == "rendering_type" and value not in ["GPU", "CPU"]:
+                        logger.warning(
+                            f"Invalid rendering_type '{value}', must be 'GPU' or 'CPU'. Using default 'GPU'"
+                        )
+                        setattr(config, key, "GPU")
+                    else:
+                        setattr(config, key, value)
                 else:
                     logger.warning(f"Unknown config option: {key}")
 
@@ -120,6 +127,7 @@ class FrameConfig:
             "fade_duration": self.fade_duration,
             "import_directory": self.import_directory,
             "full_screen": self.full_screen,
+            "rendering_type": self.rendering_type,
         }
 
     def save(self, config_path: Optional[Path] = None) -> None:

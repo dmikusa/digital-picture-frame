@@ -42,6 +42,7 @@ class TestFrameConfig:
             "fade_duration": 2000,
             "import_directory": "/home/user/import",
             "full_screen": True,
+            "rendering_type": "GPU",
         }
         assert config_dict == expected
 
@@ -218,6 +219,7 @@ class TestFrameConfig:
                 "fade_duration": 2500,
                 "import_directory": None,
                 "full_screen": False,
+                "rendering_type": "GPU",
             }
             assert saved_data == expected
 
@@ -292,6 +294,7 @@ class TestFrameConfig:
             "fade_duration": 1000,
             "import_directory": None,
             "full_screen": False,
+            "rendering_type": "GPU",
         }
         assert config_dict == expected
 
@@ -308,3 +311,76 @@ class TestFrameConfig:
         # Test serialization includes full_screen
         config_dict = config_true.to_dict()
         assert config_dict["full_screen"] is True
+
+    def test_rendering_type_default(self):
+        """Test default rendering type is GPU"""
+        config = FrameConfig()
+        assert config.rendering_type == "GPU"
+
+    def test_rendering_type_cpu(self):
+        """Test setting rendering type to CPU"""
+        config = FrameConfig(rendering_type="CPU")
+        assert config.rendering_type == "CPU"
+
+    def test_rendering_type_gpu(self):
+        """Test setting rendering type to GPU"""
+        config = FrameConfig(rendering_type="GPU")
+        assert config.rendering_type == "GPU"
+
+    def test_rendering_type_serialization(self):
+        """Test rendering type is included in serialization"""
+        config = FrameConfig(rendering_type="CPU")
+        config_dict = config.to_dict()
+        assert config_dict["rendering_type"] == "CPU"
+
+    def test_load_with_invalid_rendering_type(self):
+        """Test loading config with invalid rendering type falls back to GPU"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Change to temp directory
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+
+                # Create config file with invalid rendering type
+                config_path = Path("frame-config.json")
+                test_config = {
+                    "rendering_type": "INVALID",
+                    "photos_directory": "/test/photos",
+                }
+
+                with open(config_path, "w") as f:
+                    json.dump(test_config, f)
+
+                # Load config - should default to GPU and log warning
+                config = FrameConfig.load()
+                assert config.rendering_type == "GPU"
+                assert config.photos_directory == "/test/photos"
+
+            finally:
+                os.chdir(original_cwd)
+
+    def test_load_with_rendering_type_cpu(self):
+        """Test loading config with CPU rendering type"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Change to temp directory
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+
+                # Create config file
+                config_path = Path("frame-config.json")
+                test_config = {
+                    "rendering_type": "CPU",
+                    "photos_directory": "/test/photos",
+                }
+
+                with open(config_path, "w") as f:
+                    json.dump(test_config, f)
+
+                # Load config
+                config = FrameConfig.load()
+                assert config.rendering_type == "CPU"
+                assert config.photos_directory == "/test/photos"
+
+            finally:
+                os.chdir(original_cwd)
