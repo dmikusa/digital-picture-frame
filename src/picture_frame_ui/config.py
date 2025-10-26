@@ -29,20 +29,24 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FrameConfig:
     """Configuration for the Picture Frame application"""
+
     photos_directory: str = "images"
     slideshow_duration: int = 5  # seconds between photo changes
     fade_duration: int = 1000  # milliseconds for crossfade transition
-    
+    import_directory: Optional[str] = None  # directory to import new photos from
+
     @classmethod
-    def load(cls) -> 'FrameConfig':
+    def load(cls) -> "FrameConfig":
         """Load configuration from file, with fallback locations and defaults"""
-        
+
         # Try current directory first
         current_dir_config = Path("frame-config.json")
         if current_dir_config.exists():
-            logger.debug(f"Found config file in current directory: {current_dir_config}")
+            logger.debug(
+                f"Found config file in current directory: {current_dir_config}"
+            )
             return cls._load_from_file(current_dir_config)
-        
+
         # Try user home directory
         home_dir = os.getenv("HOME")
         if home_dir:
@@ -50,7 +54,7 @@ class FrameConfig:
             if home_config.exists():
                 logger.debug(f"Found config file in home directory: {home_config}")
                 return cls._load_from_file(home_config)
-        
+
         # No config file found, use defaults
         logger.warning("No configuration file found, using defaults")
         logger.info(
@@ -58,14 +62,14 @@ class FrameConfig:
             "or ~/.picture-frame-ui/"
         )
         return cls()
-    
+
     @classmethod
-    def _load_from_file(cls, config_path: Path) -> 'FrameConfig':
+    def _load_from_file(cls, config_path: Path) -> "FrameConfig":
         """Load configuration from a specific file"""
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 config_data = json.load(f)
-            
+
             # Create config with defaults, then update with file data
             config = cls()
             for key, value in config_data.items():
@@ -73,45 +77,59 @@ class FrameConfig:
                     setattr(config, key, value)
                 else:
                     logger.warning(f"Unknown config option: {key}")
-            
+
             logger.info(f"Loaded configuration from: {config_path}")
             logger.debug(f"Config: {config}")
-            
+
             return config
-            
+
         except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
             logger.error(f"Failed to load config file {config_path}: {e}")
             logger.info("Using default configuration")
             return cls()
-    
+
     def get_photos_path(self) -> Path:
         """Get the absolute path to the photos directory"""
         path = Path(self.photos_directory)
-        
+
         # Convert relative path to absolute if needed
         if not path.is_absolute():
             return Path.cwd() / path
         else:
             return path
-    
+
+    def get_import_path(self) -> Optional[Path]:
+        """Get the absolute path to the import directory"""
+        if self.import_directory is None:
+            return None
+
+        path = Path(self.import_directory)
+
+        # Convert relative path to absolute if needed
+        if not path.is_absolute():
+            return Path.cwd() / path
+        else:
+            return path
+
     def to_dict(self) -> dict:
         """Convert configuration to dictionary for serialization"""
         return {
             "photos_directory": self.photos_directory,
             "slideshow_duration": self.slideshow_duration,
-            "fade_duration": self.fade_duration
+            "fade_duration": self.fade_duration,
+            "import_directory": self.import_directory,
         }
-    
+
     def save(self, config_path: Optional[Path] = None) -> None:
         """Save configuration to file"""
         if config_path is None:
             config_path = Path("frame-config.json")
-        
+
         # Create directory if it doesn't exist
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         try:
-            with open(config_path, 'w') as f:
+            with open(config_path, "w") as f:
                 json.dump(self.to_dict(), f, indent=2)
             logger.info(f"Configuration saved to: {config_path}")
         except OSError as e:

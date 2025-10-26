@@ -40,4 +40,5 @@ venv.bak/
 
 # Test images and user data
 /test_images
+/BackgroundPics
 frame-config.json

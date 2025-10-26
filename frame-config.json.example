@@ -1,5 +1,6 @@
 {
   "photos_directory": "images",
   "slideshow_duration": 5,
-  "fade_duration": 1000
+  "fade_duration": 1000,
+  "import_directory": "import"
 }
