@@ -32,7 +32,14 @@ deps-upgrade:
     uv sync
 
 run:
+    #!/usr/bin/env fish
+    set -x DYLD_LIBRARY_PATH "/opt/homebrew/lib:$DYLD_LIBRARY_PATH"
+    set -x PKG_CONFIG_PATH "/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
     uv run python main.py
 
 run-debug:
-    DEBUG=1 uv run python main.py
+    #!/usr/bin/env fish
+    set -x DYLD_LIBRARY_PATH "/opt/homebrew/lib:$DYLD_LIBRARY_PATH"
+    set -x PKG_CONFIG_PATH "/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
+    set -x DEBUG 1
+    uv run python main.py

@@ -18,23 +18,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging
 import sys
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+
+from gi.repository import Gtk, Gio, GLib  # type: ignore[import-untyped]
 from pathlib import Path
 from typing import Optional, Any
-
-try:
-    import gi
-
-    gi.require_version("Gtk", "4.0")
-    gi.require_version("Gio", "2.0")
-    gi.require_version("GLib", "2.0")
-    from gi.repository import Gtk, Gio, GLib  # type: ignore[import-untyped]
-except ImportError as e:
-    print(f"Failed to import GTK4: {e}")
-    print("Please install PyGObject and GTK4:")
-    print("  uv add pygobject")
-    print("  # Also ensure GTK4 is installed on your system")
-    sys.exit(1)
-
 from .config import FrameConfig
 from .photos import PhotoLoader
 
