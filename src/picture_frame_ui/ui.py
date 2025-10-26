@@ -96,11 +96,16 @@ class PictureFrameApp(Gtk.Application):
         self.window.set_default_size(800, 600)
 
         # Create a vertical box to hold our UI elements
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        vbox.set_margin_top(12)
-        vbox.set_margin_bottom(12)
-        vbox.set_margin_start(12)
-        vbox.set_margin_end(12)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        # Remove margins for full-screen picture frame display
+        vbox.set_margin_top(0)
+        vbox.set_margin_bottom(0)
+        vbox.set_margin_start(0)
+        vbox.set_margin_end(0)
+
+        # Ensure the container fills the entire window
+        vbox.set_hexpand(True)
+        vbox.set_vexpand(True)
 
         # Create a Stack widget for crossfade animation between images
         self.stack = Gtk.Stack()
@@ -109,6 +114,12 @@ class PictureFrameApp(Gtk.Application):
         self.stack.set_transition_duration(self.config.fade_duration)
         self.stack.set_hhomogeneous(True)
         self.stack.set_vhomogeneous(True)
+
+        # Center the stack contents
+        self.stack.set_halign(Gtk.Align.FILL)
+        self.stack.set_valign(Gtk.Align.FILL)
+        self.stack.set_hexpand(True)
+        self.stack.set_vexpand(True)
 
         # Create two Picture widgets for double buffering the animation
         self.picture1 = self._create_picture_widget()
@@ -141,6 +152,15 @@ class PictureFrameApp(Gtk.Application):
         picture.set_can_shrink(True)
         picture.set_keep_aspect_ratio(True)
         picture.set_alternative_text("Digital Picture Frame Display")
+
+        # Center the image both horizontally and vertically
+        picture.set_halign(Gtk.Align.CENTER)
+        picture.set_valign(Gtk.Align.CENTER)
+
+        # Allow the widget to expand to fill available space
+        picture.set_hexpand(True)
+        picture.set_vexpand(True)
+
         return picture
 
     def _load_image_into_picture(self, picture: Any):  # picture: Gtk.Picture
