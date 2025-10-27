@@ -50,14 +50,6 @@ jobs:
           uv run --frozen coverage run --source=src/sevensignal_mcp --omit "*_test.py" -m pytest -vv --junitxml=results.xml
           uv run --frozen coverage xml -o coverage.xml
 
-      - name: SonarCloud Scan
-        uses: sonarsource/sonarqube-scan-action@v6
-        with:
-          projectBaseDir: .
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONARCLOUD_TOKEN }}
-
       - name: Create test summary
         uses: test-summary/action@v2.4
         with:
