@@ -1,0 +1,42 @@
+name: Update Python Dependencies
+"on":
+  schedule:
+    - cron: 0 2 * * 1
+  workflow_dispatch: { }
+jobs:
+  update-deps:
+    name: Update Python Dependencies with UV
+    runs-on:
+      - ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install Dependencies
+        run: uv sync --frozen
+
+      - name: Update Dependencies
+        run: uv lock --upgrade
+
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          body: |-
+            Update Python Dependencies
+
+            Please review the changes in this PR, which will update dependencies to their latest versions.
+          branch: update/python-deps
+          commit-message: |-
+            Update Python Dependencies
+
+            Update Python Dependencies to their latest versions
+          committer: Daniel Mikusa <dan@mikusa.com>
+          author: Daniel Mikusa <dan@mikusa.com>
+          delete-branch: true
+          title: Update Python Dependencies

@@ -1,12 +1,16 @@
 version: 2
 updates:
-  - package-ecosystem: "cargo"
-    directory: "/"
+  - package-ecosystem: "github-actions" # See documentation for possible values
+    directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
-    labels:
-      - dependency-upgrade
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
+    allow:
+      - dependency-type: "all"
+    groups:
+      npm:
+        patterns:
+          - "*"
+        # group all minor and patch dependency updates together
+        update-types:
+          - "minor"
+          - "patch"
