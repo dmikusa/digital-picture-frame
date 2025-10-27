@@ -4,21 +4,19 @@ A fullscreen photo slideshow application built with Python and GTK4, designed to
 
 ## Features
 
-- Fullscreen photo display with smooth crossfade transitions
-- Automatic cycling through photos in a directory
-- Configurable display duration (default: 5 seconds)
-- Smooth 1-second crossfade transitions between photos
+- Fullscreen photo display with transitions as it rotates through photos in a directory
+- Configurable display duration (default: 5 seconds) & crossfade duration
 - Support for common image formats (JPEG, PNG, GIF, BMP, TIFF, WebP)
-- Always reads fresh directory listing (no cached file list)
-- Configurable via JSON configuration file
 
 ## Requirements
 
 - Python 3.10 or later
 - GTK4 development libraries
-- uv package manager (recommended)
+- uv package manager (for development)
 
 ### System Dependencies
+
+This should run on most systems with the following dependencies:
 
 #### Ubuntu/Debian
 ```bash
@@ -38,18 +36,13 @@ sudo dnf install python3-gobject gtk4-devel
 
 ## Installation
 
+Better options coming, but for now...
+
 ### Using uv (recommended)
 
-1. Install uv if you haven't already:
-```bash
-# macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Or with pip
-pip install uv
-```
-
+1. Install uv if you haven't already
 2. Clone and install the project:
+
 ```bash
 git clone https://github.com/dmikusa/digital-picture-frame.git
 cd digital-picture-frame
@@ -66,21 +59,48 @@ pip install -e .
 
 ## Usage
 
-### Quick Start
+### Create a Configuration File
+
+Create `frame-config.json` file in either:
+
+- Current directory
+- `~/.picture-frame-ui/frame-config.json`
+
+You can copy `frame-config.json.example` to get started, or copy what's below:
+
+```json
+{
+  "photos_directory": "images",
+  "slideshow_duration": 5,
+  "fade_duration": 1000,
+  "import_directory": "import",
+  "full_screen": false,
+  "rendering_type": "GPU"
+}
+```
+
+Configuration options:
+- `photos_directory`: Path to directory containing photos that will be displayed. This directory is controlled by the application, and is basically where you want it to cache the photos that it is displaying.
+- `import_directory`: Path to your photos. These are not changed or modified. Photos from this directory are resized and copied into `photos_directory`.
+- `slideshow_duration`: Seconds between photo changes (default: 5)
+- `fade_duration`: Crossfade transition duration in milliseconds (default: 1000)
+- `full_screen`: Launch the app in full screen mode.
+- `rendering_type`: Either `GPU` or `CPU`, the default is `GPU`. Most users should stick with `GPU`, but if the app fails to start on your system, then try `CPU`.
+
+### Run the App
+
+There are a few ways you can run this. They all work, and are in no particular order. Use whatever is more convenient for you.
+
+#### With `uv`
 
 ```bash
-# Create a photos directory and add some images
-mkdir images
-# Add your photos to the images directory
-
-# Run the application
 uv run python main.py
 
 # Or with debug logging
 DEBUG=1 uv run python main.py
 ```
 
-### Using pip installation
+#### Using pip installation
 
 ```bash
 # After pip install (run from project directory)
@@ -90,29 +110,11 @@ python main.py
 DEBUG=1 python main.py
 ```
 
-### Configuration
+#### Custom PYTHONPATH
 
-Create a `frame-config.json` file in either:
-- Current directory
-- `~/.picture-frame-ui/frame-config.json`
-
-Example configuration:
-```json
-{
-  "photos_directory": "/path/to/your/photos",
-  "slideshow_duration": 5,
-  "fade_duration": 1000
-}
+```bash
+PYTHONPATH=./src python main.py
 ```
-
-Configuration options:
-- `photos_directory`: Path to directory containing photos (default: "images")
-- `slideshow_duration`: Seconds between photo changes (default: 5)
-- `fade_duration`: Crossfade transition duration in milliseconds (default: 1000)
-
-### Keyboard Shortcuts
-
-- **Cmd+Q** (macOS) or **Ctrl+Q** (Linux/Windows): Quit application
 
 ## Development
 
@@ -135,59 +137,23 @@ DEBUG=1 uv run python main.py
 
 ### Testing
 
-The project includes comprehensive test coverage for the core library modules:
+To run tests:
 
 ```bash
-# Run all tests
-uv run pytest
-
-# Run tests with verbose output
-uv run pytest -v
-
-# Run specific test file
-uv run pytest src/picture_frame_ui/config_test.py
-
-# Run tests using justfile
 just test-all
 
 # Run specific test
 just test src/picture_frame_ui/photos_test.py
 ```
 
-**Test Coverage:**
-- **Config module**: Configuration loading, saving, validation, fallback behavior
-- **Photos module**: Directory scanning, image filtering, cycling, error handling
+or to watch for test changes and auto-run:
+
+```bash
+just watch-all
+
+# Run specific test
+just watch src/picture_frame_ui/photos_test.py
 ```
-
-### Project Structure
-
-```
-src/picture_frame_ui/           # Python library
-├── __init__.py                 # Package initialization
-├── config.py                   # Configuration management
-├── photos.py                   # Photo loading and directory scanning
-└── ui.py                      # GTK4 user interface
-main.py                        # Application entry point
-test_images/                   # Sample images for testing
-pyproject.toml                 # Python project configuration
-frame-config.json              # Current config file
-frame-config.json.example      # Example config file
-justfile                       # Development commands
-README.md                      # This documentation
-LICENSE                        # AGPL-3.0 license
-```
-
-## Migration from Rust Version
-
-This Python version is functionally equivalent to the original Rust version with the following improvements:
-
-- More Pythonic configuration handling
-- Better error handling and logging
-- Simplified dependency management with uv
-- Same GTK4 UI with crossfade transitions
-- Same slideshow functionality
-
-The memory monitoring features from the Rust version have been removed as they're not necessary in Python.
 
 ## License
 
