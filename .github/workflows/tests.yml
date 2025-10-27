@@ -47,7 +47,7 @@ jobs:
 
       - name: Run Tests
         run: |
-          uv run --frozen coverage run --source=src/sevensignal_mcp --omit "*_test.py" -m pytest -vv --junitxml=results.xml
+          uv run --frozen coverage run --source=src/picture_frame_ui --omit "*_test.py" -m pytest -vv --junitxml=results.xml
           uv run --frozen coverage xml -o coverage.xml
 
       - name: Create test summary
