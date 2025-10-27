@@ -17,19 +17,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Iterator, Optional
-from urllib.parse import urljoin
-from urllib.request import pathname2url
 
 logger = logging.getLogger(__name__)
 
 
 class PhotoLoader(ABC):
     """Abstract base class for photo loaders"""
-    
+
     @abstractmethod
     def load_next_photo(self) -> str:
         """Load the next photo and return its file URL"""
@@ -38,57 +35,75 @@ class PhotoLoader(ABC):
 
 class FilePhotoLoader(PhotoLoader):
     """Photo loader that reads from a filesystem directory"""
-    
+
     # Common image file extensions
-    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
-    
+    IMAGE_EXTENSIONS = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".tiff",
+        ".tif",
+        ".webp",
+    }
+
     def __init__(self, base_directory: str):
         self.base_directory = Path(base_directory)
         self._current_iterator: Optional[Iterator[Path]] = None
         logger.info(f"Created FilePhotoLoader for directory: {self.base_directory}")
-    
+
     def _get_image_files(self) -> Iterator[Path]:
         """Get an iterator of image files in the directory"""
         if not self.base_directory.exists():
-            raise FileNotFoundError(f"Photos directory does not exist: {self.base_directory}")
-        
+            raise FileNotFoundError(
+                f"Photos directory does not exist: {self.base_directory}"
+            )
+
         if not self.base_directory.is_dir():
-            raise NotADirectoryError(f"Photos path is not a directory: {self.base_directory}")
-        
+            raise NotADirectoryError(
+                f"Photos path is not a directory: {self.base_directory}"
+            )
+
         # Get all files in directory and filter for image extensions
         image_files = []
         for file_path in self.base_directory.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in self.IMAGE_EXTENSIONS:
+            if (
+                file_path.is_file()
+                and file_path.suffix.lower() in self.IMAGE_EXTENSIONS
+            ):
                 image_files.append(file_path.resolve())
-        
+
         if not image_files:
-            raise FileNotFoundError(f"No image files found in directory: {self.base_directory}")
-        
+            raise FileNotFoundError(
+                f"No image files found in directory: {self.base_directory}"
+            )
+
         # Sort files to ensure consistent ordering across platforms
         image_files.sort(key=lambda p: p.name.lower())
-        
+
         logger.debug(f"Found {len(image_files)} image files in {self.base_directory}")
         return iter(image_files)
-    
+
     def load_next_photo(self) -> str:
         """Load the next photo and return its file URL"""
         if self._current_iterator is None:
             logger.info(f"Reading photos from directory: {self.base_directory}")
             self._current_iterator = self._get_image_files()
-        
+
         try:
             # Get next file from iterator
             next_file = next(self._current_iterator)
             file_url = Path(next_file).as_uri()
             logger.debug(f"Loading image: {file_url}")
             return file_url
-            
+
         except StopIteration:
             # End of iterator, restart from beginning
             logger.debug("Reached end of photo list, restarting")
             self._current_iterator = None
             return self.load_next_photo()  # Recursive call to restart
-    
+
     def refresh_directory(self) -> None:
         """Force refresh of the directory listing on next load_next_photo call"""
         self._current_iterator = None

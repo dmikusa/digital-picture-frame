@@ -19,7 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import hashlib
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 from PIL import Image
 
@@ -290,7 +290,7 @@ class PhotoImporter:
                 self.resize_image(source_path, target_path, target_width, target_height)
             else:
                 # Image doesn't need resizing, just copy
-                logger.info(f"Photo is within size limits, copying without resize")
+                logger.info("Photo is within size limits, copying without resize")
                 self.copy_image(source_path, target_path)
 
             logger.info(f"Successfully processed photo: {source_path} -> {target_path}")

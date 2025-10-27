@@ -221,7 +221,7 @@ class TestPhotoImporter:
 
         # Create a file with hash pattern
         hash_value = "abcdef1234567890"
-        existing_file = photos_dir / f"existing##{ hash_value}.jpg"
+        existing_file = photos_dir / f"existing##{hash_value}.jpg"
         existing_file.touch()
 
         assert importer.photo_exists_in_directory(hash_value)

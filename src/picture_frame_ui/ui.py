@@ -20,6 +20,10 @@ import logging
 import sys
 import os
 import gi
+from pathlib import Path
+from typing import Optional, Any
+from .config import FrameConfig
+from .photos import PhotoLoader
 
 # Set basic environment to avoid accessibility warnings
 os.environ.setdefault("GTK_A11Y", "none")
@@ -29,11 +33,7 @@ gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 gi.require_version("Gdk", "4.0")
 
-from gi.repository import Gtk, Gio, GLib, Gdk  # type: ignore[import-untyped]
-from pathlib import Path
-from typing import Optional, Any
-from .config import FrameConfig
-from .photos import PhotoLoader
+from gi.repository import Gtk, Gio, GLib, Gdk  # type: ignore[import-untyped]  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +215,6 @@ class PictureFrameApp(Gtk.Application):
             surface = self.window.get_surface()
             if surface is not None:
                 # Create an empty cursor to hide the mouse
-                display = self.window.get_display()
                 cursor = Gdk.Cursor.new_from_name("none", None)
                 if cursor is None:
                     # Fallback: create a blank cursor

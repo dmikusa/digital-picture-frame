@@ -4,7 +4,6 @@ Tests for the photos module
 
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
