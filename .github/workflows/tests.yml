@@ -1,4 +1,4 @@
-name: Run Gateway MCP Tests
+name: Run Tests
 
 on:
   push:
@@ -49,8 +49,6 @@ jobs:
         run: |
           uv run --frozen coverage run --source=src/sevensignal_mcp --omit "*_test.py" -m pytest -vv --junitxml=results.xml
           uv run --frozen coverage xml -o coverage.xml
-        env:
-          GATEWAY_ENV_FILE: ".env.test.gateway"
 
       - name: SonarCloud Scan
         uses: sonarsource/sonarqube-scan-action@v6
@@ -106,8 +104,6 @@ jobs:
       - name: Run Tests
         run: |
           uv run --frozen pytest -vv --junitxml=results.xml
-        env:
-          GATEWAY_ENV_FILE: ".env.test.gateway"
 
       - name: Create test summary
         uses: test-summary/action@v2.4
