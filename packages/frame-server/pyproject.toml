@@ -1,30 +1,25 @@
 [project]
-name = "digital-picture-frame-workspace"
+name = "frame-server"
 version = "0.1.0"
-description = "A digital picture frame with UI, photo management, and web server components"
+description = "Web server for uploading photos to the digital picture frame"
 readme = "README.md"
 license = "AGPL-3.0"
 authors = [{name = "Daniel Mikusa"}]
 requires-python = ">=3.10"
 dependencies = [
-    "picture-frame-ui",
     "photo-manager",
-    "frame-server",
 ]
 
-[project.urls]
-Repository = "https://github.com/dmikusa/digital-picture-frame"
-
 [project.scripts]
-picture-frame-ui = "main:main"
-
-[tool.uv.workspace]
-members = ["packages/*"]
+frame-server = "frame_server.server:main"
+frame-client = "frame_server.client:main"
 
 [tool.uv.sources]
-picture-frame-ui = { workspace = true }
 photo-manager = { workspace = true }
-frame-server = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.8.13,<0.9.0"]
+build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
@@ -35,13 +30,13 @@ dev = [
 ]
 
 [tool.pyright]
-include = ["packages/**/src", "main.py"]
+include = ["src/frame_server"]
 exclude = ["**/__pycache__"]
 pythonVersion = "3.11"
 pythonPlatform = "Linux"
 
 [tool.pytest.ini_options]
-testpaths = ["packages"]
+testpaths = ["src/frame_server"]
 addopts = [
     "--strict-markers",
     "--strict-config",

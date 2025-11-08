@@ -20,17 +20,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from picture_frame_ui.config import FrameConfig
-from picture_frame_ui.photos import create_photo_loader
-from picture_frame_ui.importer import import_photos_from_directory
+from photo_manager.photos import create_photo_loader
+from photo_manager.importer import import_photos_from_directory
 from picture_frame_ui.ui import (
     run_app,
     InitializationError,
     RuntimeError,
     get_screen_dimensions,
 )
+from frame_server.server import run_server
 
 
 def setup_logging():
@@ -80,7 +82,10 @@ def main():
                 )
 
                 imported_count = import_photos_from_directory(
-                    import_path, photos_path, screen_width, screen_height
+                    import_path,
+                    photos_path,
+                    max_width=screen_width,
+                    max_height=screen_height,
                 )
                 if imported_count > 0:
                     logger.info(f"Successfully imported {imported_count} new photos")
@@ -109,6 +114,21 @@ def main():
 
         # Create photo loader
         photo_loader = create_photo_loader(str(photos_path))
+
+        # Start the frame server in a background thread
+        logger.info("Starting frame server in background")
+        server_thread = threading.Thread(
+            target=run_server,
+            kwargs={
+                "host": "0.0.0.0",
+                "port": 8080,
+                "photos_directory": str(photos_path),
+            },
+            daemon=True,  # Dies when main thread dies
+            name="FrameServer",
+        )
+        server_thread.start()
+        logger.info("Frame server started on http://0.0.0.0:8080")
 
         logger.debug("Starting UI")
         exit_code = run_app(config, photo_loader)

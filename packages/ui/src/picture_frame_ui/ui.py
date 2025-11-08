@@ -22,8 +22,9 @@ import os
 import gi
 from pathlib import Path
 from typing import Optional, Any
+from photo_manager.photos import PhotoLoader
 from .config import FrameConfig
-from .photos import PhotoLoader
+
 
 # Set basic environment to avoid accessibility warnings
 os.environ.setdefault("GTK_A11Y", "none")

@@ -1,0 +1,36 @@
+[project]
+name = "photo-manager"
+version = "0.1.0"
+description = "Photo loading, importing, and management for digital picture frame"
+readme = "README.md"
+license = "AGPL-3.0"
+authors = [{name = "Daniel Mikusa"}]
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=12.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.13,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.11.0",
+    "pyright>=1.1.406",
+    "pytest>=8.4.2",
+    "ruff>=0.14.1",
+]
+
+[tool.pyright]
+include = ["src/photo_manager"]
+exclude = ["**/__pycache__"]
+pythonVersion = "3.11"
+pythonPlatform = "Linux"
+
+[tool.pytest.ini_options]
+testpaths = ["src/photo_manager"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+]

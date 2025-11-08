@@ -21,7 +21,7 @@ import pytest
 from pathlib import Path
 from PIL import Image
 
-from picture_frame_ui.importer import PhotoImporter, import_photos_from_directory
+from photo_manager.importer import PhotoImporter, import_photos_from_directory
 
 
 class TestPhotoImporter:

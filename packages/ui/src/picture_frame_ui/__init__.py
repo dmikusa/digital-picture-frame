@@ -1,5 +1,5 @@
 """
-Digital Picture Frame - A fullscreen photo slideshow application
+Picture Frame UI - User Interface Components
 Copyright (C) 2025 Daniel Mikusa
 
 This program is free software: you can redistribute it and/or modify
