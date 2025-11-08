@@ -36,7 +36,7 @@ class FrameServerHandler(BaseHTTPRequestHandler):
     def __init__(
         self, *args, photos_path: str, max_file_size: int = 20 * 1024 * 1024, **kwargs
     ):
-        super().__init__(*args, **kwargs)
+        # Set attributes BEFORE calling super().__init__() because it immediately processes the request
         self.max_file_size = max_file_size
 
         photos_directory = Path(photos_path)
@@ -46,6 +46,9 @@ class FrameServerHandler(BaseHTTPRequestHandler):
             max_width=1920,
             max_height=1080,
         )
+
+        # This starts processing the request immediately!
+        super().__init__(*args, **kwargs)
 
     def do_GET(self):
         """Handle GET requests"""
@@ -67,6 +70,13 @@ class FrameServerHandler(BaseHTTPRequestHandler):
 
     def _handle_upload(self):
         """Handle photo upload"""
+        logger.info(f"_handle_upload called, checking for max_file_size attribute")
+        logger.info(f"self.__dict__: {self.__dict__}")
+        if not hasattr(self, "max_file_size"):
+            logger.error("max_file_size attribute not found!")
+            self._send_json_response({"error": "Server configuration error"}, 500)
+            return
+
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length == 0:
@@ -186,10 +196,17 @@ def run_server(
     max_file_size: int = 20 * 1024 * 1024,
 ):
     """Run the frame server"""
-    handler = partial(
-        FrameServerHandler, max_file_size=max_file_size, photos_path=photos_path
-    )
-    server = HTTPServer((host, port), handler)
+
+    def handler_factory(*args, **kwargs):
+        logger.info(f"handler_factory called with args: {args}, kwargs: {kwargs}")
+        logger.info(
+            f"Creating handler with photos_path: {photos_path}, max_file_size: {max_file_size}"
+        )
+        return FrameServerHandler(
+            *args, photos_path=photos_path, max_file_size=max_file_size, **kwargs
+        )
+
+    server = HTTPServer((host, port), handler_factory)
     logger.info(f"Frame server running at http://{host}:{port}")
     logger.info("Available endpoints:")
     logger.info("  GET / or /index - Web interface")

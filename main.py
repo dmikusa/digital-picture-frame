@@ -115,7 +115,7 @@ def main():
     logger.info("Starting frame server in background")
     server_thread = threading.Thread(
         target=run_server,
-        args=(photos_path,),
+        args=(str(photos_path),),
         kwargs={
             "host": "0.0.0.0",
             "port": 8080,
