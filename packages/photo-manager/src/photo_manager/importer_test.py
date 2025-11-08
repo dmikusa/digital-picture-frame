@@ -63,9 +63,9 @@ class TestPhotoImporter:
         return image_path
 
     def test_calculate_sha1(self, temp_dirs, sample_image):
-        """Test SHA1 hash calculation"""
+        """Test SHA1 calculation"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         hash1 = importer.calculate_sha1(sample_image)
         hash2 = importer.calculate_sha1(sample_image)
@@ -76,9 +76,9 @@ class TestPhotoImporter:
         assert all(c in "0123456789abcdef" for c in hash1)
 
     def test_get_image_dimensions(self, temp_dirs, sample_image):
-        """Test getting image dimensions"""
+        """Test image dimension retrieval"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         width, height = importer.get_image_dimensions(sample_image)
         assert width == 2400
@@ -87,7 +87,7 @@ class TestPhotoImporter:
     def test_calculate_resize_dimensions_needs_resize(self, temp_dirs):
         """Test dimension calculation when resize is needed"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         # Test image larger than max dimensions
         new_width, new_height = importer.calculate_resize_dimensions(2400, 1600)
@@ -105,7 +105,7 @@ class TestPhotoImporter:
         """Test dimension calculation with custom screen dimensions"""
         import_dir, photos_dir = temp_dirs
         # Test with a smaller screen size
-        importer = PhotoImporter(import_dir, photos_dir, max_width=1366, max_height=768)
+        importer = PhotoImporter(photos_dir, max_width=1366, max_height=768)
 
         # Test image larger than custom max dimensions
         new_width, new_height = importer.calculate_resize_dimensions(2400, 1600)
@@ -127,7 +127,7 @@ class TestPhotoImporter:
     def test_calculate_resize_width_needs_resize(self, temp_dirs):
         """Test dimension calculation when width resize is needed"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         # Test image larger than max dimensions
         new_width, new_height = importer.calculate_resize_dimensions(2400, 900)
@@ -144,7 +144,7 @@ class TestPhotoImporter:
     def test_calculate_resize_height_needs_resize(self, temp_dirs):
         """Test dimension calculation when height resize is needed"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         # Test image larger than max dimensions
         new_width, new_height = importer.calculate_resize_dimensions(900, 2400)
@@ -170,7 +170,7 @@ class TestPhotoImporter:
     def test_calculate_resize_dimensions_no_resize_needed(self, temp_dirs):
         """Test dimension calculation when no resize is needed"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         # Test image smaller than max dimensions
         new_width, new_height = importer.calculate_resize_dimensions(800, 600)
@@ -182,7 +182,7 @@ class TestPhotoImporter:
     def test_calculate_resize_dimensions_tall_image(self, temp_dirs):
         """Test dimension calculation for tall images"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         # Test tall image (height is limiting factor)
         new_width, new_height = importer.calculate_resize_dimensions(1080, 1920)
@@ -199,7 +199,7 @@ class TestPhotoImporter:
     def test_generate_target_filename(self, temp_dirs, sample_image):
         """Test target filename generation"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         hash_value = "abcdef1234567890"
         filename = importer.generate_target_filename(sample_image, hash_value)
@@ -210,14 +210,14 @@ class TestPhotoImporter:
     def test_photo_exists_in_directory_false(self, temp_dirs):
         """Test checking for non-existent photo"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         assert not importer.photo_exists_in_directory("nonexistent_hash")
 
     def test_photo_exists_in_directory_true(self, temp_dirs):
         """Test checking for existing photo"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         # Create a file with hash pattern
         hash_value = "abcdef1234567890"
@@ -229,7 +229,7 @@ class TestPhotoImporter:
     def test_process_photo_success_with_resize(self, temp_dirs, sample_image):
         """Test successful photo processing with resize"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         result = importer.process_photo(sample_image)
 
@@ -254,7 +254,7 @@ class TestPhotoImporter:
     def test_process_photo_success_no_resize(self, temp_dirs, small_image):
         """Test successful photo processing without resize"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         result = importer.process_photo(small_image)
 
@@ -275,7 +275,7 @@ class TestPhotoImporter:
     def test_process_photo_skip_existing(self, temp_dirs, sample_image):
         """Test skipping photo that already exists"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
         # Process photo first time
         result1 = importer.process_photo(sample_image)
@@ -292,9 +292,9 @@ class TestPhotoImporter:
     def test_import_photos_empty_directory(self, temp_dirs):
         """Test importing from empty directory"""
         import_dir, photos_dir = temp_dirs
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
 
-        count = importer.import_photos()
+        count = importer.import_photos(import_dir)
         assert count == 0
 
     def test_import_photos_multiple_files(self, temp_dirs):
@@ -309,8 +309,8 @@ class TestPhotoImporter:
         # Create a non-image file (should be ignored)
         (import_dir / "readme.txt").write_text("Not an image")
 
-        importer = PhotoImporter(import_dir, photos_dir)
-        count = importer.import_photos()
+        importer = PhotoImporter(photos_dir)
+        count = importer.import_photos(import_dir)
 
         assert count == 3
 
@@ -323,8 +323,8 @@ class TestPhotoImporter:
         _, photos_dir = temp_dirs
         nonexistent_dir = Path("/nonexistent/directory")
 
-        importer = PhotoImporter(nonexistent_dir, photos_dir)
-        count = importer.import_photos()
+        importer = PhotoImporter(photos_dir)
+        count = importer.import_photos(nonexistent_dir)
 
         assert count == 0
 
@@ -344,8 +344,8 @@ class TestPhotoImporter:
             img = Image.new("RGB", (800, 600), color="yellow")
             img.save(import_dir / filename, format_name)
 
-        importer = PhotoImporter(import_dir, photos_dir)
-        count = importer.import_photos()
+        importer = PhotoImporter(photos_dir)
+        count = importer.import_photos(import_dir)
 
         assert count == len(formats)
 
@@ -444,7 +444,7 @@ class TestErrorHandling:
         invalid_file = import_dir / "invalid.jpg"
         invalid_file.write_text("This is not an image")
 
-        importer = PhotoImporter(import_dir, photos_dir)
+        importer = PhotoImporter(photos_dir)
         result = importer.process_photo(invalid_file)
 
         assert result is False
@@ -461,7 +461,7 @@ class TestErrorHandling:
         photos_dir.chmod(0o444)
 
         try:
-            importer = PhotoImporter(import_dir, photos_dir)
+            importer = PhotoImporter(photos_dir)
             result = importer.process_photo(sample_image)
 
             # Should handle the error gracefully

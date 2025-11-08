@@ -21,15 +21,12 @@ import logging
 import os
 import sys
 import threading
-from pathlib import Path
 
 from picture_frame_ui.config import FrameConfig
 from photo_manager.photos import create_photo_loader
 from photo_manager.importer import import_photos_from_directory
 from picture_frame_ui.ui import (
     run_app,
-    InitializationError,
-    RuntimeError,
     get_screen_dimensions,
 )
 from frame_server.server import run_server
@@ -60,96 +57,81 @@ def main():
 
     logger.info("Digital Picture Frame starting up")
 
-    try:
-        # Load configuration
-        logger.debug("Loading configuration")
-        config = FrameConfig.load()
+    # Load configuration
+    logger.debug("Loading configuration")
+    config = FrameConfig.load()
 
-        # Import new photos if import directory is configured
-        import_path = config.get_import_path()
-        if import_path is not None:
-            logger.info(f"Import directory configured: {import_path}")
-            photos_path = config.get_photos_path()
-
-            # Ensure photos directory exists
-            photos_path.mkdir(parents=True, exist_ok=True)
-
-            try:
-                # Get screen dimensions for optimal photo resizing
-                screen_width, screen_height = get_screen_dimensions()
-                logger.debug(
-                    f"Using screen dimensions for photo import: {screen_width}x{screen_height}"
-                )
-
-                imported_count = import_photos_from_directory(
-                    import_path,
-                    photos_path,
-                    max_width=screen_width,
-                    max_height=screen_height,
-                )
-                if imported_count > 0:
-                    logger.info(f"Successfully imported {imported_count} new photos")
-                else:
-                    logger.debug("No new photos to import")
-            except Exception as e:
-                logger.error(f"Failed to import photos: {e}", exc_info=True)
-                # Continue with application startup even if import fails
-        else:
-            logger.debug("No import directory configured, skipping photo import")
-
-        logger.debug(
-            f"Creating Photo Loader from configured directory: {config.photos_directory}"
-        )
-
-        # Validate photos directory exists
+    # Import new photos if import directory is configured
+    import_path = config.get_import_path()
+    if import_path is not None:
+        logger.info(f"Import directory configured: {import_path}")
         photos_path = config.get_photos_path()
-        if not photos_path.exists():
-            logger.error(f"Photos directory does not exist: {photos_path}")
-            logger.info(f"Please create the directory or update the configuration")
-            return 1
 
-        if not photos_path.is_dir():
-            logger.error(f"Photos path is not a directory: {photos_path}")
-            return 1
+        # Ensure photos directory exists
+        photos_path.mkdir(parents=True, exist_ok=True)
 
-        # Create photo loader
-        photo_loader = create_photo_loader(str(photos_path))
+        try:
+            # Get screen dimensions for optimal photo resizing
+            screen_width, screen_height = get_screen_dimensions()
+            logger.debug(
+                f"Using screen dimensions for photo import: {screen_width}x{screen_height}"
+            )
 
-        # Start the frame server in a background thread
-        logger.info("Starting frame server in background")
-        server_thread = threading.Thread(
-            target=run_server,
-            kwargs={
-                "host": "0.0.0.0",
-                "port": 8080,
-                "photos_directory": str(photos_path),
-            },
-            daemon=True,  # Dies when main thread dies
-            name="FrameServer",
-        )
-        server_thread.start()
-        logger.info("Frame server started on http://0.0.0.0:8080")
+            imported_count = import_photos_from_directory(
+                import_path,
+                photos_path,
+                max_width=screen_width,
+                max_height=screen_height,
+            )
+            if imported_count > 0:
+                logger.info(f"Successfully imported {imported_count} new photos")
+            else:
+                logger.debug("No new photos to import")
+        except Exception as e:
+            logger.error(f"Failed to import photos: {e}", exc_info=True)
+            # Continue with application startup even if import fails
+    else:
+        logger.debug("No import directory configured, skipping photo import")
 
-        logger.debug("Starting UI")
-        exit_code = run_app(config, photo_loader)
+    logger.debug(
+        f"Creating Photo Loader from configured directory: {config.photos_directory}"
+    )
 
-        logger.info("Digital Picture Frame shutting down")
-        return exit_code
-
-    except InitializationError as e:
-        logger.error(f"UI Initialization Error: {e}")
+    # Validate photos directory exists
+    photos_path = config.get_photos_path()
+    if not photos_path.exists():
+        logger.error(f"Photos directory does not exist: {photos_path}")
+        logger.info(f"Please create the directory or update the configuration")
         return 1
-    except RuntimeError as e:
-        logger.error(f"UI Runtime Error: {e}")
+
+    if not photos_path.is_dir():
+        logger.error(f"Photos path is not a directory: {photos_path}")
         return 1
-    except FileNotFoundError as e:
-        logger.error(f"File not found: {e}")
-        logger.info("Please check your photos directory configuration")
-        return 1
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        return 1
+
+    # Create photo loader
+    photo_loader = create_photo_loader(str(photos_path))
+
+    # Start the frame server in a background thread
+    logger.info("Starting frame server in background")
+    server_thread = threading.Thread(
+        target=run_server,
+        args=(photos_path,),
+        kwargs={
+            "host": "0.0.0.0",
+            "port": 8080,
+        },
+        daemon=True,  # Dies when main thread dies
+        name="FrameServer",
+    )
+    server_thread.start()
+    logger.info("Frame server started on http://0.0.0.0:8080")
+
+    logger.debug("Starting UI")
+    exit_code = run_app(config, photo_loader)
+
+    logger.info("Digital Picture Frame shutting down")
+    return exit_code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

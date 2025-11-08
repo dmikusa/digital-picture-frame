@@ -43,7 +43,6 @@ class PhotoImporter:
 
     def __init__(
         self,
-        import_directory: Path,
         photos_directory: Path,
         max_width: int = 1920,
         max_height: int = 1080,
@@ -52,17 +51,15 @@ class PhotoImporter:
         Initialize the photo importer
 
         Args:
-            import_directory: Directory to scan for new photos
             photos_directory: Directory where processed photos are stored
             max_width: Maximum width for resized images (defaults to 1920)
             max_height: Maximum height for resized images (defaults to 1080)
         """
-        self.import_directory = import_directory
         self.photos_directory = photos_directory
         self.max_width = max_width
         self.max_height = max_height
         logger.info(
-            f"PhotoImporter initialized - import: {import_directory}, photos: {photos_directory}, max_size: {max_width}x{max_height}"
+            f"PhotoImporter initialized - photos: {photos_directory}, max_size: {max_width}x{max_height}"
         )
 
     def calculate_sha1(self, file_path: Path) -> str:
@@ -300,26 +297,50 @@ class PhotoImporter:
             logger.error(f"Failed to process photo {source_path}: {e}", exc_info=True)
             return False
 
-    def import_photos(self) -> int:
+    def import_single_file(self, file_path: Path) -> bool:
+        """
+        Import a single photo file
+
+        Args:
+            file_path: Path to the photo file to import
+
+        Returns:
+            True if photo was imported successfully, False if skipped or failed
+        """
+        if not file_path.exists() or not file_path.is_file():
+            logger.error(f"File does not exist or is not a file: {file_path}")
+            return False
+
+        if file_path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
+            logger.error(f"File type not supported: {file_path}")
+            return False
+
+        logger.info(f"Importing single file: {file_path}")
+        return self.process_photo(file_path)
+
+    def import_photos(self, import_directory: Path) -> int:
         """
         Import all supported photos from the import directory
+
+        Args:
+            import_directory: Directory to scan for new photos
 
         Returns:
             Number of photos successfully imported
         """
-        if not self.import_directory.exists():
-            logger.warning(f"Import directory does not exist: {self.import_directory}")
+        if not import_directory.exists():
+            logger.warning(f"Import directory does not exist: {import_directory}")
             return 0
 
-        if not self.import_directory.is_dir():
-            logger.error(f"Import path is not a directory: {self.import_directory}")
+        if not import_directory.is_dir():
+            logger.error(f"Import path is not a directory: {import_directory}")
             return 0
 
-        logger.info(f"Starting photo import from: {self.import_directory}")
+        logger.info(f"Starting photo import from: {import_directory}")
 
         # Find all supported image files
         image_files = []
-        for file_path in self.import_directory.iterdir():
+        for file_path in import_directory.iterdir():
             if (
                 file_path.is_file()
                 and file_path.suffix.lower() in self.SUPPORTED_EXTENSIONS
@@ -327,7 +348,7 @@ class PhotoImporter:
                 image_files.append(file_path)
 
         if not image_files:
-            logger.info(f"No supported image files found in: {self.import_directory}")
+            logger.info(f"No supported image files found in: {import_directory}")
             return 0
 
         logger.info(f"Found {len(image_files)} image files to process")
@@ -362,5 +383,5 @@ def import_photos_from_directory(
     Returns:
         Number of photos successfully imported
     """
-    importer = PhotoImporter(import_directory, photos_directory, max_width, max_height)
-    return importer.import_photos()
+    importer = PhotoImporter(photos_directory, max_width, max_height)
+    return importer.import_photos(import_directory)

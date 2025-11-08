@@ -2,8 +2,8 @@ typecheck:
     uv run --frozen pyright
 
 format:
-    uv run --frozen ruff check src/picture_frame_ui --fix --exit-non-zero-on-fix
-    uv run --frozen ruff format src/picture_frame_ui
+    uv run --frozen ruff check packages/ --fix --exit-non-zero-on-fix
+    uv run --frozen ruff format packages/
 
 test-all:
     uv run --frozen pytest -vv
@@ -13,12 +13,12 @@ test TEST:
 
 coverage-all:
     uv run --frozen coverage erase
-    uv run --frozen coverage run --source=src/picture_frame_ui --omit "*_test.py" -m pytest -vv
+    uv run --frozen coverage run --source=packages/ --omit "*_test.py" -m pytest -vv
     uv run --frozen coverage report -m
 
 coverage TEST:
     uv run --frozen coverage erase
-    uv run --frozen coverage run --source=src/picture_frame_ui --omit "*_test.py" -m pytest -vv {{TEST}}
+    uv run --frozen coverage run --source=packages/ --omit "*_test.py" -m pytest -vv {{TEST}}
     uv run --frozen coverage report -m
 
 watch-all:

@@ -18,16 +18,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import logging
-import os
-import sys
 import json
 import tempfile
-import shutil
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-from typing import Optional
-from photo_manager.importer import import_photos_from_directory
+from urllib.parse import urlparse
+from photo_manager.importer import PhotoImporter
+from functools import partial
 
 
 logger = logging.getLogger(__name__)
@@ -36,18 +33,26 @@ logger = logging.getLogger(__name__)
 class FrameServerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the frame server"""
 
-    def __init__(self, *args, photos_directory: Optional[str] = None, **kwargs):
-        self.photos_directory = photos_directory or "/tmp/frame-photos"
+    def __init__(
+        self, *args, photos_path: str, max_file_size: int = 20 * 1024 * 1024, **kwargs
+    ):
         super().__init__(*args, **kwargs)
+        self.max_file_size = max_file_size
+
+        photos_directory = Path(photos_path)
+        photos_directory.mkdir(parents=True, exist_ok=True)
+        self.photo_importer = PhotoImporter(
+            photos_directory=photos_directory,
+            max_width=1920,
+            max_height=1080,
+        )
 
     def do_GET(self):
         """Handle GET requests"""
         parsed_path = urlparse(self.path)
 
-        if parsed_path.path == "/health":
-            self._send_json_response({"status": "healthy"}, 200)
-        elif parsed_path.path == "/photos":
-            self._list_photos()
+        if parsed_path.path == "/" or parsed_path.path == "/index":
+            self._serve_index_html()
         else:
             self._send_json_response({"error": "Not found"}, 404)
 
@@ -68,82 +73,74 @@ class FrameServerHandler(BaseHTTPRequestHandler):
                 self._send_json_response({"error": "No content provided"}, 400)
                 return
 
+            # Check for file size limit
+            if content_length > self.max_file_size:
+                self._send_json_response(
+                    {
+                        "error": f"File too large. Maximum size is {self.max_file_size // (1024 * 1024)}MB"
+                    },
+                    413,  # HTTP 413 Payload Too Large
+                )
+                return
+
             # Read the uploaded file data
-            file_data = self.rfile.read(content_length)
-
-            # Create a temporary file
+            # Create a temporary file and write data in chunks to avoid memory issues
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-                temp_file.write(file_data)
-                temp_file_path = temp_file.name
+                bytes_remaining = content_length
+                bytes_read = 0
+                chunk_size = 8192  # 8KB chunks
 
-            try:
-                # Create temporary directory for import
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_photo_path = Path(temp_dir) / "uploaded_photo.jpg"
-                    shutil.move(temp_file_path, temp_photo_path)
+                while bytes_remaining > 0:
+                    chunk_size_to_read = min(chunk_size, bytes_remaining)
+                    chunk = self.rfile.read(chunk_size_to_read)
+                    if not chunk:
+                        break
 
-                    # Import the photo using the photo_manager
-                    photos_path = Path(self.photos_directory)
-                    photos_path.mkdir(parents=True, exist_ok=True)
-
-                    # Use standard screen dimensions for import
-                    imported_count = import_photos_from_directory(
-                        Path(temp_dir),
-                        photos_path,
-                        max_width=1920,
-                        max_height=1080,
-                    )
-
-                    if imported_count > 0:
+                    bytes_read += len(chunk)
+                    # Check if we've exceeded the max file size during reading
+                    if bytes_read > self.max_file_size:
+                        # Clean up the temporary file
+                        temp_file.close()
+                        Path(temp_file.name).unlink()
                         self._send_json_response(
                             {
-                                "success": True,
-                                "message": f"Successfully imported {imported_count} photo(s)",
+                                "error": f"File too large. Maximum size is {self.max_file_size // (1024 * 1024)}MB"
                             },
-                            200,
+                            413,
                         )
-                    else:
-                        self._send_json_response(
-                            {"error": "Failed to import photo"}, 400
-                        )
+                        return
+
+                    temp_file.write(chunk)
+                    bytes_remaining -= len(chunk)
+
+                temp_file_path = Path(temp_file.name)
+
+            try:
+                # Import the photo directly using the PhotoImporter instance
+                success = self.photo_importer.import_single_file(temp_file_path)
+
+                if success:
+                    self._send_json_response(
+                        {
+                            "success": True,
+                            "message": "Successfully imported photo",
+                        },
+                        200,
+                    )
+                else:
+                    self._send_json_response({"error": "Failed to import photo"}, 400)
 
             except Exception as e:
                 logger.error(f"Error importing photo: {e}")
                 self._send_json_response({"error": f"Import failed: {str(e)}"}, 500)
+            finally:
+                # Clean up the temporary file
+                if temp_file_path.exists():
+                    temp_file_path.unlink()
 
         except Exception as e:
             logger.error(f"Error handling upload: {e}")
             self._send_json_response({"error": f"Upload failed: {str(e)}"}, 500)
-
-    def _list_photos(self):
-        """List all photos in the photos directory"""
-        try:
-            photos_path = Path(self.photos_directory)
-            if not photos_path.exists():
-                photos_path.mkdir(parents=True, exist_ok=True)
-
-            # List all image files
-            image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
-            photos = []
-
-            for file_path in photos_path.iterdir():
-                if file_path.is_file() and file_path.suffix.lower() in image_extensions:
-                    photos.append(
-                        {
-                            "name": file_path.name,
-                            "size": file_path.stat().st_size,
-                            "modified": file_path.stat().st_mtime,
-                        }
-                    )
-
-            self._send_json_response(
-                {"photos": photos, "count": len(photos), "directory": str(photos_path)},
-                200,
-            )
-
-        except Exception as e:
-            logger.error(f"Error listing photos: {e}")
-            self._send_json_response({"error": f"Failed to list photos: {str(e)}"}, 500)
 
     def _send_json_response(self, data: dict, status_code: int):
         """Send a JSON response"""
@@ -155,78 +152,47 @@ class FrameServerHandler(BaseHTTPRequestHandler):
         response_data = json.dumps(data, indent=2).encode("utf-8")
         self.wfile.write(response_data)
 
+    def _serve_index_html(self):
+        """Serve the index.html file"""
+        try:
+            # Get the path to the HTML file relative to this module
+            current_dir = Path(__file__).parent
+            html_file_path = current_dir / "index.html"
+
+            if html_file_path.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                with open(html_file_path, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
+                self._send_json_response({"error": "Index file not found"}, 404)
+
+        except Exception as e:
+            logger.error(f"Error serving index.html: {e}")
+            self._send_json_response({"error": "Internal server error"}, 500)
+
     def log_message(self, format, *args):
         """Override log_message to use Python logging"""
         logger.info(f"{self.address_string()} - {format % args}")
 
 
-def create_handler_class(photos_directory: str):
-    """Create a handler class with the photos directory bound"""
-
-    class BoundFrameServerHandler(FrameServerHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, photos_directory=photos_directory, **kwargs)
-
-    return BoundFrameServerHandler
-
-
 def run_server(
-    host: str = "0.0.0.0", port: int = 8080, photos_directory: Optional[str] = None
+    photos_path: str,
+    host: str = "0.0.0.0",
+    port: int = 3400,
+    max_file_size: int = 20 * 1024 * 1024,
 ):
     """Run the frame server"""
-    if photos_directory is None:
-        photos_directory = os.environ.get("FRAME_PHOTOS_DIR", "/tmp/frame-photos")
-
-    logger.info(f"Starting frame server on {host}:{port}")
-    logger.info(f"Photos directory: {photos_directory}")
-
-    handler_class = create_handler_class(photos_directory)
-    server = None
-
-    try:
-        server = HTTPServer((host, port), handler_class)
-        logger.info(f"Frame server running at http://{host}:{port}")
-        logger.info("Available endpoints:")
-        logger.info("  GET  /health - Health check")
-        logger.info("  GET  /photos - List photos")
-        logger.info("  POST /upload - Upload photo")
-
-        server.serve_forever()
-
-    except KeyboardInterrupt:
-        logger.info("Shutting down frame server")
-        if server is not None:
-            server.shutdown()
-    except Exception as e:
-        logger.error(f"Server error: {e}")
-        if server is not None:
-            server.shutdown()
-        raise
-
-
-def main():
-    """Main entry point for the frame server"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handler = partial(
+        FrameServerHandler, max_file_size=max_file_size, photos_path=photos_path
     )
+    server = HTTPServer((host, port), handler)
+    logger.info(f"Frame server running at http://{host}:{port}")
+    logger.info("Available endpoints:")
+    logger.info("  GET / or /index - Web interface")
+    logger.info("  POST /upload - Upload photo")
 
-    # Parse command line arguments for basic configuration
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Digital Picture Frame Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Server host")
-    parser.add_argument("--port", type=int, default=8080, help="Server port")
-    parser.add_argument("--photos-dir", help="Photos directory path")
-
-    args = parser.parse_args()
-
-    try:
-        run_server(args.host, args.port, args.photos_dir)
-    except Exception as e:
-        logger.error(f"Failed to start server: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    server.serve_forever()
