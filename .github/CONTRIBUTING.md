@@ -33,6 +33,7 @@ This file contains persistent rules and conventions that should be followed when
 ### Python Conventions
 - **Follow PEP 8** for code style
 - **Use type hints** for all function parameters and return values
+- **Favor specific types** for hints, example use Path instead of str when referencing file paths
 - **Include comprehensive docstrings** for all public functions and classes
 - **Use pathlib.Path** instead of os.path for file operations
 - **Prefer f-strings** for string formatting

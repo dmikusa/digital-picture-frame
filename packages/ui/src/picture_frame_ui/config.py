@@ -36,6 +36,9 @@ class FrameConfig:
     import_directory: Optional[str] = None  # directory to import new photos from
     full_screen: bool = False  # whether to start in full screen mode
     rendering_type: str = "GPU"  # rendering type: "GPU" or "CPU"
+    server_host: str = "0.0.0.0"
+    server_port: int = 3400
+    server_max_file_size: int = 20 * 1024 * 1024  # max upload size in bytes
 
     @classmethod
     def load(cls) -> "FrameConfig":
@@ -102,9 +105,18 @@ class FrameConfig:
 
         # Convert relative path to absolute if needed
         if not path.is_absolute():
-            return Path.cwd() / path
-        else:
-            return path
+            path = Path.cwd() / path
+
+        if not path.exists():
+            logger.error(f"Photos directory does not exist: {path}")
+            logger.info(f"Please create the directory or update the configuration")
+            raise FileNotFoundError(f"Photos directory does not exist: {path}")
+
+        if not path.is_dir():
+            logger.error(f"Photos path is not a directory: {path}")
+            raise NotADirectoryError(f"Photos path is not a directory: {path}")
+
+        return path
 
     def get_import_path(self) -> Optional[Path]:
         """Get the absolute path to the import directory"""
@@ -128,19 +140,7 @@ class FrameConfig:
             "import_directory": self.import_directory,
             "full_screen": self.full_screen,
             "rendering_type": self.rendering_type,
+            "server_host": self.server_host,
+            "server_port": self.server_port,
+            "server_max_file_size": self.server_max_file_size,
         }
-
-    def save(self, config_path: Optional[Path] = None) -> None:
-        """Save configuration to file"""
-        if config_path is None:
-            config_path = Path("frame-config.json")
-
-        # Create directory if it doesn't exist
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            with open(config_path, "w") as f:
-                json.dump(self.to_dict(), f, indent=2)
-            logger.info(f"Configuration saved to: {config_path}")
-        except OSError as e:
-            logger.error(f"Failed to save config to {config_path}: {e}")

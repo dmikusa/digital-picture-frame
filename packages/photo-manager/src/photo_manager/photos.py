@@ -48,8 +48,8 @@ class FilePhotoLoader(PhotoLoader):
         ".webp",
     }
 
-    def __init__(self, base_directory: str):
-        self.base_directory = Path(base_directory)
+    def __init__(self, base_directory: Path):
+        self.base_directory = base_directory
         self._current_iterator: Optional[Iterator[Path]] = None
         logger.info(f"Created FilePhotoLoader for directory: {self.base_directory}")
 
@@ -110,6 +110,6 @@ class FilePhotoLoader(PhotoLoader):
         logger.debug("Directory listing will be refreshed on next photo load")
 
 
-def create_photo_loader(photos_directory: str) -> PhotoLoader:
+def create_photo_loader(photos_directory: Path) -> PhotoLoader:
     """Factory function to create appropriate photo loader"""
     return FilePhotoLoader(photos_directory)

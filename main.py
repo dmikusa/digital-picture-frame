@@ -61,6 +61,12 @@ def main():
     logger.debug("Loading configuration")
     config = FrameConfig.load()
 
+    # Get screen dimensions for optimal photo resizing
+    screen_width, screen_height = get_screen_dimensions()
+    logger.debug(
+        f"Using screen dimensions for photo import: {screen_width}x{screen_height}"
+    )
+
     # Import new photos if import directory is configured
     import_path = config.get_import_path()
     if import_path is not None:
@@ -71,12 +77,6 @@ def main():
         photos_path.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Get screen dimensions for optimal photo resizing
-            screen_width, screen_height = get_screen_dimensions()
-            logger.debug(
-                f"Using screen dimensions for photo import: {screen_width}x{screen_height}"
-            )
-
             imported_count = import_photos_from_directory(
                 import_path,
                 photos_path,
@@ -99,27 +99,16 @@ def main():
 
     # Validate photos directory exists
     photos_path = config.get_photos_path()
-    if not photos_path.exists():
-        logger.error(f"Photos directory does not exist: {photos_path}")
-        logger.info(f"Please create the directory or update the configuration")
-        return 1
-
-    if not photos_path.is_dir():
-        logger.error(f"Photos path is not a directory: {photos_path}")
-        return 1
 
     # Create photo loader
-    photo_loader = create_photo_loader(str(photos_path))
+    photo_loader = create_photo_loader(photos_path)
 
     # Start the frame server in a background thread
     logger.info("Starting frame server in background")
     server_thread = threading.Thread(
         target=run_server,
-        args=(str(photos_path),),
-        kwargs={
-            "host": "0.0.0.0",
-            "port": 8080,
-        },
+        args=(config, screen_width, screen_height),
+        kwargs={},
         daemon=True,  # Dies when main thread dies
         name="FrameServer",
     )

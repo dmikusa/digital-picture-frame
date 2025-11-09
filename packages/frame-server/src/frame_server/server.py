@@ -26,6 +26,8 @@ from urllib.parse import urlparse
 from photo_manager.importer import PhotoImporter
 from functools import partial
 
+from picture_frame_ui.config import FrameConfig
+
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +36,23 @@ class FrameServerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the frame server"""
 
     def __init__(
-        self, *args, photos_path: str, max_file_size: int = 20 * 1024 * 1024, **kwargs
+        self,
+        *args,
+        photos_path: Path,
+        screen_width: int,
+        screen_height: int,
+        max_file_size: int,
+        **kwargs,
     ):
         # Set attributes BEFORE calling super().__init__() because it immediately processes the request
         self.max_file_size = max_file_size
 
-        photos_directory = Path(photos_path)
+        photos_directory = photos_path
         photos_directory.mkdir(parents=True, exist_ok=True)
         self.photo_importer = PhotoImporter(
             photos_directory=photos_directory,
-            max_width=1920,
-            max_height=1080,
+            max_width=screen_width,
+            max_height=screen_height,
         )
 
         # This starts processing the request immediately!
@@ -190,24 +198,30 @@ class FrameServerHandler(BaseHTTPRequestHandler):
 
 
 def run_server(
-    photos_path: str,
-    host: str = "0.0.0.0",
-    port: int = 3400,
-    max_file_size: int = 20 * 1024 * 1024,
+    config: FrameConfig,
+    screen_width: int,
+    screen_height: int,
 ):
     """Run the frame server"""
 
     def handler_factory(*args, **kwargs):
         logger.info(f"handler_factory called with args: {args}, kwargs: {kwargs}")
         logger.info(
-            f"Creating handler with photos_path: {photos_path}, max_file_size: {max_file_size}"
+            f"Creating handler with photos_path: {config.get_photos_path()}, max_file_size: {config.server_max_file_size}"
         )
         return FrameServerHandler(
-            *args, photos_path=photos_path, max_file_size=max_file_size, **kwargs
+            *args,
+            photos_path=config.get_photos_path(),
+            max_file_size=config.server_max_file_size,
+            screen_width=screen_width,
+            screen_height=screen_height,
+            **kwargs,
         )
 
-    server = HTTPServer((host, port), handler_factory)
-    logger.info(f"Frame server running at http://{host}:{port}")
+    server = HTTPServer((config.server_host, config.server_port), handler_factory)
+    logger.info(
+        f"Frame server running at http://{config.server_host}:{config.server_port}"
+    )
     logger.info("Available endpoints:")
     logger.info("  GET / or /index - Web interface")
     logger.info("  POST /upload - Upload photo")

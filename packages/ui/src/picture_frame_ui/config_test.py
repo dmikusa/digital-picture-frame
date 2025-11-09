@@ -42,6 +42,9 @@ class TestFrameConfig:
             "import_directory": "/home/user/import",
             "full_screen": True,
             "rendering_type": "GPU",
+            "server_host": "0.0.0.0",
+            "server_port": 3400,
+            "server_max_file_size": 20971520,
         }
         assert config_dict == expected
 
@@ -181,80 +184,61 @@ class TestFrameConfig:
 
     def test_get_photos_path_relative(self):
         """Test getting absolute path from relative photos directory"""
-        config = FrameConfig(photos_directory="photos")
-        path = config.get_photos_path()
-
-        assert path.is_absolute()
-        assert path.name == "photos"
-
-    def test_get_photos_path_absolute(self):
-        """Test getting absolute path from absolute photos directory"""
-        abs_path = "/home/user/photos"
-        config = FrameConfig(photos_directory=abs_path)
-        path = config.get_photos_path()
-
-        assert path == Path(abs_path)
-        assert path.is_absolute()
-
-    def test_save_config(self):
-        """Test saving configuration to file"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config = FrameConfig(
-                photos_directory="/test/save", slideshow_duration=15, fade_duration=2500
-            )
-
-            config_path = Path(temp_dir) / "test-config.json"
-            config.save(config_path)
-
-            # Verify file was created and contains correct data
-            assert config_path.exists()
-
-            with open(config_path, "r") as f:
-                saved_data = json.load(f)
-
-            expected = {
-                "photos_directory": "/test/save",
-                "slideshow_duration": 15,
-                "fade_duration": 2500,
-                "import_directory": None,
-                "full_screen": False,
-                "rendering_type": "GPU",
-            }
-            assert saved_data == expected
-
-    def test_save_config_creates_directory(self):
-        """Test that save creates parent directories if they don't exist"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config = FrameConfig()
-
-            # Save to nested path that doesn't exist
-            config_path = Path(temp_dir) / "nested" / "dirs" / "config.json"
-            config.save(config_path)
-
-            assert config_path.exists()
-            assert config_path.parent.is_dir()
-
-    def test_save_config_default_path(self):
-        """Test saving config with default path"""
         with tempfile.TemporaryDirectory() as temp_dir:
             original_cwd = os.getcwd()
             try:
                 os.chdir(temp_dir)
+                # Create the photos directory
+                photos_dir = Path("photos")
+                photos_dir.mkdir()
 
-                config = FrameConfig(photos_directory="/test/default")
-                config.save()  # Use default path
+                config = FrameConfig(photos_directory="photos")
+                path = config.get_photos_path()
 
-                config_path = Path("frame-config.json")
-                assert config_path.exists()
-
-                # Verify content
-                with open(config_path, "r") as f:
-                    saved_data = json.load(f)
-
-                assert saved_data["photos_directory"] == "/test/default"
-
+                assert path.is_absolute()
+                assert path.name == "photos"
+                assert path.exists()
             finally:
                 os.chdir(original_cwd)
+
+    def test_get_photos_path_absolute(self):
+        """Test getting absolute path from absolute photos directory"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create the photos directory
+            photos_dir = Path(temp_dir) / "photos"
+            photos_dir.mkdir()
+
+            config = FrameConfig(photos_directory=str(photos_dir))
+            path = config.get_photos_path()
+
+            assert path == photos_dir
+            assert path.is_absolute()
+            assert path.exists()
+
+    def test_get_photos_path_not_exists(self):
+        """Test error when photos directory does not exist"""
+        config = FrameConfig(photos_directory="/nonexistent/path")
+
+        try:
+            config.get_photos_path()
+            assert False, "Expected FileNotFoundError"
+        except FileNotFoundError as e:
+            assert "Photos directory does not exist" in str(e)
+
+    def test_get_photos_path_not_directory(self):
+        """Test error when photos path is not a directory"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create a file instead of a directory
+            file_path = Path(temp_dir) / "not_a_dir.txt"
+            file_path.touch()
+
+            config = FrameConfig(photos_directory=str(file_path))
+
+            try:
+                config.get_photos_path()
+                assert False, "Expected NotADirectoryError"
+            except NotADirectoryError as e:
+                assert "Photos path is not a directory" in str(e)
 
     def test_get_import_path_none(self):
         """Test getting import path when import_directory is None"""
@@ -294,6 +278,9 @@ class TestFrameConfig:
             "import_directory": None,
             "full_screen": False,
             "rendering_type": "GPU",
+            "server_host": "0.0.0.0",
+            "server_port": 3400,
+            "server_max_file_size": 20971520,
         }
         assert config_dict == expected
 

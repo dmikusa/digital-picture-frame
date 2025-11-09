@@ -26,7 +26,7 @@ class TestFilePhotoLoader:
 
     def test_initialization(self):
         """Test FilePhotoLoader initialization"""
-        loader = FilePhotoLoader("/test/directory")
+        loader = FilePhotoLoader(Path("/test/directory"))
         assert loader.base_directory == Path("/test/directory")
         assert loader._current_iterator is None
 
@@ -36,7 +36,7 @@ class TestFilePhotoLoader:
             temp_path = Path(temp_dir)
             self.create_test_directory_with_files(temp_path, ["photo1.jpg"])
 
-            loader = FilePhotoLoader(str(temp_path))
+            loader = FilePhotoLoader(temp_path)
             photo_url = loader.load_next_photo()
 
             assert photo_url.startswith("file://")
@@ -49,7 +49,7 @@ class TestFilePhotoLoader:
             files = ["photo1.jpg", "photo2.png", "photo3.gif"]
             self.create_test_directory_with_files(temp_path, files)
 
-            loader = FilePhotoLoader(str(temp_path))
+            loader = FilePhotoLoader(temp_path)
 
             # Load all files
             loaded_urls = []
@@ -71,7 +71,7 @@ class TestFilePhotoLoader:
             files = ["photo1.jpg", "photo2.png"]
             self.create_test_directory_with_files(temp_path, files)
 
-            loader = FilePhotoLoader(str(temp_path))
+            loader = FilePhotoLoader(temp_path)
 
             # Load all files in directory
             first_round = []
@@ -84,7 +84,7 @@ class TestFilePhotoLoader:
 
     def test_load_next_photo_nonexistent_directory(self):
         """Test handling of nonexistent directory"""
-        loader = FilePhotoLoader("/nonexistent/directory")
+        loader = FilePhotoLoader(Path("/nonexistent/directory"))
 
         with pytest.raises(FileNotFoundError):
             loader.load_next_photo()
@@ -92,7 +92,7 @@ class TestFilePhotoLoader:
     def test_load_next_photo_empty_directory(self):
         """Test handling of directory with no image files"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            loader = FilePhotoLoader(temp_dir)
+            loader = FilePhotoLoader(Path(temp_dir))
 
             with pytest.raises(FileNotFoundError, match="No image files found"):
                 loader.load_next_photo()
@@ -105,7 +105,7 @@ class TestFilePhotoLoader:
             files = ["photo1.jpg", "document.txt", "photo2.png", "data.csv"]
             self.create_test_directory_with_files(temp_path, files)
 
-            loader = FilePhotoLoader(str(temp_path))
+            loader = FilePhotoLoader(temp_path)
 
             # Should only load image files
             loaded_urls = []
@@ -141,7 +141,7 @@ class TestFilePhotoLoader:
             ]
             self.create_test_directory_with_files(temp_path, image_files)
 
-            loader = FilePhotoLoader(str(temp_path))
+            loader = FilePhotoLoader(temp_path)
 
             # Should be able to load all image files
             loaded_count = 0
@@ -162,7 +162,7 @@ class TestFilePhotoLoader:
             temp_path = Path(temp_dir)
             self.create_test_directory_with_files(temp_path, ["photo1.jpg"])
 
-            loader = FilePhotoLoader(str(temp_path))
+            loader = FilePhotoLoader(temp_path)
 
             # Load first photo
             first_url = loader.load_next_photo()
@@ -192,7 +192,7 @@ class TestFilePhotoLoader:
             file_path = Path(temp_dir) / "not_a_directory.txt"
             file_path.write_text("test content")
 
-            loader = FilePhotoLoader(str(file_path))
+            loader = FilePhotoLoader(file_path)
 
             with pytest.raises(NotADirectoryError):
                 loader.load_next_photo()
@@ -205,7 +205,7 @@ class TestFilePhotoLoader:
             files = ["z_photo.jpg", "a_photo.jpg", "m_photo.jpg"]
             self.create_test_directory_with_files(temp_path, files)
 
-            loader = FilePhotoLoader(str(temp_path))
+            loader = FilePhotoLoader(temp_path)
 
             # Load all files
             loaded_urls = []
@@ -225,13 +225,13 @@ class TestCreatePhotoLoader:
 
     def test_create_photo_loader_returns_file_loader(self):
         """Test that factory function returns FilePhotoLoader instance"""
-        loader = create_photo_loader("/test/path")
+        loader = create_photo_loader(Path("/test/path"))
         assert isinstance(loader, FilePhotoLoader)
         assert loader.base_directory == Path("/test/path")
 
     def test_create_photo_loader_with_string_path(self):
         """Test factory function with string path"""
-        path = "/home/user/photos"
+        path = Path("/home/user/photos")
         loader = create_photo_loader(path)
         assert isinstance(loader, FilePhotoLoader)
-        assert str(loader.base_directory) == path
+        assert loader.base_directory == path
