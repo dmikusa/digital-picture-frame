@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging
 import os
+from pathlib import Path
 import sys
 import threading
 
@@ -27,7 +28,6 @@ from photo_manager.photos import create_photo_loader
 from photo_manager.importer import import_photos_from_directory
 from picture_frame_ui.ui import (
     run_app,
-    get_screen_dimensions,
 )
 from frame_server.server import run_server
 
@@ -61,12 +61,6 @@ def main():
     logger.debug("Loading configuration")
     config = FrameConfig.load()
 
-    # Get screen dimensions for optimal photo resizing
-    screen_width, screen_height = get_screen_dimensions()
-    logger.debug(
-        f"Using screen dimensions for photo import: {screen_width}x{screen_height}"
-    )
-
     # Import new photos if import directory is configured
     import_path = config.get_import_path()
     if import_path is not None:
@@ -78,10 +72,7 @@ def main():
 
         try:
             imported_count = import_photos_from_directory(
-                import_path,
-                photos_path,
-                max_width=screen_width,
-                max_height=screen_height,
+                config,
             )
             if imported_count > 0:
                 logger.info(f"Successfully imported {imported_count} new photos")
@@ -107,13 +98,15 @@ def main():
     logger.info("Starting frame server in background")
     server_thread = threading.Thread(
         target=run_server,
-        args=(config, screen_width, screen_height),
+        args=(config,),
         kwargs={},
         daemon=True,  # Dies when main thread dies
         name="FrameServer",
     )
     server_thread.start()
-    logger.info("Frame server started on http://0.0.0.0:8080")
+    logger.info(
+        f"Frame server started on http://{config.server_host}:{config.server_port}"
+    )
 
     logger.debug("Starting UI")
     exit_code = run_app(config, photo_loader)

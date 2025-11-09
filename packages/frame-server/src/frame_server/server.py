@@ -25,7 +25,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from photo_manager.importer import PhotoImporter
 from functools import partial
-
 from picture_frame_ui.config import FrameConfig
 
 
@@ -38,22 +37,14 @@ class FrameServerHandler(BaseHTTPRequestHandler):
     def __init__(
         self,
         *args,
-        photos_path: Path,
-        screen_width: int,
-        screen_height: int,
-        max_file_size: int,
+        config: FrameConfig,
         **kwargs,
     ):
         # Set attributes BEFORE calling super().__init__() because it immediately processes the request
-        self.max_file_size = max_file_size
-
-        photos_directory = photos_path
-        photos_directory.mkdir(parents=True, exist_ok=True)
         self.photo_importer = PhotoImporter(
-            photos_directory=photos_directory,
-            max_width=screen_width,
-            max_height=screen_height,
+            config=config,
         )
+        self._config = config
 
         # This starts processing the request immediately!
         super().__init__(*args, **kwargs)
@@ -92,10 +83,10 @@ class FrameServerHandler(BaseHTTPRequestHandler):
                 return
 
             # Check for file size limit
-            if content_length > self.max_file_size:
+            if content_length > self._config.server_max_file_size:
                 self._send_json_response(
                     {
-                        "error": f"File too large. Maximum size is {self.max_file_size // (1024 * 1024)}MB"
+                        "error": f"File too large. Maximum size is {self._config.server_max_file_size // (1024 * 1024)}MB"
                     },
                     413,  # HTTP 413 Payload Too Large
                 )
@@ -116,13 +107,13 @@ class FrameServerHandler(BaseHTTPRequestHandler):
 
                     bytes_read += len(chunk)
                     # Check if we've exceeded the max file size during reading
-                    if bytes_read > self.max_file_size:
+                    if bytes_read > self._config.server_max_file_size:
                         # Clean up the temporary file
                         temp_file.close()
                         Path(temp_file.name).unlink()
                         self._send_json_response(
                             {
-                                "error": f"File too large. Maximum size is {self.max_file_size // (1024 * 1024)}MB"
+                                "error": f"File too large. Maximum size is {self._config.server_max_file_size // (1024 * 1024)}MB"
                             },
                             413,
                         )
@@ -199,22 +190,13 @@ class FrameServerHandler(BaseHTTPRequestHandler):
 
 def run_server(
     config: FrameConfig,
-    screen_width: int,
-    screen_height: int,
 ):
     """Run the frame server"""
 
     def handler_factory(*args, **kwargs):
-        logger.info(f"handler_factory called with args: {args}, kwargs: {kwargs}")
-        logger.info(
-            f"Creating handler with photos_path: {config.get_photos_path()}, max_file_size: {config.server_max_file_size}"
-        )
         return FrameServerHandler(
             *args,
-            photos_path=config.get_photos_path(),
-            max_file_size=config.server_max_file_size,
-            screen_width=screen_width,
-            screen_height=screen_height,
+            config=config,
             **kwargs,
         )
 

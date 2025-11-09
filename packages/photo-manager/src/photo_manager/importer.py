@@ -20,8 +20,8 @@ import hashlib
 import logging
 from pathlib import Path
 from typing import Tuple
-
 from PIL import Image
+from picture_frame_ui.config import FrameConfig
 
 logger = logging.getLogger(__name__)
 
@@ -43,24 +43,17 @@ class PhotoImporter:
 
     def __init__(
         self,
-        photos_directory: Path,
-        max_width: int = 1920,
-        max_height: int = 1080,
+        config: FrameConfig,
     ):
         """
         Initialize the photo importer
 
         Args:
-            photos_directory: Directory where processed photos are stored
+            config: Optional FrameConfig object to get dimensions from
             max_width: Maximum width for resized images (defaults to 1920)
             max_height: Maximum height for resized images (defaults to 1080)
         """
-        self.photos_directory = photos_directory
-        self.max_width = max_width
-        self.max_height = max_height
-        logger.info(
-            f"PhotoImporter initialized - photos: {photos_directory}, max_size: {max_width}x{max_height}"
-        )
+        self._config = config
 
     def calculate_sha1(self, file_path: Path) -> str:
         """
@@ -117,15 +110,18 @@ class PhotoImporter:
             Tuple of (new_width, new_height)
         """
         # If image is already within bounds, return original dimensions
-        if original_width <= self.max_width and original_height <= self.max_height:
+        if (
+            original_width <= self._config.screen_width
+            and original_height <= self._config.screen_height
+        ):
             logger.debug(
                 f"Image {original_width}x{original_height} is within bounds, no resize needed"
             )
             return original_width, original_height
 
         # Calculate scaling factor - use the more restrictive dimension
-        width_scale = self.max_width / original_width
-        height_scale = self.max_height / original_height
+        width_scale = self._config.screen_width / original_width
+        height_scale = self._config.screen_height / original_height
         scale_factor = min(width_scale, height_scale)
 
         new_width = int(original_width * scale_factor)
@@ -231,12 +227,12 @@ class PhotoImporter:
         Returns:
             True if a photo with this hash exists, False otherwise
         """
-        if not self.photos_directory.exists():
+        if not self._config.get_photos_path().exists():
             return False
 
         # Look for any file that contains the hash pattern
         pattern = f"##{sha1_hash}."
-        for file_path in self.photos_directory.iterdir():
+        for file_path in self._config.get_photos_path().iterdir():
             if file_path.is_file() and pattern in file_path.name:
                 logger.debug(f"Found existing photo with hash {sha1_hash}: {file_path}")
                 return True
@@ -276,7 +272,7 @@ class PhotoImporter:
 
             # Generate target filename
             target_filename = self.generate_target_filename(source_path, sha1_hash)
-            target_path = self.photos_directory / target_filename
+            target_path = self._config.get_photos_path() / target_filename
 
             # Process the image
             if target_width != width or target_height != height:
@@ -366,22 +362,20 @@ class PhotoImporter:
 
 
 def import_photos_from_directory(
-    import_directory: Path,
-    photos_directory: Path,
-    max_width: int = 1920,
-    max_height: int = 1080,
+    config: FrameConfig,
 ) -> int:
     """
     Convenience function to import photos from a directory
 
     Args:
-        import_directory: Directory to scan for new photos
-        photos_directory: Directory where processed photos are stored
-        max_width: Maximum width for resized images (defaults to 1920)
-        max_height: Maximum height for resized images (defaults to 1080)
+        config: Optional FrameConfig object to get dimensions from
 
     Returns:
         Number of photos successfully imported
     """
-    importer = PhotoImporter(photos_directory, max_width, max_height)
-    return importer.import_photos(import_directory)
+    import_path = config.get_import_path()
+    if import_path is None:
+        logger.warning("No import directory configured, skipping import")
+        return 0
+
+    return PhotoImporter(config).import_photos(import_path)
