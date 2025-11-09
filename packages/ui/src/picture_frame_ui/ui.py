@@ -33,8 +33,9 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
 
-from gi.repository import Gtk, Gio, GLib, Gdk  # type: ignore[import-untyped]  # noqa: E402
+from gi.repository import Gtk, Gio, GLib, Gdk, GdkPixbuf  # type: ignore[import-untyped]  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,11 @@ class PictureFrameApp(Gtk.Application):
         assert self.window is not None  # Type checker hint
         self.window.present()
 
+        # Hide cursor after window is presented (if in full screen mode)
+        if self.config.full_screen:
+            # Use idle_add to ensure the window is fully realized
+            GLib.idle_add(self._hide_mouse_cursor)
+
     def build_ui(self):
         """Build the main UI components"""
         logger.debug("Building UI with crossfade animation")
@@ -108,9 +114,6 @@ class PictureFrameApp(Gtk.Application):
         if self.config.full_screen:
             logger.debug("Setting window to full screen mode")
             self.window.fullscreen()
-
-            # Hide the mouse cursor in full screen mode
-            self._hide_mouse_cursor()
 
         # Create a vertical box to hold our UI elements
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -206,7 +209,7 @@ class PictureFrameApp(Gtk.Application):
 
         logger.debug(f"Applied black background to widget: {type(widget).__name__}")
 
-    def _hide_mouse_cursor(self) -> None:
+    def _hide_mouse_cursor(self) -> bool:
         """Hide the mouse cursor when in full screen mode"""
         try:
             # Ensure window is initialized
@@ -215,21 +218,52 @@ class PictureFrameApp(Gtk.Application):
             # Get the window's surface
             surface = self.window.get_surface()
             if surface is not None:
-                # Create an empty cursor to hide the mouse
-                cursor = Gdk.Cursor.new_from_name("none", None)
-                if cursor is None:
-                    # Fallback: create a blank cursor
-                    cursor = Gdk.Cursor.new_from_name("blank", None)
+                # Create a blank cursor to hide the mouse
+                display = surface.get_display()
+                if display is not None:
+                    # Try different approaches to create a blank cursor
+                    cursor = None
 
-                if cursor is not None:
-                    surface.set_cursor(cursor)
-                    logger.debug("Mouse cursor hidden in full screen mode")
+                    # Try creating a blank cursor first
+                    try:
+                        cursor = Gdk.Cursor.new_from_name("none", display)
+                    except:
+                        pass
+
+                    if cursor is None:
+                        try:
+                            cursor = Gdk.Cursor.new_from_name("blank", display)
+                        except:
+                            pass
+
+                    # If named cursors don't work, create a transparent cursor
+                    if cursor is None:
+                        try:
+                            # Create a 1x1 transparent pixbuf
+                            pixbuf = GdkPixbuf.Pixbuf.new(
+                                GdkPixbuf.Colorspace.RGB, True, 8, 1, 1
+                            )
+                            pixbuf.fill(0x00000000)  # Transparent
+                            cursor = Gdk.Cursor.new_from_texture(
+                                Gdk.Texture.new_for_pixbuf(pixbuf), 0, 0, None
+                            )
+                        except Exception as e:
+                            logger.debug(f"Failed to create transparent cursor: {e}")
+
+                    if cursor is not None:
+                        surface.set_cursor(cursor)
+                        logger.debug("Mouse cursor hidden in full screen mode")
+                        return True
+                    else:
+                        logger.warning("Failed to create any type of blank cursor")
                 else:
-                    logger.warning("Failed to create blank cursor")
+                    logger.warning("Could not get display from surface")
             else:
                 logger.warning("Could not get window surface to hide cursor")
         except Exception as e:
             logger.warning(f"Failed to hide mouse cursor: {e}")
+
+        return False
 
     def _load_image_into_picture(self, picture: Any):  # picture: Gtk.Picture
         """Load the next image into the specified Picture widget"""
