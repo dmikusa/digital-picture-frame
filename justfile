@@ -11,6 +11,10 @@ test-all:
 test TEST:
     uv run --frozen pytest -vv {{TEST}}
 
+coverage-ci:
+    uv run --frozen coverage run --source=packages/ --omit "*_test.py" -m pytest -vv --junitxml=results.xml
+    uv run --frozen coverage xml -o coverage.xml
+
 coverage-all:
     uv run --frozen coverage erase
     uv run --frozen coverage run --source=packages/ --omit "*_test.py" -m pytest -vv

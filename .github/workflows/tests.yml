@@ -26,6 +26,8 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
+      - uses: extractions/setup-just@v3
+
       - name: Cache SonarCloud packages
         uses: actions/cache@v4
         with:
@@ -40,15 +42,10 @@ jobs:
         run: uv sync --frozen
 
       - name: Check Format, Lint, and Types
-        run: |
-          uv run --frozen ruff check src
-          uv run --frozen ruff format src
-          uv run --frozen pyright
+        run: just format && just typecheck
 
       - name: Run Tests
-        run: |
-          uv run --frozen coverage run --source=src/picture_frame_ui --omit "*_test.py" -m pytest -vv --junitxml=results.xml
-          uv run --frozen coverage xml -o coverage.xml
+        run: just coverage-ci
 
       - name: Create test summary
         uses: test-summary/action@v2.4
@@ -88,14 +85,10 @@ jobs:
         run: uv sync --frozen
 
       - name: Check Format, Lint, and Types
-        run: |
-          uv run --frozen ruff check src
-          uv run --frozen ruff format src
-          uv run --frozen pyright
+        run: just format && just typecheck
 
       - name: Run Tests
-        run: |
-          uv run --frozen pytest -vv --junitxml=results.xml
+        run: just coverage-ci
 
       - name: Create test summary
         uses: test-summary/action@v2.4
