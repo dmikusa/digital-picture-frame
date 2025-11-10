@@ -140,7 +140,7 @@ class FrameConfig:
 
         if not path.exists():
             logger.error(f"Photos directory does not exist: {path}")
-            logger.info(f"Please create the directory or update the configuration")
+            logger.info("Please create the directory or update the configuration")
             raise FileNotFoundError(f"Photos directory does not exist: {path}")
 
         if not path.is_dir():

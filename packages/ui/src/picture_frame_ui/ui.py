@@ -227,13 +227,13 @@ class PictureFrameApp(Gtk.Application):
                     # Try creating a blank cursor first
                     try:
                         cursor = Gdk.Cursor.new_from_name("none", display)
-                    except:
+                    except Exception:
                         pass
 
                     if cursor is None:
                         try:
                             cursor = Gdk.Cursor.new_from_name("blank", display)
-                        except:
+                        except Exception:
                             pass
 
                     # If named cursors don't work, create a transparent cursor

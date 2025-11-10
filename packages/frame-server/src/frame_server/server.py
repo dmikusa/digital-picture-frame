@@ -24,7 +24,6 @@ from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from photo_manager.importer import PhotoImporter
-from functools import partial
 from picture_frame_ui.config import FrameConfig
 
 
@@ -69,7 +68,7 @@ class FrameServerHandler(BaseHTTPRequestHandler):
 
     def _handle_upload(self):
         """Handle photo upload"""
-        logger.info(f"_handle_upload called, checking for max_file_size attribute")
+        logger.info("_handle_upload called, checking for max_file_size attribute")
         logger.info(f"self.__dict__: {self.__dict__}")
         if not hasattr(self, "max_file_size"):
             logger.error("max_file_size attribute not found!")
