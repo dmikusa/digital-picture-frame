@@ -25,7 +25,7 @@ jobs:
       - name: Update Dependencies
         run: uv lock --upgrade
 
-      - uses: peter-evans/create-pull-request@v7
+      - uses: peter-evans/create-pull-request@v8
         with:
           body: |-
             Update Python Dependencies
