@@ -1,0 +1,180 @@
+mod app;
+mod config;
+mod display;
+mod import;
+mod index;
+mod logger;
+
+use config::Config;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Acquire an exclusive PID lock at /tmp/photo-frame.lock.
+/// Returns the lock file (must be kept alive for the lock to hold).
+fn acquire_pid_lock() -> Result<std::fs::File, String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("/tmp/photo-frame.lock")
+        .map_err(|e| format!("Failed to open lock file: {}", e))?;
+
+    let pid = std::process::id();
+    writeln!(file, "{}", pid).map_err(|e| format!("Failed to write PID: {}", e))?;
+
+    let fd = file.as_raw_fd();
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!(
+            "Another instance of photo-frame is already running (lock file in use): {}",
+            err
+        ));
+    }
+
+    Ok(file)
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <config.toml>", args[0]);
+        std::process::exit(1);
+    }
+
+    // Acquire PID lock before doing anything else
+    let _lock_file = match acquire_pid_lock() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let config_path = Path::new(&args[1]);
+    let config = match Config::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load config: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Initialize logger
+    if let Err(e) = logger::TmpfsLogger::init(
+        PathBuf::from("/tmp/photo-frame.log"),
+        config.log_max_size,
+        config.log_max_files,
+    ) {
+        eprintln!("Failed to initialize logger: {}", e);
+        std::process::exit(1);
+    }
+
+    log::info!("Starting photo-frame");
+    log::info!("{}", config);
+
+    // Ensure photos directory exists
+    if let Err(e) = std::fs::create_dir_all(&config.photos_dir) {
+        log::error!("Failed to create photos directory: {}", e);
+        std::process::exit(1);
+    }
+
+    // Initialize or find index
+    let (index_path, metadata) = match index::init_index(&config.photos_dir) {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!("Failed to initialize index: {}", e);
+            std::process::exit(1);
+        }
+    };
+    log::info!(
+        "Index: {} (start_line={}, valid_count={})",
+        index_path.display(),
+        metadata.start_line,
+        metadata.valid_count
+    );
+
+    // Compact index if ghost ratio > 50%
+    let metadata = if metadata.ghost_ratio() > 0.5 {
+        log::info!("Compacting index (ghost ratio: {:.2})", metadata.ghost_ratio());
+        match index::compact_index(&config.photos_dir, &metadata) {
+            Ok(new_meta) => new_meta,
+            Err(e) => {
+                log::error!("Failed to compact index: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        metadata
+    };
+
+    // Build deduplication set
+    let dedup_set = match index::build_dedup_set(&index_path, &metadata) {
+        Ok(set) => {
+            log::info!("Loaded {} unique photo hashes", set.len());
+            Arc::new(Mutex::new(set))
+        }
+        Err(e) => {
+            log::error!("Failed to build dedup set: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Shared shutdown flag
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Set up signal handling
+    let mut signals = match signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+    ]) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to set up signal handler: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Spawn display thread
+    let display_shutdown = shutdown.clone();
+    let display_socket = config.socket_path.clone();
+    let display_photos_dir = config.photos_dir.clone();
+    let display_handle = std::thread::spawn(move || {
+        if let Err(e) = app::run_display_loop(&display_photos_dir, &display_socket, display_shutdown) {
+            log::error!("Display loop error: {}", e);
+        }
+    });
+
+    // Spawn USB watcher thread
+    let usb_photos_dir = config.photos_dir.clone();
+    let usb_index_dir = config.photos_dir.clone();
+    let usb_dedup_set = dedup_set.clone();
+    let usb_config = config.clone();
+    let usb_handle = std::thread::spawn(move || {
+        if let Err(e) = import::watch_usb_mounts(usb_photos_dir, usb_index_dir, usb_dedup_set, usb_config) {
+            log::error!("USB watcher error: {}", e);
+        }
+    });
+
+    // Wait for signal
+    for sig in signals.forever() {
+        match sig {
+            signal_hook::consts::SIGTERM | signal_hook::consts::SIGINT => {
+                log::info!("Received signal {}, shutting down", sig);
+                shutdown.store(true, Ordering::Relaxed);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Wait for threads to finish (with timeout)
+    let _ = display_handle.join();
+    let _ = usb_handle.join();
+
+    log::info!("Shutdown complete");
+}

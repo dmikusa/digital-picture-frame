@@ -1,0 +1,22 @@
+[package]
+name = "photo-frame"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "z"
+lto = true
+
+[dependencies]
+notify = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+log = { version = "0.4", features = ["std"] }
+crc32fast = "1.3"
+signal-hook = "0.3"
+chrono = "0.4"
+flate2 = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
