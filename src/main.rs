@@ -12,6 +12,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Acquire an exclusive PID lock at /tmp/photo-frame.lock.
 /// Returns the lock file (must be kept alive for the lock to hold).
@@ -143,7 +144,7 @@ fn main() {
     let display_shutdown = shutdown.clone();
     let display_socket = config.socket_path.clone();
     let display_photos_dir = config.photos_dir.clone();
-    let display_handle = std::thread::spawn(move || {
+    let _display_handle = std::thread::spawn(move || {
         if let Err(e) = app::run_display_loop(&display_photos_dir, &display_socket, display_shutdown) {
             log::error!("Display loop error: {}", e);
         }
@@ -154,8 +155,9 @@ fn main() {
     let usb_index_dir = config.photos_dir.clone();
     let usb_dedup_set = dedup_set.clone();
     let usb_config = config.clone();
-    let usb_handle = std::thread::spawn(move || {
-        if let Err(e) = import::watch_usb_mounts(usb_photos_dir, usb_index_dir, usb_dedup_set, usb_config) {
+    let usb_shutdown = shutdown.clone();
+    let _usb_handle = std::thread::spawn(move || {
+        if let Err(e) = import::watch_usb_mounts(usb_photos_dir, usb_index_dir, usb_dedup_set, usb_config, usb_shutdown) {
             log::error!("USB watcher error: {}", e);
         }
     });
@@ -172,9 +174,11 @@ fn main() {
         }
     }
 
-    // Wait for threads to finish (with timeout)
-    let _ = display_handle.join();
-    let _ = usb_handle.join();
+    // Give threads a brief moment to see the flag and clean up.
+    // We do NOT join() because worker threads may be blocked in I/O
+    // (socket reads, inotify waits) and could hang indefinitely.
+    // The OS cleans up Unix sockets and file descriptors on process exit.
+    std::thread::sleep(Duration::from_millis(200));
 
     log::info!("Shutdown complete");
 }

@@ -16,6 +16,7 @@ pub fn watch_usb_mounts(
     index_dir: PathBuf,
     dedup_set: Arc<Mutex<HashSet<u64>>>,
     config: Config,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(
@@ -36,34 +37,48 @@ pub fn watch_usb_mounts(
 
     let mut active_mounts: HashSet<PathBuf> = HashSet::new();
 
-    for event in rx {
-        match event.kind {
-            notify::EventKind::Create(notify::event::CreateKind::Folder) => {
-                let paths: Vec<PathBuf> = event.paths.clone();
-                for path in paths {
-                    if path.is_dir() && !active_mounts.contains(&path) {
-                        log::info!("USB mount detected: {}", path.display());
-                        active_mounts.insert(path.clone());
-                        let photos_dir = photos_dir.clone();
-                        let index_dir = index_dir.clone();
-                        let dedup_set = dedup_set.clone();
-                        let config = config.clone();
-                        std::thread::spawn(move || {
-                            if let Err(e) = import_from_mount(&path, &photos_dir, &index_dir, dedup_set, &config) {
-                                log::error!("Import failed for {}: {}", path.display(), e);
-                            }
-                            log::info!("Import complete for {}", path.display());
-                        });
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("USB watcher shutting down");
+            break;
+        }
+
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => match event.kind {
+                notify::EventKind::Create(notify::event::CreateKind::Folder) => {
+                    let paths: Vec<PathBuf> = event.paths.clone();
+                    for path in paths {
+                        if path.is_dir() && !active_mounts.contains(&path) {
+                            log::info!("USB mount detected: {}", path.display());
+                            active_mounts.insert(path.clone());
+                            let photos_dir = photos_dir.clone();
+                            let index_dir = index_dir.clone();
+                            let dedup_set = dedup_set.clone();
+                            let config = config.clone();
+                            std::thread::spawn(move || {
+                                if let Err(e) = import_from_mount(&path, &photos_dir, &index_dir, dedup_set, &config) {
+                                    log::error!("Import failed for {}: {}", path.display(), e);
+                                }
+                                log::info!("Import complete for {}", path.display());
+                            });
+                        }
                     }
                 }
-            }
-            notify::EventKind::Remove(notify::event::RemoveKind::Folder) => {
-                for path in &event.paths {
-                    active_mounts.remove(path);
-                    log::info!("USB unmount detected: {}", path.display());
+                notify::EventKind::Remove(notify::event::RemoveKind::Folder) => {
+                    for path in &event.paths {
+                        active_mounts.remove(path);
+                        log::info!("USB unmount detected: {}", path.display());
+                    }
                 }
+                _ => {}
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // No event within timeout, loop back and check shutdown
             }
-            _ => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::warn!("USB watcher channel disconnected");
+                break;
+            }
         }
     }
 
