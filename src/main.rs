@@ -9,7 +9,7 @@ use config::Config;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,10 +42,33 @@ fn acquire_pid_lock() -> Result<std::fs::File, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <config.toml>", args[0]);
-        std::process::exit(1);
+
+    // Parse optional --import-dir <path> flag
+    let mut import_dir: Option<PathBuf> = None;
+    let mut config_path_arg: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--import-dir" {
+            if i + 1 >= args.len() {
+                eprintln!("Usage: {} [--import-dir <dir>] <config.toml>", args[0]);
+                std::process::exit(1);
+            }
+            import_dir = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
+        } else {
+            config_path_arg = Some(args[i].clone());
+            i += 1;
+        }
     }
+
+    let config_path = match config_path_arg {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("Usage: {} [--import-dir <dir>] <config.toml>", args[0]);
+            std::process::exit(1);
+        }
+    };
 
     // Acquire PID lock before doing anything else
     let _lock_file = match acquire_pid_lock() {
@@ -55,9 +78,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-
-    let config_path = Path::new(&args[1]);
-    let config = match Config::from_file(config_path) {
+    let config = match Config::from_file(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to load config: {}", e);
@@ -124,6 +145,25 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Optional one-time import from a local directory
+    if let Some(dir) = import_dir {
+        if dir.exists() && dir.is_dir() {
+            log::info!("Importing photos from: {}", dir.display());
+            if let Err(e) = import::import_from_directory(
+                &dir,
+                &config.photos_dir,
+                &config.photos_dir,
+                &dedup_set,
+                &config,
+            ) {
+                log::error!("Directory import failed: {}", e);
+            }
+        } else {
+            log::error!("Import directory does not exist or is not a directory: {}", dir.display());
+            std::process::exit(1);
+        }
+    }
 
     // Shared shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));

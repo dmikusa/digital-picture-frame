@@ -125,6 +125,9 @@ The release binary will be at `target/release/photo-frame`.
 
 # Then start the manager (on the Pi, or copy cross-compiled binary first)
 ./photo-frame /path/to/config.toml
+
+# Import photos from a local folder at startup (no USB needed)
+./photo-frame --import-dir /path/to/photos /path/to/config.toml
 ```
 
 ### Example Configuration (`config.toml`)

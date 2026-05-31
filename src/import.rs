@@ -85,20 +85,20 @@ pub fn watch_usb_mounts(
     Ok(())
 }
 
-/// Import all JPEGs from a mounted USB drive.
-fn import_from_mount(
-    mount_point: &Path,
+/// Import all JPEGs from a directory (USB mount or local folder).
+pub fn import_from_directory(
+    dir: &Path,
     photos_dir: &Path,
     index_dir: &Path,
-    dedup_set: Arc<Mutex<HashSet<u64>>>,
+    dedup_set: &Arc<Mutex<HashSet<u64>>>,
     config: &Config,
 ) -> io::Result<()> {
-    let photos = find_jpegs(mount_point);
+    let jpegs = find_jpegs(dir);
     let mut imported = 0;
     let mut skipped = 0;
 
-    for photo_path in photos {
-        match import_single_photo(&photo_path, photos_dir, index_dir, &dedup_set, config) {
+    for photo_path in jpegs {
+        match import_single_photo(&photo_path, photos_dir, index_dir, dedup_set, config) {
             Ok(true) => imported += 1,
             Ok(false) => skipped += 1,
             Err(e) => {
@@ -108,12 +108,23 @@ fn import_from_mount(
     }
 
     log::info!(
-        "Import summary: {} imported, {} skipped (duplicates), {} errors",
+        "Import summary from {}: {} imported, {} skipped (duplicates)",
+        dir.display(),
         imported,
-        skipped,
-        0
+        skipped
     );
     Ok(())
+}
+
+/// Import all JPEGs from a mounted USB drive.
+fn import_from_mount(
+    mount_point: &Path,
+    photos_dir: &Path,
+    index_dir: &Path,
+    dedup_set: Arc<Mutex<HashSet<u64>>>,
+    config: &Config,
+) -> io::Result<()> {
+    import_from_directory(mount_point, photos_dir, index_dir, &dedup_set, config)
 }
 
 /// Find all JPEG files under a directory, recursively.
