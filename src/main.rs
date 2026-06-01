@@ -169,10 +169,17 @@ fn main() {
 
     // Optional one-time import from a local directory
     if let Some(dir) = import_dir {
-        if dir.exists() && dir.is_dir() {
-            log::info!("Importing photos from: {}", dir.display());
+        let abs_dir = match dir.canonicalize() {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to resolve import directory {}: {}", dir.display(), e);
+                std::process::exit(1);
+            }
+        };
+        if abs_dir.exists() && abs_dir.is_dir() {
+            log::info!("Importing photos from: {}", abs_dir.display());
             if let Err(e) = import::import_from_directory(
-                &dir,
+                &abs_dir,
                 &config.photos_dir,
                 &config.photos_dir,
                 &dedup_set,
@@ -181,7 +188,7 @@ fn main() {
                 log::error!("Directory import failed: {}", e);
             }
         } else {
-            log::error!("Import directory does not exist or is not a directory: {}", dir.display());
+            log::error!("Import directory does not exist or is not a directory: {}", abs_dir.display());
             std::process::exit(1);
         }
     }

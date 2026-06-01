@@ -290,8 +290,12 @@ fn convert_image(
 ) -> io::Result<()> {
     let magick_cmd = if Command::new("magick").arg("--version").output().is_ok() {
         "magick"
-    } else {
+    } else if Command::new("convert").arg("--version").output().is_ok() {
         "convert"
+    } else {
+        return Err(io::Error::other(
+            "ImageMagick not found in PATH (tried 'magick' and 'convert')",
+        ));
     };
 
     let output = if matches!(mode, AspectRatioMode::Fill) {
