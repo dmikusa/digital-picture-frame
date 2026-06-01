@@ -139,7 +139,16 @@ struct app_state {
     /* Display geometry */
     float                screen_aspect;
     int                  mode_w, mode_h;
+
+    /* Graceful shutdown */
+    volatile sig_atomic_t running;
 } g;
+
+static void signal_handler(int sig)
+{
+    (void)sig;
+    g.running = 0;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -521,6 +530,15 @@ static void advance_fade(void)
 int main(void)
 {
     memset(&g, 0, sizeof(g));
+    g.running = 1;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* do NOT restart syscalls */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
 
     /* ---- DRM/GBM/EGL setup --------------------------------------------- */
     g.drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -714,6 +732,8 @@ int main(void)
     printf("Waiting for 2 images via %s...\n", SOCKET_PATH);
 
     while (1) {
+        if (!g.running) break;
+
         int timeout = -1;
         if (g.phase == PHASE_HOLDING && !g.hold_complete) {
             struct timespec now;
@@ -731,7 +751,10 @@ int main(void)
         struct epoll_event events[4];
         int n = epoll_wait(g.epoll_fd, events, 4, timeout);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (!g.running) break;
+                continue;
+            }
             perror("epoll_wait");
             break;
         }
