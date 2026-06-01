@@ -40,22 +40,43 @@ fn acquire_pid_lock() -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+fn print_help(name: &str) {
+    println!("Digital photo frame manager for Raspberry Pi");
+    println!();
+    println!("Usage: {} [OPTIONS] <config.toml>", name);
+    println!();
+    println!("Arguments:");
+    println!("  <config.toml>    Path to the TOML configuration file");
+    println!();
+    println!("Options:");
+    println!("  --import-dir <dir>   Import photos from a local directory and exit");
+    println!("  -h, --help           Print this help message and exit");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse optional --import-dir <path> flag
+    // Parse optional flags
     let mut import_dir: Option<PathBuf> = None;
     let mut config_path_arg: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--import-dir" {
+        if args[i] == "-h" || args[i] == "--help" {
+            print_help(&args[0]);
+            std::process::exit(0);
+        } else if args[i] == "--import-dir" {
             if i + 1 >= args.len() {
-                eprintln!("Usage: {} [--import-dir <dir>] <config.toml>", args[0]);
+                eprintln!("Error: --import-dir requires an argument");
+                eprintln!("Usage: {} [OPTIONS] <config.toml>", args[0]);
                 std::process::exit(1);
             }
             import_dir = Some(PathBuf::from(&args[i + 1]));
             i += 2;
+        } else if args[i].starts_with("-") {
+            eprintln!("Error: unknown option {}", args[i]);
+            eprintln!("Usage: {} [OPTIONS] <config.toml>", args[0]);
+            std::process::exit(1);
         } else {
             config_path_arg = Some(args[i].clone());
             i += 1;
@@ -65,7 +86,7 @@ fn main() {
     let config_path = match config_path_arg {
         Some(p) => PathBuf::from(p),
         None => {
-            eprintln!("Usage: {} [--import-dir <dir>] <config.toml>", args[0]);
+            print_help(&args[0]);
             std::process::exit(1);
         }
     };
