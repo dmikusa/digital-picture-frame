@@ -93,7 +93,10 @@ pub fn import_from_directory(
     dedup_set: &Arc<Mutex<HashSet<u64>>>,
     config: &Config,
 ) -> io::Result<()> {
-    let jpegs = find_jpegs(dir);
+    // Resolve to an absolute path so downstream syscalls are not affected
+    // by the process's current working directory.
+    let abs_dir = dir.canonicalize()?;
+    let jpegs = find_jpegs(&abs_dir);
     let mut imported = 0;
     let mut skipped = 0;
 
@@ -109,7 +112,7 @@ pub fn import_from_directory(
 
     log::info!(
         "Import summary from {}: {} imported, {} skipped (duplicates)",
-        dir.display(),
+        abs_dir.display(),
         imported,
         skipped
     );
