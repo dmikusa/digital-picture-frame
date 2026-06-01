@@ -44,9 +44,12 @@ impl Config {
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file: {}", e))?;
-        let config: Config = toml::from_str(&contents)
+        let mut config: Config = toml::from_str(&contents)
             .map_err(|e| format!("Failed to parse config file: {}", e))?;
         config.validate()?;
+        config.photos_dir = config.photos_dir
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve photos_dir: {}", e))?;
         Ok(config)
     }
 
