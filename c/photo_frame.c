@@ -310,6 +310,7 @@ static void send_ready(void)
 
 static void handle_img_command(const char *path)
 {
+    printf("Received IMG: %s\n", path);
     /* Fill the first empty slot.  During normal operation exactly one
        slot is free (the one we just faded away from).  At startup both
        are empty, so this naturally fills slot 0 first, then slot 1. */
