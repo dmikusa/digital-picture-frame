@@ -1,10 +1,10 @@
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
 /// A client that connects to the display app's Unix domain socket.
-/// Handles reconnection with backoff on failures.
+/// Relies on the kernel socket buffer for backpressure.
 pub struct DisplayClient {
     socket_path: std::path::PathBuf,
     stream: Option<UnixStream>,
@@ -17,87 +17,79 @@ impl DisplayClient {
         DisplayClient {
             socket_path: socket_path.to_path_buf(),
             stream: None,
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
             backoff: Duration::from_secs(5),
         }
     }
 
-    /// Ensure we have a connected socket by sending a PING and expecting PONG.
+    /// Ensure we have a live connection. Reconnects only if the stream is missing.
     fn ensure_connected(&mut self) -> io::Result<()> {
-        if let Some(mut stream) = self.stream.take() {
-            if ping(&mut stream).is_ok() {
-                self.stream = Some(stream);
-                return Ok(());
-            }
-            // Ping failed, drop the stream and reconnect
+        if self.stream.is_some() {
+            return Ok(());
         }
-
-        self.reconnect()?;
-        // Verify the new connection with a ping
-        if let Some(ref mut stream) = self.stream {
-            ping(stream)?;
-        }
-        Ok(())
+        self.reconnect()
     }
 
     fn reconnect(&mut self) -> io::Result<()> {
-        log::info!("Connecting to display socket at {}", self.socket_path.display());
+        log::info!(
+            "Connecting to display socket at {}",
+            self.socket_path.display()
+        );
         let stream = UnixStream::connect(&self.socket_path)?;
+        // 30-second write timeout lets us detect a truly dead display app
+        // without breaking normal backpressure (the display app may pause
+        // reading for several seconds while it renders).
         stream.set_write_timeout(Some(self.timeout))?;
-        stream.set_read_timeout(Some(self.timeout))?;
         self.stream = Some(stream);
         log::info!("Connected to display socket");
         Ok(())
     }
 
     /// Send an IMG command to the display app.
-    /// Blocks if the kernel socket buffer is full (backpressure).
-    /// Returns an error only if the connection is definitively dead.
+    ///
+    /// When the display app is consuming, this returns immediately.
+    /// When the display app is backpressuring us (its buffer is full and it
+    /// has paused reading), `write_all` blocks until the kernel buffer has
+    /// space or the 30-second timeout expires.
     pub fn send_img(&mut self, path: &str) -> io::Result<()> {
         self.ensure_connected()?;
 
         let msg = format!("IMG {}\n", path);
-        let stream = self.stream.as_mut().unwrap();
 
-        match stream.write_all(msg.as_bytes()) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Write failed. Mark connection as dead and retry once after reconnect.
-                log::warn!("Send failed: {}, will reconnect", e);
-                self.stream = None;
-                std::thread::sleep(self.backoff);
-                self.reconnect()?;
-                let stream = self.stream.as_mut().unwrap();
-                stream.write_all(msg.as_bytes())
+        loop {
+            let stream = self.stream.as_mut().unwrap();
+            match stream.write_all(msg.as_bytes()) {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // Backpressure: display app isn't reading fast enough.
+                    // Pause briefly and retry on the same connection.
+                    log::debug!(
+                        "Write timed out (backpressure), retrying in 100ms"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::BrokenPipe
+                        || e.kind() == io::ErrorKind::ConnectionReset =>
+                {
+                    // Connection lost. Reconnect once and retry.
+                    log::warn!("Display connection lost: {}", e);
+                    self.stream = None;
+                    std::thread::sleep(self.backoff);
+                    self.reconnect()?;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
         }
     }
 
     pub fn close(&mut self) {
         self.stream = None;
-    }
-}
-
-/// Send a PING and expect a PONG response within the configured timeout.
-fn ping(stream: &mut UnixStream) -> io::Result<()> {
-    let mut peer = stream.try_clone()?;
-    let mut reader = BufReader::new(&mut peer);
-
-    stream.write_all(b"PING\n")?;
-    stream.flush()?;
-
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
-    if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "PING: EOF"));
-    }
-    if line.trim() == "PONG" {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("PING: expected PONG, got: {}", line.trim()),
-        ))
     }
 }
 
@@ -109,28 +101,6 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn test_ping_pong() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let socket_path = tmpdir.path().join("test.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let received = String::from_utf8_lossy(&buf[..n]).to_string();
-            assert_eq!(received, "PING\n");
-            stream.write_all(b"PONG\n").unwrap();
-        });
-
-        let mut client = DisplayClient::new(&socket_path);
-        // Ping should succeed
-        client.ensure_connected().unwrap();
-
-        handle.join().unwrap();
-    }
-
-    #[test]
     fn test_send_img() {
         let tmpdir = tempfile::tempdir().unwrap();
         let socket_path = tmpdir.path().join("test.sock");
@@ -139,13 +109,6 @@ mod tests {
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
-            // First read is PING
-            let n = stream.read(&mut buf).unwrap();
-            let received = String::from_utf8_lossy(&buf[..n]).to_string();
-            assert!(received.starts_with("PING"));
-            stream.write_all(b"PONG\n").unwrap();
-
-            // Second read is IMG
             let n = stream.read(&mut buf).unwrap();
             String::from_utf8_lossy(&buf[..n]).to_string()
         });
