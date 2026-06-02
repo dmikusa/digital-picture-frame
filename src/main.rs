@@ -17,11 +17,34 @@ use std::time::Duration;
 /// Acquire an exclusive PID lock at /tmp/photo-frame.lock.
 /// Returns the lock file (must be kept alive for the lock to hold).
 fn acquire_pid_lock() -> Result<std::fs::File, String> {
+    let lock_path = std::path::Path::new("/tmp/photo-frame.lock");
+
+    // Check for stale lock file from a previous (crashed) instance.
+    if lock_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(lock_path) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                let our_pid = std::process::id();
+                if pid != our_pid {
+                    let running = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                    if running {
+                        return Err(format!(
+                            "Another instance of photo-frame is already running (PID {})",
+                            pid
+                        ));
+                    } else {
+                        eprintln!("Removing stale lock file from PID {}", pid);
+                        let _ = std::fs::remove_file(lock_path);
+                    }
+                }
+            }
+        }
+    }
+
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open("/tmp/photo-frame.lock")
+        .open(lock_path)
         .map_err(|e| format!("Failed to open lock file: {}", e))?;
 
     let pid = std::process::id();
