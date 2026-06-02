@@ -55,6 +55,11 @@ A Rust binary (`photo-frame`) that runs on a Raspberry Pi Zero W2 under DietPi. 
 - Immediately closes the display socket and exits. Does **not** attempt to finish an in-flight `send()` to avoid blocking on a full kernel buffer.
 - The display app (`photo_frame.c`) handles disconnects gracefully — it prints a message and continues its render loop with already-loaded images.
 
+### 1.7 Display App Environment Variables
+The C display app (`photo_frame.c`) reads these optional environment variables on startup:
+- `PHOTO_FRAME_FADE_DURATION`: cross-fade duration in seconds between images. Default: 1.5. Set to 0 for instant cut (no fade).
+- `PHOTO_FRAME_SKIP_FRAMES`: skip N frames during each fade to reduce CPU. 0 = render every frame (default), 1 = render every 2nd frame, 2 = render every 3rd frame.
+
 ---
 
 ## 2. Decision Points & Rationale

@@ -142,6 +142,19 @@ log_max_size = 262144      # 256 KiB
 log_max_files = 2
 ```
 
+### Display App Environment Variables
+
+The C display app reads these optional environment variables on startup:
+
+```bash
+# Fade duration between images (seconds). 0 = instant cut (no fade).
+PHOTO_FRAME_FADE_DURATION=1.5 ./c/photo_frame
+
+# Skip frames during fade to reduce CPU. 0 = render every frame,
+# 1 = render every 2nd frame, 2 = render every 3rd frame, etc.
+PHOTO_FRAME_SKIP_FRAMES=1 ./c/photo_frame
+```
+
 ## DietPi Setup
 
 ### 1. Prevent RootFS Auto-Expansion

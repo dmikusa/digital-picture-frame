@@ -53,9 +53,10 @@
 #define GBM_FORMAT_ARGB8888 GBM_BO_FORMAT_ARGB8888
 #endif
 
-#define SOCKET_PATH       "/tmp/photo-frame.sock"
-#define HOLD_DURATION_SEC 5.0f
-#define FADE_DURATION_SEC 1.5f
+#define SOCKET_PATH            "/tmp/photo-frame.sock"
+#define HOLD_DURATION_SEC      5.0f
+#define DEFAULT_FADE_DURATION  1.5f
+#define DEFAULT_SKIP_FRAMES  0
 
 #define CHECK(cond, ...) do { \
     if (!(cond)) { \
@@ -140,6 +141,11 @@ struct app_state {
     float                screen_aspect;
     int                  mode_w, mode_h;
 
+    /* Configurable fade */
+    float                fade_duration;
+    int                  skip_frames;
+    int                  frame_counter;
+
     /* Graceful shutdown */
     volatile sig_atomic_t running;
 } g;
@@ -148,6 +154,27 @@ static void signal_handler(int sig)
 {
     (void)sig;
     g.running = 0;
+}
+
+/* Read display settings from environment variables */
+static void read_display_config(void)
+{
+    g.fade_duration = DEFAULT_FADE_DURATION;
+    g.skip_frames   = DEFAULT_SKIP_FRAMES;
+
+    const char *env_fade = getenv("PHOTO_FRAME_FADE_DURATION");
+    if (env_fade && env_fade[0] != '\0') {
+        g.fade_duration = strtof(env_fade, NULL);
+        if (g.fade_duration < 0.0f) g.fade_duration = 0.0f;
+    }
+
+    const char *env_skip = getenv("PHOTO_FRAME_SKIP_FRAMES");
+    if (env_skip && env_skip[0] != '\0') {
+        g.skip_frames = (int)strtol(env_skip, NULL, 10);
+        if (g.skip_frames < 0) g.skip_frames = 0;
+    }
+
+    printf("Display config: fade=%.1fs skip=%d\n", g.fade_duration, g.skip_frames);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -451,6 +478,7 @@ static void start_fade(int from_slot, int to_slot)
     g.fade_from     = from_slot;
     g.fade_to       = to_slot;
     g.fade_progress = 0.0f;
+    g.frame_counter = 0;
     clock_gettime(CLOCK_MONOTONIC, &g.fade_start);
 
     render_frame(0.0f, from_slot, to_slot);
@@ -459,20 +487,22 @@ static void start_fade(int from_slot, int to_slot)
 
 static void advance_fade(void)
 {
-    /* Recycle previous scanout buffer */
-    if (g.scanout_fb.bo) {
-        drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
-        gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+    /* Promote pending framebuffer to scanout on every flip completion */
+    if (g.pending_fb.bo) {
+        if (g.scanout_fb.bo) {
+            drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
+            gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+        }
+        g.scanout_fb = g.pending_fb;
+        g.pending_fb.bo    = NULL;
+        g.pending_fb.fb_id = 0;
     }
-    g.scanout_fb = g.pending_fb;
-    g.pending_fb.bo    = NULL;
-    g.pending_fb.fb_id = 0;
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     float elapsed = (float)(now.tv_sec - g.fade_start.tv_sec)
                   + (float)(now.tv_nsec - g.fade_start.tv_nsec) / 1e9f;
-    g.fade_progress = elapsed / FADE_DURATION_SEC;
+    g.fade_progress = elapsed / g.fade_duration;
     if (g.fade_progress > 1.0f) g.fade_progress = 1.0f;
 
     if (g.fade_progress >= 1.0f) {
@@ -519,6 +549,17 @@ static void advance_fade(void)
         return;
     }
 
+    g.frame_counter++;
+    if (g.skip_frames > 0 && (g.frame_counter % (g.skip_frames + 1)) != 0) {
+        /* Skip rendering this frame: re-flip to the same buffer */
+        g.flip_done = 0;
+        int ret = drmModePageFlip(g.drm_fd, g.crtc_id, g.scanout_fb.fb_id,
+                                  DRM_MODE_PAGE_FLIP_EVENT,
+                                  (void *)&g.flip_done);
+        CHECK(ret == 0, "drmModePageFlip (skip)");
+        return;
+    }
+
     /* Render next frame */
     render_frame(g.fade_progress, g.fade_from, g.fade_to);
     request_page_flip();
@@ -532,6 +573,7 @@ int main(void)
 {
     memset(&g, 0, sizeof(g));
     g.running = 1;
+    read_display_config();
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
