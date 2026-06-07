@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -298,25 +299,29 @@ fn convert_image(
         ));
     };
 
-    let output = if matches!(mode, AspectRatioMode::Fill) {
-        Command::new(magick_cmd)
-            .arg(src)
-            .arg("-resize")
+    let mut cmd = Command::new(magick_cmd);
+    cmd.arg(src);
+    if matches!(mode, AspectRatioMode::Fill) {
+        cmd.arg("-resize")
             .arg(format!("{}x{}^", width, height))
             .arg("-gravity")
             .arg("center")
             .arg("-extent")
-            .arg(format!("{}x{}", width, height))
-            .arg(dest)
-            .output()?
+            .arg(format!("{}x{}", width, height));
     } else {
-        Command::new(magick_cmd)
-            .arg(src)
-            .arg("-resize")
-            .arg(format!("{}x{}", width, height))
-            .arg(dest)
-            .output()?
-    };
+        cmd.arg("-resize")
+            .arg(format!("{}x{}", width, height));
+    }
+    cmd.arg(dest);
+
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::nice(10);
+            Ok(())
+        });
+    }
+
+    let output = cmd.output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
