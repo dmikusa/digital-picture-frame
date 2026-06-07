@@ -34,7 +34,7 @@ ifneq (, $(shell which cargo-zigbuild 2>/dev/null))
   CARGO := cargo-zigbuild
 endif
 
-.PHONY: all c rust pi pi-armv7 pi-install test clean install run-display
+.PHONY: all c rust pi pi-armv7 pi-install test clean install run-display run-manager
 
 all: c rust
 
@@ -69,6 +69,9 @@ clean:
 install: all
 	install -Dm755 c/photo_frame /usr/local/bin/photo_frame
 	install -Dm755 target/release/photo-frame /usr/local/bin/photo-frame-manager
+
+run-manager: rust
+	./target/release/photo-frame --import-dir "$(IMPORT_DIR)" config.toml
 
 run-display: c
 	cd c && ./photo_frame
