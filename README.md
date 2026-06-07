@@ -5,7 +5,7 @@ A lightweight Rust binary that manages a photo collection for a digital photo fr
 ## Features
 
 - **Display Thread**: Streams photos from a CSV index and sends them to a companion display app via a Unix domain socket. Handles backpressure naturally through kernel socket buffers.
-- **USB Import**: Automatically detects USB drive mounts, scans for JPEG files, deduplicates them, converts them to a configured native resolution, and copies them into an organized directory structure.
+- **USB Import**: Automatically detects USB drive mounts, scans for image files (JPEG, HEIF/HEIC), deduplicates them, converts them to a configured native resolution, and copies them into an organized directory structure.
 - **Storage Rotation**: When the dedicated photo partition is full, automatically deletes the oldest photos in configurable batches.
 - **Circular Index**: The CSV photo index uses logical deletion with an encoded filename (`index-<start>-<count>.csv`). Compaction rewrites the index when ghost entries exceed 50%.
 - **Low Resource Usage**: Optimized for the Pi Zero W2 with minimal CPU and memory usage. Release binary is under 1MB.

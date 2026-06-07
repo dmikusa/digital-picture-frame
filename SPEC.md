@@ -18,8 +18,8 @@ A Rust binary (`photo-frame`) that runs on a Raspberry Pi Zero W2 under DietPi. 
 
 ### 1.2 USB Import Thread
 - Detects USB drive mounts using `usbmount` + `inotify` watching `/media`.
-- Scans mounted drives for JPEG files (recursively).
-- For each JPEG:
+- Scans mounted drives for image files (JPEG, HEIF/HEIC) recursively.
+- For each image:
   - Computes a fast non-cryptographic hash (first 32KB + file size) for duplicate detection.
   - Checks against in-memory deduplication set (built from CSV on startup).
   - Converts to configured native resolution using ImageMagick (shell out).

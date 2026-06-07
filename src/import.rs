@@ -97,11 +97,11 @@ pub fn import_from_directory(
     // Resolve to an absolute path so downstream syscalls are not affected
     // by the process's current working directory.
     let abs_dir = dir.canonicalize()?;
-    let jpegs = find_jpegs(&abs_dir);
+    let images = find_images(&abs_dir);
     let mut imported = 0;
     let mut skipped = 0;
 
-    for photo_path in jpegs {
+    for photo_path in images {
         match import_single_photo(&photo_path, photos_dir, index_dir, dedup_set, config) {
             Ok(true) => imported += 1,
             Ok(false) => skipped += 1,
@@ -131,17 +131,19 @@ fn import_from_mount(
     import_from_directory(mount_point, photos_dir, index_dir, &dedup_set, config)
 }
 
-/// Find all JPEG files under a directory, recursively.
-fn find_jpegs(dir: &Path) -> Vec<PathBuf> {
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "heif", "heifs", "heic", "heics"];
+
+/// Find all image files under a directory, recursively.
+fn find_images(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.is_dir() {
-                result.extend(find_jpegs(&path));
+                result.extend(find_images(&path));
             } else if let Some(ext) = path.extension() {
                 let ext = ext.to_string_lossy().to_lowercase();
-                if ext == "jpg" || ext == "jpeg" {
+                if IMAGE_EXTENSIONS.contains(&ext.as_ref()) {
                     result.push(path);
                 }
             }
@@ -359,18 +361,20 @@ mod tests {
     }
 
     #[test]
-    fn test_find_jpegs() {
+    fn test_find_images() {
         let tmpdir = tempfile::tempdir().unwrap();
         File::create(tmpdir.path().join("photo1.jpg")).unwrap();
         File::create(tmpdir.path().join("photo2.JPEG")).unwrap();
+        File::create(tmpdir.path().join("photo3.heif")).unwrap();
+        File::create(tmpdir.path().join("photo4.HEIC")).unwrap();
         File::create(tmpdir.path().join("notaphoto.txt")).unwrap();
 
         let subdir = tmpdir.path().join("subdir");
         fs::create_dir(&subdir).unwrap();
         File::create(subdir.join("nested.jpg")).unwrap();
 
-        let jpegs = find_jpegs(tmpdir.path());
-        assert_eq!(jpegs.len(), 3);
+        let images = find_images(tmpdir.path());
+        assert_eq!(images.len(), 5);
     }
 
     #[test]
