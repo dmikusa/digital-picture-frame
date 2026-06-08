@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A Rust binary (`photo-frame`) that runs on a Raspberry Pi Zero W2 under DietPi. It manages a photo collection, drives a separate DRM/GBM display application (`photo_frame.c`) via a Unix domain socket, and imports photos from USB drives. The design prioritizes low CPU/memory usage, minimal SD card writes, and simplicity.
+A Rust binary (`photo-frame-manager`) that runs on a Raspberry Pi Zero W2 under DietPi. It manages a photo collection, drives a separate DRM/GBM display application (`photo-frame-display.c`) via a Unix domain socket, and imports photos from USB drives. The design prioritizes low CPU/memory usage, minimal SD card writes, and simplicity.
 
 ---
 
@@ -53,10 +53,10 @@ A Rust binary (`photo-frame`) that runs on a Raspberry Pi Zero W2 under DietPi. 
 ### 1.6 Graceful Shutdown
 - Handles `SIGTERM`/`SIGINT`.
 - Immediately closes the display socket and exits. Does **not** attempt to finish an in-flight `send()` to avoid blocking on a full kernel buffer.
-- The display app (`photo_frame.c`) handles disconnects gracefully — it prints a message and continues its render loop with already-loaded images.
+- The display app (`photo-frame-display.c`) handles disconnects gracefully — it prints a message and continues its render loop with already-loaded images.
 
 ### 1.7 Display App Environment Variables
-The C display app (`photo_frame.c`) reads these optional environment variables on startup:
+The C display app (`photo-frame-display.c`) reads these optional environment variables on startup:
 - `PHOTO_FRAME_FADE_DURATION`: cross-fade duration in seconds between images. Default: 1.5. Set to 0 for instant cut (no fade).
 - `PHOTO_FRAME_SKIP_FRAMES`: skip N frames during each fade to reduce CPU. 0 = render every frame (default), 1 = render every 2nd frame, 2 = render every 3rd frame.
 

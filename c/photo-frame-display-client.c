@@ -1,7 +1,7 @@
 /*
  * sender.c
  *
- * Simple client for photo_frame.c.
+ * Simple client for photo-frame-display.c.
  * Opens a persistent connection, sends one image path, waits for READY,
  * then sends the next.  This gives natural backpressure because the
  * display app pauses socket reads when it is full.

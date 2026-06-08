@@ -1,0 +1,131 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm64
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+    container: debian:11-slim
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            libdrm-dev \
+            libegl1-mesa-dev \
+            libgbm-dev \
+            pkg-config
+
+      - uses: actions/checkout@v4
+
+      - name: Compute version
+        id: version
+        run: |
+          BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//; s/".*//')
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "full=${BASE_VERSION}-${COMMIT}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+
+      - name: Build C display app
+        run: make c
+
+      - name: Build Rust manager
+        run: cargo build --release --locked
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build .deb package
+        run: cargo deb --deb-version ${{ steps.version.outputs.full }}
+
+      - name: Rename .deb with architecture
+        run: |
+          SRC=$(ls target/debian/*.deb | head -n1)
+          DEST="target/debian/photo-frame_${{ steps.version.outputs.full }}_${{ matrix.arch }}.deb"
+          mv "$SRC" "$DEST"
+          echo "Built: $DEST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/debian/*.deb
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version
+        id: version
+        run: |
+          BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//; s/".*//')
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "full=${BASE_VERSION}-${COMMIT}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: deb-*
+          merge-multiple: true
+
+      - name: Delete old drafts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE="${{ steps.version.outputs.base }}"
+          echo "Looking for old draft releases matching v${BASE}-* ..."
+          gh api "repos/${{ github.repository }}/releases?per_page=100" \
+            --jq ".[] | select(.draft == true and (.tag_name | startswith(\"v${BASE}-\"))) | .id" \
+            | while read -r id; do
+                echo "Deleting draft release $id"
+                gh api "repos/${{ github.repository }}/releases/$id" -X DELETE || true
+              done
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FULL="${{ steps.version.outputs.full }}"
+          TAG="v${FULL}"
+          echo "Creating draft release $TAG"
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            artifacts/*.deb

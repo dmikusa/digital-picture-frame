@@ -1,0 +1,14 @@
+[Unit]
+Description=Photo Frame DRM Display
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/photo-frame-display
+EnvironmentFile=-/etc/photo-frame/display.env
+Restart=on-failure
+User=photo-frame
+Group=video
+
+[Install]
+WantedBy=multi-user.target

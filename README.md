@@ -98,7 +98,7 @@ Some design choices that might matter:
 
 ## The C display app
 
-The C app (`c/photo_frame.c`) handles all the graphics. It opens a DRM device directly, with no X11 or Wayland involved. GBM allocates framebuffers, EGL sets up an OpenGL ES 2.0 context, and images are loaded with stb_image and drawn as textured quads. Fade transitions are just alpha blending between two textures.
+The C app (`c/photo-frame-display.c`) handles all the graphics. It opens a DRM device directly, with no X11 or Wayland involved. GBM allocates framebuffers, EGL sets up an OpenGL ES 2.0 context, and images are loaded with stb_image and drawn as textured quads. Fade transitions are just alpha blending between two textures.
 
 ## Project Structure
 
@@ -123,6 +123,7 @@ photo-frame/
 make              # C display app + Rust manager (native)
 make c            # C app only
 make rust         # Rust manager only
+make deb          # Build Debian package (requires cargo-deb)
 make test         # Run Rust tests
 make clean        # Clean everything
 make run-display  # Runs the C display app
@@ -167,13 +168,13 @@ Here's what the make commands are doing:
 
 ```bash
 # Start the display app first (on the Pi)
-./c/photo_frame
+./c/photo-frame-display
 
 # Then the manager
-./photo-frame /path/to/config.toml
+./photo-frame-manager /path/to/config.toml
 
 # Or import from a local folder at startup (no USB needed)
-./photo-frame --import-dir /path/to/photos /path/to/config.toml
+./photo-frame-manager --import-dir /path/to/photos /path/to/config.toml
 ```
 
 ### Config (`config.toml`)
@@ -192,10 +193,10 @@ log_max_files = 2
 
 ```bash
 # Fade duration in seconds. 0 = instant cut.
-PHOTO_FRAME_FADE_DURATION=1.5 ./c/photo_frame
+PHOTO_FRAME_FADE_DURATION=1.5 ./c/photo-frame-display
 
 # Skip frames during fade to reduce CPU. 0 = every frame, 1 = every 2nd, etc.
-PHOTO_FRAME_SKIP_FRAMES=1 ./c/photo_frame
+PHOTO_FRAME_SKIP_FRAMES=1 ./c/photo-frame-display
 ```
 
 ## DietPi setup
@@ -240,7 +241,7 @@ sudo apt install -y usbmount imagemagick
 
 ### 5. Display app
 
-The Rust manager needs the C display app (`photo_frame.c`) running alongside it. See `c/photo_frame.c` in this repo.
+The Rust manager needs the C display app (`photo-frame-display.c`) running alongside it. See `c/photo-frame-display.c` in this repo.
 
 ## Storage rotation
 
@@ -249,6 +250,63 @@ When the photos partition fills up (`ENOSPC`), the app deletes the oldest `batch
 ## Shutdown
 
 The app handles `SIGTERM` and `SIGINT`. It closes the socket immediately and exits. It won't finish sending a half-sent image, since the display app handles disconnects fine.
+
+## Packaging & Installation
+
+Pre-built `.deb` packages are available from GitHub Releases for both `amd64` and `arm64`.
+
+### Install
+
+1. Download the `.deb` for your architecture from the latest draft release.
+2. Install it:
+   ```bash
+   sudo dpkg -i photo-frame_*.deb
+   ```
+3. The package installs and starts two systemd services:
+   - `photo-frame-display.service` — the C DRM display app
+   - `photo-frame-manager.service` — the Rust manager
+
+### Dedicated User
+
+The package creates a `photo-frame` system user and adds it to the `video` group.
+This grants the display app access to `/dev/dri/card0` on standard Debian-based systems.
+
+If your system has custom udev rules that prevent the `video` group from accessing the
+DRM device, you can fall back to running the display app as `root`:
+
+```bash
+sudo systemctl edit photo-frame-display.service
+```
+
+Add:
+```ini
+[Service]
+User=root
+Group=root
+```
+
+Then:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart photo-frame-display
+```
+
+### Configuration
+
+Edit `/etc/photo-frame/config.toml` to change manager settings (photos directory, socket path, resolution, etc.).
+
+Edit `/etc/photo-frame/display.env` to change display settings (fade duration, frame skip).
+Both files are marked as `conffiles`, so `dpkg` will preserve your changes on package upgrades.
+
+### Building the Package Locally
+
+If you have `cargo-deb` installed:
+
+```bash
+make deb
+```
+
+This produces `target/debian/photo-frame_*.deb`.
 
 ## License
 

@@ -1,0 +1,36 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+  configure)
+    # Create dedicated user if it doesn't exist
+    if ! id -u photo-frame &>/dev/null; then
+      useradd -r -s /bin/false -G video photo-frame
+    fi
+
+    # Ensure photos directory exists with correct ownership
+    mkdir -p /mnt/photos
+    chown photo-frame:photo-frame /mnt/photos
+
+    # Reload systemd to pick up new units
+    systemctl daemon-reload
+
+    # Enable services to start on boot
+    systemctl enable photo-frame-display.service
+    systemctl enable photo-frame-manager.service
+
+    # Start services on fresh install
+    systemctl start photo-frame-display.service || true
+    systemctl start photo-frame-manager.service || true
+    ;;
+
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+
+  *)
+    echo "postinst called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

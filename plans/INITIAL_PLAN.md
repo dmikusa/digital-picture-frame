@@ -3,7 +3,7 @@
 ## Phase 1: Project Bootstrap & Core Infrastructure
 
 ### Task 1.1: Create Rust Project
-- `cargo init --name photo-frame`
+- `cargo init --name photo-frame-manager`
 - Set up `Cargo.toml` with dependencies:
   - `tokio = { version = "1", features = ["full"] }`
   - `notify = "6"`
@@ -152,12 +152,12 @@
 ### Task 6.1: README
 - Build instructions (`cargo build --release`).
 - DietPi setup steps (partition, packages, config).
-- How to run (`./photo-frame /path/to/config.toml`).
+- How to run (`./photo-frame-manager /path/to/config.toml`).
 - Troubleshooting (socket permissions, USB not mounting).
 
 ### Task 6.2: `AGENTS.md` Update
 - Document build steps, test commands, project conventions.
-- Note the `photo_frame.c` companion binary.
+- Note the `photo-frame-display.c` companion binary.
 
 ### Task 6.3: Final Review
 - Run `cargo clippy`, fix warnings.

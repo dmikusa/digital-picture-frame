@@ -1,0 +1,13 @@
+[Unit]
+Description=Photo Frame Manager
+After=photo-frame-display.service
+Wants=photo-frame-display.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/photo-frame-manager /etc/photo-frame/config.toml
+Restart=on-failure
+User=photo-frame
+
+[Install]
+WantedBy=multi-user.target

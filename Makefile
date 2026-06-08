@@ -8,6 +8,7 @@
 #   make              - build both C display app and Rust manager (native)
 #   make c            - build only the C display app
 #   make rust         - build only the Rust manager (native)
+#   make deb          - build Debian package (requires cargo-deb)
 #   make pi           - cross-compile Rust manager for Raspberry Pi (aarch64)
 #   make pi-armv7     - cross-compile Rust manager for Raspberry Pi (armv7)
 #   make pi-install   - copy cross-compiled binary to Pi (set PI_HOST)
@@ -34,7 +35,7 @@ ifneq (, $(shell which cargo-zigbuild 2>/dev/null))
   CARGO := cargo-zigbuild
 endif
 
-.PHONY: all c rust pi pi-armv7 pi-install test clean install run-display run-manager
+.PHONY: all c rust deb pi pi-armv7 pi-install test clean install run-display run-manager
 
 all: c rust
 
@@ -47,17 +48,20 @@ rust:
 pi:
 	@echo "Cross-compiling Rust manager for Pi ($(PI_TARGET_AARCH64)) using $(CARGO)..."
 	$(CARGO) build --release --target $(PI_TARGET_AARCH64)
-	@echo "Binary: target/$(PI_TARGET_AARCH64)/release/photo-frame"
+	@echo "Binary: target/$(PI_TARGET_AARCH64)/release/photo-frame-manager"
 
 pi-armv7:
 	@echo "Cross-compiling Rust manager for Pi ($(PI_TARGET_ARMV7)) using $(CARGO)..."
 	$(CARGO) build --release --target $(PI_TARGET_ARMV7)
-	@echo "Binary: target/$(PI_TARGET_ARMV7)/release/photo-frame"
+	@echo "Binary: target/$(PI_TARGET_ARMV7)/release/photo-frame-manager"
 
 pi-install: pi
 	@echo "Copying binary to $(PI_HOST)..."
-	scp target/$(PI_TARGET_AARCH64)/release/photo-frame $(PI_HOST):/tmp/photo-frame
-	ssh $(PI_HOST) "sudo install -Dm755 /tmp/photo-frame /usr/local/bin/photo-frame && rm /tmp/photo-frame"
+	scp target/$(PI_TARGET_AARCH64)/release/photo-frame-manager $(PI_HOST):/tmp/photo-frame-manager
+	ssh $(PI_HOST) "sudo install -Dm755 /tmp/photo-frame-manager /usr/local/bin/photo-frame-manager && rm /tmp/photo-frame-manager"
+
+deb:
+	cargo deb
 
 test:
 	cargo test
@@ -67,11 +71,11 @@ clean:
 	cargo clean
 
 install: all
-	install -Dm755 c/photo_frame /usr/local/bin/photo_frame
-	install -Dm755 target/release/photo-frame /usr/local/bin/photo-frame-manager
+	install -Dm755 c/photo-frame-display /usr/local/bin/photo-frame-display
+	install -Dm755 target/release/photo-frame-manager /usr/local/bin/photo-frame-manager
 
 run-manager: rust
-	./target/release/photo-frame --import-dir "$(IMPORT_DIR)" config.toml
+	./target/release/photo-frame-manager --import-dir "$(IMPORT_DIR)" config.toml
 
 run-display: c
-	cd c && ./photo_frame
+	cd c && ./photo-frame-display

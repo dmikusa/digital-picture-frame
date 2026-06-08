@@ -1,36 +1,36 @@
 # Makefile for C display app and example clients
 #
 # Targets:
-#   make          - build photo_frame
+#   make          - build photo-frame-display
 #   make clean    - remove built binaries
-#   make run      - build and run photo_frame
+#   make run      - build and run photo-frame-display
 
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O2 -std=gnu11
 LDFLAGS :=
 
-# photo_frame requires DRM, EGL, GLES, GBM, and math
+# photo-frame-display requires DRM, EGL, GLES, GBM, and math
 FRAME_LIBS := -lEGL -lGLESv2 -lgbm $(shell pkg-config --libs libdrm) -lm
 FRAME_CFLAGS := $(CFLAGS) $(shell pkg-config --cflags libdrm)
 
-# photo_frame_client has no special library dependencies
+# photo-frame-display-client has no special library dependencies
 CLIENT_LIBS  :=
 
 .PHONY: all clean run
 
-all: photo_frame
+all: photo-frame-display
 
-photo_frame: photo_frame.c stb_image.h
+photo-frame-display: photo-frame-display.c stb_image.h
 	$(CC) $(FRAME_CFLAGS) -o $@ $< $(FRAME_LIBS) $(LDFLAGS)
 
-photo_frame_client: photo_frame_client.c
+photo-frame-display-client: photo-frame-display-client.c
 	$(CC) $(CFLAGS) -o $@ $< $(CLIENT_LIBS) $(LDFLAGS)
 
 # Build both the display app and the example client
-all-with-client: photo_frame photo_frame_client
+all-with-client: photo-frame-display photo-frame-display-client
 
 clean:
-	rm -f photo_frame photo_frame_client
+	rm -f photo-frame-display photo-frame-display-client
 
-run: photo_frame
-	./photo_frame
+run: photo-frame-display
+	./photo-frame-display

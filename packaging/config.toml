@@ -1,0 +1,7 @@
+photos_dir = "/mnt/photos"
+socket_path = "/tmp/photo-frame.sock"
+native_resolution = "1920x1080"
+aspect_ratio_mode = "fit"
+batch_delete_size = 20
+log_max_size = 262144
+log_max_files = 2

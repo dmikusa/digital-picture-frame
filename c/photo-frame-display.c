@@ -1,5 +1,5 @@
 /*
- * photo_frame.c
+ * photo-frame-display.c
  *
  * Production-quality DRM/GBM/EGL photo frame.
  *
@@ -9,11 +9,11 @@
  * may push the next image at any time during the hold.
  *
  * Build:
- *   gcc photo_frame.c -o photo_frame -lEGL -lGLESv2 -lgbm \
+ *   gcc photo-frame-display.c -o photo-frame-display -lEGL -lGLESv2 -lgbm \
  *       $(pkg-config --cflags --libs libdrm) -lm
  *
  * Run:
- *   ./photo_frame
+ *   ./photo-frame-display
  *
  *   Then from another terminal (or your management app):
  *     echo "IMG /path/to/photo1.jpg" | nc -U /tmp/photo-frame.sock

@@ -28,7 +28,7 @@ fn acquire_pid_lock() -> Result<std::fs::File, String> {
                     let running = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
                     if running {
                         return Err(format!(
-                            "Another instance of photo-frame is already running (PID {})",
+                            "Another instance of photo-frame-manager is already running (PID {})",
                             pid
                         ));
                     } else {
@@ -55,7 +55,7 @@ fn acquire_pid_lock() -> Result<std::fs::File, String> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         return Err(format!(
-            "Another instance of photo-frame is already running (lock file in use): {}",
+            "Another instance of photo-frame-manager is already running (lock file in use): {}",
             err
         ));
     }
@@ -140,7 +140,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    log::info!("Starting photo-frame");
+    log::info!("Starting photo-frame-manager");
     log::info!("{}", config);
 
     // Ensure photos directory exists

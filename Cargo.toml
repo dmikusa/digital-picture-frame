@@ -1,5 +1,5 @@
 [package]
-name = "photo-frame"
+name = "photo-frame-manager"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,6 +17,21 @@ signal-hook = "0.3"
 chrono = "0.4"
 flate2 = "1"
 libc = "0.2"
+
+[package.metadata.deb]
+maintainer = "Daniel Mikusa <dan@mikusa.com>"
+section = "graphics"
+priority = "optional"
+depends = "$auto, usbmount, imagemagick, libdrm2, libegl1-mesa, libgbm1"
+assets = [
+    ["target/release/photo-frame-manager", "usr/bin/photo-frame-manager", "755"],
+    ["c/photo-frame-display", "usr/bin/photo-frame-display", "755"],
+    ["packaging/config.toml", "etc/photo-frame/config.toml", "644"],
+    ["packaging/display.env", "etc/photo-frame/display.env", "644"],
+    ["packaging/photo-frame-display.service", "lib/systemd/system/", "644"],
+    ["packaging/photo-frame-manager.service", "lib/systemd/system/", "644"],
+]
+maintainer-scripts = "packaging/deb-scripts/"
 
 [dev-dependencies]
 tempfile = "3"
