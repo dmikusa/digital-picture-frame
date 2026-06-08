@@ -21,19 +21,26 @@
 #   - src/        : Rust manager app (USB import, socket client, index management)
 #
 # Targets:
-#   make              - build both C display app and Rust manager (native)
-#   make c            - build only the C display app
-#   make rust         - build only the Rust manager (native)
-#   make deb          - build Debian package (requires cargo-deb)
-#   make test         - run Rust tests
-#   make clean        - clean both C and Rust build artifacts
-#   make install      - install binaries to /usr/local/bin (requires sudo)
-#   make run-display  - build and run the C display app
-#   make run-manager  - build and run the Rust manager app
-#   make setup-debian - install build/runtime dependencies on Debian
-#   make setup-cargo  - install required cargo plugins (cargo-deb)
+#   make                   - build both C display app and Rust manager (native)
+#   make c                 - build only the C display app
+#   make rust              - build only the Rust manager (native)
+#   make deb               - build Debian package (requires cargo-deb)
+#   make test              - run all tests (Rust + C in container)
+#   make test-rust         - run Rust tests only
+#   make test-c            - run C build + lint in container (Podman/Docker)
+#   make build-c-container - build the container image for C testing
+#   make clean             - clean both C and Rust build artifacts
+#   make install           - install binaries to /usr/local/bin (requires sudo)
+#   make run-display       - build and run the C display app
+#   make run-manager       - build and run the Rust manager app
+#   make setup-debian      - install build/runtime dependencies on Debian
+#   make setup-cargo       - install required cargo plugins (cargo-deb)
 
-.PHONY: all c rust deb test clean install run-display run-manager setup-debian setup-cargo
+# Use podman by default, override with: make CONTAINER=docker
+CONTAINER := $(shell which podman 2>/dev/null || which docker 2>/dev/null)
+CONTAINER_IMAGE := photo-frame-c-build
+
+.PHONY: all c rust deb test test-rust test-c build-c-container clean install run-display run-manager setup-debian setup-cargo
 
 all: c rust
 
@@ -46,12 +53,23 @@ rust:
 deb:
 	cargo deb
 
-test:
+test: test-rust test-c
+
+test-rust:
 	cargo test
+
+test-c: build-c-container
+	@echo "Running C tests + build + lint in container ($(CONTAINER))..."
+	$(CONTAINER) run --rm -v $(PWD)/c:/src:Z $(CONTAINER_IMAGE) \
+		bash -c "cd /src && make clean && make test && make && cppcheck --enable=all --error-exitcode=1 --suppress=*:stb_image.h --suppress=ctuArrayIndex --suppress=missingIncludeSystem --suppress=toomanyconfigs ."
+
+build-c-container:
+	$(CONTAINER) build -t $(CONTAINER_IMAGE) -f c/Containerfile c
 
 clean:
 	$(MAKE) -C c clean
 	cargo clean
+	-$(CONTAINER) rmi $(CONTAINER_IMAGE) 2>/dev/null || true
 
 install: all
 	install -Dm755 c/photo-frame-display /usr/local/bin/photo-frame-display

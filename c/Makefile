@@ -18,6 +18,7 @@
 #
 # Targets:
 #   make          - build photo-frame-display
+#   make test     - build and run unit tests for display logic
 #   make clean    - remove built binaries
 #   make run      - build and run photo-frame-display
 
@@ -25,19 +26,26 @@ CC      := gcc
 CFLAGS  := -Wall -Wextra -O2 -std=gnu11
 LDFLAGS :=
 
-# photo-frame-display requires DRM, EGL, GLES, GBM, and math
+# Display logic (no GL/DRM dependencies)
+LOGIC_SRC := display_logic.c
+LOGIC_OBJ := display_logic.o
+
+# photo-frame-display requires DRM, EGL, GLES, GBM, and math (stb_image uses pow)
 FRAME_LIBS := -lEGL -lGLESv2 -lgbm $(shell pkg-config --libs libdrm) -lm
 FRAME_CFLAGS := $(CFLAGS) $(shell pkg-config --cflags libdrm)
 
 # photo-frame-display-client has no special library dependencies
 CLIENT_LIBS  :=
 
-.PHONY: all clean run
+.PHONY: all test clean run
 
 all: photo-frame-display
 
-photo-frame-display: photo-frame-display.c stb_image.h
-	$(CC) $(FRAME_CFLAGS) -o $@ $< $(FRAME_LIBS) $(LDFLAGS)
+$(LOGIC_OBJ): display_logic.c display_logic.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+photo-frame-display: photo-frame-display.c $(LOGIC_OBJ) stb_image.h display_logic.h
+	$(CC) $(FRAME_CFLAGS) -o $@ $< $(LOGIC_OBJ) $(FRAME_LIBS) $(LDFLAGS)
 
 photo-frame-display-client: photo-frame-display-client.c
 	$(CC) $(CFLAGS) -o $@ $< $(CLIENT_LIBS) $(LDFLAGS)
@@ -45,8 +53,17 @@ photo-frame-display-client: photo-frame-display-client.c
 # Build both the display app and the example client
 all-with-client: photo-frame-display photo-frame-display-client
 
+# Test binary for display logic
+TEST_BIN := test_display_logic
+
+$(TEST_BIN): test_display_logic.c $(LOGIC_OBJ) display_logic.h
+	$(CC) $(CFLAGS) -o $@ $< $(LOGIC_OBJ)
+
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+
 clean:
-	rm -f photo-frame-display photo-frame-display-client
+	rm -f photo-frame-display photo-frame-display-client $(TEST_BIN) $(LOGIC_OBJ)
 
 run: photo-frame-display
 	./photo-frame-display

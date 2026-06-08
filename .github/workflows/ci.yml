@@ -24,5 +24,8 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
-      - name: Run tests
+      - name: Run Rust tests
         run: cargo test
+
+      - name: Run C build + lint
+        run: make test-c

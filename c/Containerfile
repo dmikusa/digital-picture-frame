@@ -1,0 +1,18 @@
+# Container image for building and linting the C display app.
+# Works with Podman or Docker.
+
+FROM debian:11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cppcheck \
+    gcc \
+    libdrm-dev \
+    libegl1-mesa-dev \
+    libgbm-dev \
+    make \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

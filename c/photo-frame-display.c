@@ -48,10 +48,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
-#include <math.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -63,6 +63,8 @@
 #include <xf86drmMode.h>
 #include <gbm.h>
 
+#include "display_logic.h"
+
 #define EGL_PLATFORM_GBM_KHR 0x31D7
 
 #ifndef GBM_FORMAT_ARGB8888
@@ -71,8 +73,6 @@
 
 #define SOCKET_PATH            "/run/photo-frame/photo-frame.sock"
 #define HOLD_DURATION_SEC      5.0f
-#define DEFAULT_FADE_DURATION  1.5f
-#define DEFAULT_SKIP_FRAMES  0
 
 #define CHECK(cond, ...) do { \
     if (!(cond)) { \
@@ -172,27 +172,6 @@ static void signal_handler(int sig)
     g.running = 0;
 }
 
-/* Read display settings from environment variables */
-static void read_display_config(void)
-{
-    g.fade_duration = DEFAULT_FADE_DURATION;
-    g.skip_frames   = DEFAULT_SKIP_FRAMES;
-
-    const char *env_fade = getenv("PHOTO_FRAME_FADE_DURATION");
-    if (env_fade && env_fade[0] != '\0') {
-        g.fade_duration = strtof(env_fade, NULL);
-        if (g.fade_duration < 0.0f) g.fade_duration = 0.0f;
-    }
-
-    const char *env_skip = getenv("PHOTO_FRAME_SKIP_FRAMES");
-    if (env_skip && env_skip[0] != '\0') {
-        g.skip_frames = (int)strtol(env_skip, NULL, 10);
-        if (g.skip_frames < 0) g.skip_frames = 0;
-    }
-
-    printf("Display config: fade=%.1fs skip=%d\n", g.fade_duration, g.skip_frames);
-}
-
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -234,25 +213,6 @@ static GLuint link_program(GLuint vs, GLuint fs)
         exit(1);
     }
     return p;
-}
-
-static void build_quad(float img_aspect, float screen_aspect, GLfloat *v)
-{
-    float x0, x1, y0, y1;
-    if (img_aspect > screen_aspect) {
-        x0 = -1.0f; x1 = 1.0f;
-        float h = screen_aspect / img_aspect;
-        y0 = -h; y1 = h;
-    } else {
-        float w = img_aspect / screen_aspect;
-        x0 = -w; x1 = w;
-        y0 = -1.0f; y1 = 1.0f;
-    }
-    /* V coords flipped because stb_image row 0 is top */
-    v[0]  = x0; v[1]  = y0; v[2]  = 0.0f; v[3]  = 1.0f;
-    v[4]  = x1; v[5]  = y0; v[6]  = 1.0f; v[7]  = 1.0f;
-    v[8]  = x0; v[9]  = y1; v[10] = 0.0f; v[11] = 0.0f;
-    v[12] = x1; v[13] = y1; v[14] = 1.0f; v[15] = 0.0f;
 }
 
 static void page_flip_handler(int fd, unsigned int frame,
@@ -354,18 +314,21 @@ static void send_ready(void)
 static void handle_img_command(const char *path)
 {
     printf("Received IMG: %s\n", path);
-    /* Fill the first empty slot.  During normal operation exactly one
-       slot is free (the one we just faded away from).  At startup both
-       are empty, so this naturally fills slot 0 first, then slot 1. */
-    if (!g.slots[0].occupied) {
-        load_image_into_slot(0, path);
-    } else if (!g.slots[1].occupied) {
-        load_image_into_slot(1, path);
-    } else if (!g.pending_pixels) {
-        store_pending_image(path);
-    } else {
-        printf("Warning: both slots and pending buffer full, dropping %s\n", path);
+    int dest = select_image_destination(
+        g.slots[0].occupied, g.slots[1].occupied, g.pending_pixels != NULL);
+    switch (dest) {
+        case 0: load_image_into_slot(0, path); break;
+        case 1: load_image_into_slot(1, path); break;
+        case 2: store_pending_image(path); break;
+        case 3: printf("Warning: both slots and pending buffer full, dropping %s\n", path); break;
     }
+}
+
+static int handle_img_cmd_wrapper(const char *path, void *ctx)
+{
+    (void)ctx;
+    handle_img_command(path);
+    return !(g.slots[0].occupied && g.slots[1].occupied && g.pending_pixels);
 }
 
 static void handle_socket_data(void)
@@ -395,39 +358,17 @@ static void handle_socket_data(void)
     }
     len += n;
 
-    char *start = buf;
-    char *end   = buf + len;
-    char *nl;
-    while ((nl = memchr(start, '\n', end - start)) != NULL) {
-        *nl = '\0';
-        if (strncmp(start, "IMG ", 4) == 0) {
-            handle_img_command(start + 4);
-        } else {
-            printf("Unknown command: %s\n", start);
-        }
-        start = nl + 1;
-
-        /* Backpressure: if full, stop consuming and pause socket reads */
-        if (g.slots[0].occupied && g.slots[1].occupied && g.pending_pixels) {
-            size_t remain = end - start;
-            if (remain > 0)
-                memmove(buf, start, remain);
-            len = remain;
-
-            if (!g.socket_paused) {
-                g.socket_paused = 1;
-                epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, g.conn_fd, NULL);
-                printf("Socket paused (backpressure).\n");
-            }
-            return;
-        }
+    int paused = 0;
+    size_t consumed = parse_protocol_buffer(buf, len, handle_img_cmd_wrapper, NULL, &paused);
+    if (consumed > 0) {
+        memmove(buf, buf + consumed, len - consumed);
+        len -= consumed;
     }
-
-    /* No more complete commands in buffer */
-    size_t remain = end - start;
-    if (remain > 0)
-        memmove(buf, start, remain);
-    len = remain;
+    if (paused && !g.socket_paused) {
+        g.socket_paused = 1;
+        epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, g.conn_fd, NULL);
+        printf("Socket paused (backpressure).\n");
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -589,7 +530,9 @@ int main(void)
 {
     memset(&g, 0, sizeof(g));
     g.running = 1;
-    read_display_config();
+    struct display_config cfg = read_display_config();
+    g.fade_duration = cfg.fade_duration;
+    g.skip_frames = cfg.skip_frames;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
