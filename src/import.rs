@@ -21,8 +21,8 @@ use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, W
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -73,7 +73,13 @@ pub fn watch_usb_mounts(
                             let dedup_set = dedup_set.clone();
                             let config = config.clone();
                             std::thread::spawn(move || {
-                                if let Err(e) = import_from_mount(&path, &photos_dir, &index_dir, dedup_set, &config) {
+                                if let Err(e) = import_from_mount(
+                                    &path,
+                                    &photos_dir,
+                                    &index_dir,
+                                    dedup_set,
+                                    &config,
+                                ) {
                                     log::error!("Import failed for {}: {}", path.display(), e);
                                 }
                                 log::info!("Import complete for {}", path.display());
@@ -189,7 +195,9 @@ fn import_single_photo(
     }
 
     // Determine destination path based on file mtime
-    let mtime = fs::metadata(src_path)?.modified().unwrap_or(SystemTime::now());
+    let mtime = fs::metadata(src_path)?
+        .modified()
+        .unwrap_or(SystemTime::now());
     let dest_path = build_dest_path(src_path, photos_dir, mtime);
 
     // Ensure parent directory exists
@@ -207,13 +215,15 @@ fn import_single_photo(
             if e.kind() == io::ErrorKind::WriteZero {
                 log::warn!("Disk full, attempting rotation");
                 let (_index_path, meta) = index::init_index(index_dir)?;
-                let (_new_meta, deleted) = index::delete_oldest(index_dir, &meta, config.batch_delete_size)?;
+                let (_new_meta, deleted) =
+                    index::delete_oldest(index_dir, &meta, config.batch_delete_size)?;
                 log::info!("Deleted {} old photos to free space", deleted);
                 // Retry the conversion
                 if let Err(e2) = convert_image(src_path, &dest_path, width, height, mode) {
-                    return Err(io::Error::other(
-                        format!("Conversion failed after rotation: {}", e2),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "Conversion failed after rotation: {}",
+                        e2
+                    )));
                 }
             } else {
                 return Err(e);
@@ -229,11 +239,7 @@ fn import_single_photo(
         .to_string();
     let (_index_path, meta) = index::init_index(index_dir)?;
     let mut writer = IndexWriter::open(index_dir, meta)?;
-    let line_number = writer.append(
-        &dest_path.to_string_lossy(),
-        &original_name,
-        hash,
-    )?;
+    let line_number = writer.append(&dest_path.to_string_lossy(), &original_name, hash)?;
     writer.sync_metadata()?;
 
     // Add to dedup set
@@ -327,8 +333,7 @@ fn convert_image(
             .arg("-extent")
             .arg(format!("{}x{}", width, height));
     } else {
-        cmd.arg("-resize")
-            .arg(format!("{}x{}", width, height));
+        cmd.arg("-resize").arg(format!("{}x{}", width, height));
     }
     cmd.arg(dest);
 
@@ -343,9 +348,7 @@ fn convert_image(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(
-            format!("ImageMagick failed: {}", stderr),
-        ));
+        return Err(io::Error::other(format!("ImageMagick failed: {}", stderr)));
     }
 
     Ok(())

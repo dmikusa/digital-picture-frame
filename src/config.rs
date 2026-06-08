@@ -18,8 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum AspectRatioMode {
     #[serde(rename = "fit")]
     #[default]
@@ -27,7 +26,6 @@ pub enum AspectRatioMode {
     #[serde(rename = "fill")]
     Fill,
 }
-
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -60,10 +58,11 @@ impl Config {
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file: {}", e))?;
-        let mut config: Config = toml::from_str(&contents)
-            .map_err(|e| format!("Failed to parse config file: {}", e))?;
+        let mut config: Config =
+            toml::from_str(&contents).map_err(|e| format!("Failed to parse config file: {}", e))?;
         config.validate()?;
-        config.photos_dir = config.photos_dir
+        config.photos_dir = config
+            .photos_dir
             .canonicalize()
             .map_err(|e| format!("Failed to resolve photos_dir: {}", e))?;
         Ok(config)
@@ -71,10 +70,16 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), String> {
         if !self.photos_dir.exists() {
-            return Err(format!("photos_dir does not exist: {}", self.photos_dir.display()));
+            return Err(format!(
+                "photos_dir does not exist: {}",
+                self.photos_dir.display()
+            ));
         }
         if !self.photos_dir.is_dir() {
-            return Err(format!("photos_dir is not a directory: {}", self.photos_dir.display()));
+            return Err(format!(
+                "photos_dir is not a directory: {}",
+                self.photos_dir.display()
+            ));
         }
 
         // Validate native_resolution format: WxH
@@ -109,7 +114,6 @@ impl Config {
             parts[1].parse().unwrap_or(1080),
         )
     }
-
 }
 
 impl fmt::Display for Config {
@@ -148,7 +152,10 @@ log_max_files = 3
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.photos_dir, PathBuf::from("/tmp/photos"));
-        assert_eq!(config.socket_path, PathBuf::from("/run/photo-frame/photo-frame.sock"));
+        assert_eq!(
+            config.socket_path,
+            PathBuf::from("/run/photo-frame/photo-frame.sock")
+        );
         assert_eq!(config.native_resolution, "1920x1080");
         assert_eq!(config.aspect_ratio_mode, AspectRatioMode::Fit);
         assert_eq!(config.batch_delete_size, 10);
