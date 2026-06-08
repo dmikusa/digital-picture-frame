@@ -22,11 +22,11 @@ sudo parted /dev/mmcblk0
 # (parted) quit
 
 sudo mkfs.ext4 /dev/mmcblk0p3
-sudo mkdir /mnt/photos
-sudo mount /dev/mmcblk0p3 /mnt/photos
+sudo mkdir -p /var/lib/photo-frame/photos
+sudo mount /dev/mmcblk0p3 /var/lib/photo-frame/photos
 
 # Add to /etc/fstab:
-# PARTUUID=<uuid> /mnt/photos ext4 noatime,lazytime 0 2
+# PARTUUID=<uuid> /var/lib/photo-frame/photos ext4 noatime,lazytime 0 2
 ```
 
 ### 3. Install packages

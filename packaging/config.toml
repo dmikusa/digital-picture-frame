@@ -1,7 +1,27 @@
-photos_dir = "/mnt/photos"
-socket_path = "/tmp/photo-frame.sock"
+# Required: directory where photos are stored and imported. Must exist.
+photos_dir = "/var/lib/photo-frame/photos"
+
+# Required: path to the Unix domain socket for the C display app.
+# The display app creates the socket at this path.
+# Example: "/run/photo-frame/photo-frame.sock"
+socket_path = "/run/photo-frame/photo-frame.sock"
+
+# Required: display resolution in "WxH" format. Used for import resizing.
+# Example: "1920x1080", "1024x768"
 native_resolution = "1920x1080"
+
+# Optional: how to handle aspect ratio mismatch during import.
+#   "fit" (default) = letterbox/pillarbox, preserve full photo
+#   "fill" = crop to center, fill entire screen
 aspect_ratio_mode = "fit"
+
+# Optional: number of oldest photos to delete when disk is full during import.
+# Must be > 0. Default: 20
 batch_delete_size = 20
+
+# Optional: max log file size in bytes before rotation. Default: 262144 (256 KiB)
+# Logs are written to tmpfs (RAM) to avoid SD card wear.
 log_max_size = 262144
+
+# Optional: number of rotated log files to retain. Default: 2
 log_max_files = 2

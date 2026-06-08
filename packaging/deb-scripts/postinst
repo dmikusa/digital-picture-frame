@@ -25,8 +25,8 @@ case "$1" in
     fi
 
     # Ensure photos directory exists with correct ownership
-    mkdir -p /mnt/photos
-    chown photo-frame:photo-frame /mnt/photos
+    mkdir -p /var/lib/photo-frame/photos
+    chown photo-frame:photo-frame /var/lib/photo-frame/photos
 
     # Reload systemd to pick up new units
     systemctl daemon-reload

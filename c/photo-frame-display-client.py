@@ -9,7 +9,7 @@ This gives natural backpressure because the display app pauses
 socket reads when both GPU slots and the CPU pending buffer are full.
 
 Usage:
-    python3 photo-frame-display-client.py /tmp/photo-frame.sock \
+    python3 photo-frame-display-client.py /run/photo-frame/photo-frame.sock \
         /path/to/photo1.jpg \
         /path/to/photo2.jpg \
         /path/to/photo3.jpg

@@ -9,7 +9,7 @@
  * Build: gcc sender.c -o sender
  *
  * Usage:
- *   ./sender /tmp/photo-frame.sock \
+ *   ./sender /run/photo-frame/photo-frame.sock \
  *       /path/to/photo1.jpg \
  *       /path/to/photo2.jpg \
  *       /path/to/photo3.jpg

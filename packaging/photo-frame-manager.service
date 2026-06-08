@@ -8,6 +8,7 @@ Type=simple
 ExecStart=/usr/bin/photo-frame-manager /etc/photo-frame/config.toml
 Restart=on-failure
 User=photo-frame
+RuntimeDirectory=photo-frame
 
 [Install]
 WantedBy=multi-user.target

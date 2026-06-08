@@ -126,7 +126,7 @@ If your system has custom udev rules, you can fall back to `User=root` in the di
 service (documented in README).
 
 The `postinst` also:
-- Creates `/mnt/photos` and `chown`s to `photo-frame:photo-frame`
+- Creates `/var/lib/photo-frame/photos` and `chown`s to `photo-frame:photo-frame`
 - Runs `systemctl daemon-reload`
 - Enables both services
 - Starts both services (on fresh install)
@@ -135,18 +135,34 @@ The `postinst` also:
 
 **`/etc/photo-frame/config.toml`** (conffile):
 ```toml
-photos_dir = "/mnt/photos"
-socket_path = "/tmp/photo-frame.sock"
+# Required: directory where photos are stored and imported. Must exist.
+photos_dir = "/var/lib/photo-frame/photos"
+
+# Required: path to the Unix domain socket for the C display app.
+socket_path = "/run/photo-frame/photo-frame.sock"
+
+# Required: display resolution in "WxH" format. Used for import resizing.
 native_resolution = "1920x1080"
+
+# Optional: aspect ratio handling. "fit" (default) = letterbox, "fill" = crop to center.
 aspect_ratio_mode = "fit"
+
+# Optional: photos to delete per rotation cycle when disk is full. Default: 20.
 batch_delete_size = 20
+
+# Optional: max log file size in bytes before rotation. Default: 262144 (256 KiB).
 log_max_size = 262144
+
+# Optional: number of rotated log files to retain. Default: 2.
 log_max_files = 2
 ```
 
 **`/etc/photo-frame/display.env`** (conffile):
 ```bash
+# Fade duration between photos in seconds. 0 = instant cut. Default: 1.5.
 PHOTO_FRAME_FADE_DURATION=1.5
+
+# Skip frames during fade to reduce CPU. 0 = every frame, 1 = every 2nd, etc. Default: 0.
 PHOTO_FRAME_SKIP_FRAMES=0
 ```
 

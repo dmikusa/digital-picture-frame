@@ -32,8 +32,8 @@
  *   ./photo-frame-display
  *
  *   Then from another terminal (or your management app):
- *     echo "IMG /path/to/photo1.jpg" | nc -U /tmp/photo-frame.sock
- *     echo "IMG /path/to/photo2.jpg" | nc -U /tmp/photo-frame.sock
+ *     echo "IMG /path/to/photo1.jpg" | nc -U /run/photo-frame/photo-frame.sock
+ *     echo "IMG /path/to/photo2.jpg" | nc -U /run/photo-frame/photo-frame.sock
  */
 
 #define _GNU_SOURCE
@@ -69,7 +69,7 @@
 #define GBM_FORMAT_ARGB8888 GBM_BO_FORMAT_ARGB8888
 #endif
 
-#define SOCKET_PATH            "/tmp/photo-frame.sock"
+#define SOCKET_PATH            "/run/photo-frame/photo-frame.sock"
 #define HOLD_DURATION_SEC      5.0f
 #define DEFAULT_FADE_DURATION  1.5f
 #define DEFAULT_SKIP_FRAMES  0

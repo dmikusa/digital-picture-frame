@@ -139,7 +139,7 @@ mod tests {
     fn test_parse_valid_config() {
         let toml_str = r#"
 photos_dir = "/tmp/photos"
-socket_path = "/tmp/photo-frame.sock"
+socket_path = "/run/photo-frame/photo-frame.sock"
 native_resolution = "1920x1080"
 aspect_ratio_mode = "fit"
 batch_delete_size = 10
@@ -148,7 +148,7 @@ log_max_files = 3
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.photos_dir, PathBuf::from("/tmp/photos"));
-        assert_eq!(config.socket_path, PathBuf::from("/tmp/photo-frame.sock"));
+        assert_eq!(config.socket_path, PathBuf::from("/run/photo-frame/photo-frame.sock"));
         assert_eq!(config.native_resolution, "1920x1080");
         assert_eq!(config.aspect_ratio_mode, AspectRatioMode::Fit);
         assert_eq!(config.batch_delete_size, 10);
@@ -160,7 +160,7 @@ log_max_files = 3
     fn test_parse_defaults() {
         let toml_str = r#"
 photos_dir = "/tmp/photos"
-socket_path = "/tmp/photo-frame.sock"
+socket_path = "/run/photo-frame/photo-frame.sock"
 native_resolution = "800x600"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();

@@ -9,6 +9,7 @@ EnvironmentFile=-/etc/photo-frame/display.env
 Restart=on-failure
 User=photo-frame
 Group=video
+RuntimeDirectory=photo-frame
 
 [Install]
 WantedBy=multi-user.target

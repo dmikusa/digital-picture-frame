@@ -100,7 +100,7 @@ The C display app (`photo-frame-display.c`) reads these optional environment var
 1. Flash standard DietPi image.
 2. Before first boot, mount the root partition and delete the auto-resize symlink.
 3. Boot — rootfs stays at its original ~900MB size.
-4. Manually create a second ext4 partition in the remaining space, mount to `/mnt/photos`, add to `/etc/fstab`.
+4. Manually create a second ext4 partition in the remaining space, mount to `/var/lib/photo-frame/photos`, add to `/etc/fstab`.
 
 **Why:** DietPi's `dietpi-build` only creates boot and root partitions. The resize service is enabled via a simple symlink; removing it before first boot is trivial. This is a one-time setup step, far simpler than forking the build scripts.
 
@@ -174,10 +174,10 @@ parted /dev/mmcblk0
 # (parted) mkpart primary ext4 <start> 100%
 # (parted) quit
 mkfs.ext4 /dev/mmcblk0p3
-mkdir /mnt/photos
-mount /dev/mmcblk0p3 /mnt/photos
-# Add to /etc/fstab:
-# PARTUUID=<uuid> /mnt/photos ext4 noatime,lazytime 0 2
+mkdir -p /var/lib/photo-frame/photos
+mount /dev/mmcblk0p3 /var/lib/photo-frame/photos
+
+# PARTUUID=<uuid> /var/lib/photo-frame/photos ext4 noatime,lazytime 0 2
 ```
 
 ### 4.3 Required Packages
