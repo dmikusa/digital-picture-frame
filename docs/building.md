@@ -11,9 +11,9 @@ make test         # Run Rust tests
 make clean        # Clean everything
 make run-display  # Runs the C display app
 make run-manager  # Runs the Rust manager app
+make setup-debian # Install build/runtime dependencies on Debian
+make setup-cargo  # Install required cargo plugins (cargo-deb)
 ```
-
-You might be able to cross compile this, but it honestly builds pretty quick even on the Raspberry PI Zero 2W. I'd recommend just building on-device.
 
 ## C display app requirements
 

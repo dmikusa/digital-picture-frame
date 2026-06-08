@@ -9,33 +9,15 @@
 #   make c            - build only the C display app
 #   make rust         - build only the Rust manager (native)
 #   make deb          - build Debian package (requires cargo-deb)
-#   make pi           - cross-compile Rust manager for Raspberry Pi (aarch64)
-#   make pi-armv7     - cross-compile Rust manager for Raspberry Pi (armv7)
-#   make pi-install   - copy cross-compiled binary to Pi (set PI_HOST)
 #   make test         - run Rust tests
 #   make clean        - clean both C and Rust build artifacts
 #   make install      - install binaries to /usr/local/bin (requires sudo)
 #   make run-display  - build and run the C display app
-#
-# Cross-compilation requires a linker. On macOS, the easiest options are:
-#   1. cargo-zigbuild:  cargo install cargo-zigbuild  (uses Zig as linker)
-#   2. cross:         cargo install cross             (uses Docker)
-#
-# Example with cargo-zigbuild:
-#   rustup target add aarch64-unknown-linux-gnu
-#   make pi
+#   make run-manager  - build and run the Rust manager app
+#   make setup-debian - install build/runtime dependencies on Debian
+#   make setup-cargo  - install required cargo plugins (cargo-deb)
 
-PI_HOST ?= dietpi
-PI_TARGET_AARCH64 ?= aarch64-unknown-linux-gnu
-PI_TARGET_ARMV7 ?= armv7-unknown-linux-gnueabihf
-
-CARGO := cargo
-# Use cargo-zigbuild if available, otherwise fall back to cargo
-ifneq (, $(shell which cargo-zigbuild 2>/dev/null))
-  CARGO := cargo-zigbuild
-endif
-
-.PHONY: all c rust deb pi pi-armv7 pi-install test clean install run-display run-manager
+.PHONY: all c rust deb test clean install run-display run-manager setup-debian setup-cargo
 
 all: c rust
 
@@ -44,21 +26,6 @@ c:
 
 rust:
 	cargo build --release
-
-pi:
-	@echo "Cross-compiling Rust manager for Pi ($(PI_TARGET_AARCH64)) using $(CARGO)..."
-	$(CARGO) build --release --target $(PI_TARGET_AARCH64)
-	@echo "Binary: target/$(PI_TARGET_AARCH64)/release/photo-frame-manager"
-
-pi-armv7:
-	@echo "Cross-compiling Rust manager for Pi ($(PI_TARGET_ARMV7)) using $(CARGO)..."
-	$(CARGO) build --release --target $(PI_TARGET_ARMV7)
-	@echo "Binary: target/$(PI_TARGET_ARMV7)/release/photo-frame-manager"
-
-pi-install: pi
-	@echo "Copying binary to $(PI_HOST)..."
-	scp target/$(PI_TARGET_AARCH64)/release/photo-frame-manager $(PI_HOST):/tmp/photo-frame-manager
-	ssh $(PI_HOST) "sudo install -Dm755 /tmp/photo-frame-manager /usr/local/bin/photo-frame-manager && rm /tmp/photo-frame-manager"
 
 deb:
 	cargo deb
@@ -79,3 +46,20 @@ run-manager: rust
 
 run-display: c
 	cd c && ./photo-frame-display
+
+setup-debian:
+	apt-get update
+	apt-get install -y --no-install-recommends \
+		build-essential \
+		ca-certificates \
+		curl \
+		git \
+		imagemagick \
+		libdrm-dev \
+		libegl1-mesa-dev \
+		libgbm-dev \
+		pkg-config \
+		usbmount
+
+setup-cargo:
+	cargo install cargo-deb
