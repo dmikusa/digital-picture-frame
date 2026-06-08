@@ -1,6 +1,8 @@
 [package]
 name = "photo-frame-manager"
 version = "0.1.0"
+description = "A Rust manager for a DRM/GBM/EGL digital photo frame, paired with a C display app."
+license = "AGPL-3.0-or-later"
 edition = "2021"
 
 [profile.release]

@@ -19,6 +19,10 @@ c/
   photo-frame-display.c - DRM/GBM/EGL display server (env vars for fade/skip)
 ```
 
+## License
+
+AGPL-3.0-or-later. See `docs/adding-new-files.md` for header templates.
+
 ## Reference Docs
 
 - `plans/SPEC.md` — Living specification: what features exist and how they operate.
