@@ -11,7 +11,9 @@ The manager reads `config.toml` at startup. All paths are resolved to absolute p
 photos_dir = "/var/lib/photo-frame/photos"
 
 # Required: path to the Unix domain socket used to communicate with the C display app.
-# The C display app must create this socket (or the directory must exist).
+# The C display app creates the socket. The directory should be owned by the service user
+# with mode 0700 so only the service can connect (e.g., /run/photo-frame/ with systemd
+# RuntimeDirectoryMode=0700). Both apps must run as the same user.
 # Example: "/run/photo-frame/photo-frame.sock"
 socket_path = "/run/photo-frame/photo-frame.sock"
 

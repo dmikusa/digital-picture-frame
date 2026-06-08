@@ -10,6 +10,8 @@ Restart=on-failure
 User=photo-frame
 Group=video
 RuntimeDirectory=photo-frame
+RuntimeDirectoryMode=0700
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

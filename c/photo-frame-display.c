@@ -760,7 +760,10 @@ int main(void)
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
+    /* Restrict socket permissions so only the owner can connect */
+    mode_t old_umask = umask(077);
     int ret = bind(g.listen_fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
     CHECK(ret == 0, "bind %s", SOCKET_PATH);
     ret = listen(g.listen_fd, 1);
     CHECK(ret == 0, "listen");

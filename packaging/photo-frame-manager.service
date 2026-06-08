@@ -9,6 +9,8 @@ ExecStart=/usr/bin/photo-frame-manager /etc/photo-frame/config.toml
 Restart=on-failure
 User=photo-frame
 RuntimeDirectory=photo-frame
+RuntimeDirectoryMode=0700
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
