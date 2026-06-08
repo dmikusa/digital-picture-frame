@@ -161,7 +161,7 @@ mod tests {
                 .level(Level::Info)
                 .target("test")
                 .build()
-        }}
+        }};
     }
 
     #[test]

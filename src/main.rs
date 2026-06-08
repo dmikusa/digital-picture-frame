@@ -182,7 +182,10 @@ fn main() {
 
     // Compact index if ghost ratio > 50%
     let metadata = if metadata.ghost_ratio() > 0.5 {
-        log::info!("Compacting index (ghost ratio: {:.2})", metadata.ghost_ratio());
+        log::info!(
+            "Compacting index (ghost ratio: {:.2})",
+            metadata.ghost_ratio()
+        );
         match index::compact_index(&config.photos_dir, &metadata) {
             Ok(new_meta) => new_meta,
             Err(e) => {
@@ -211,7 +214,11 @@ fn main() {
         let abs_dir = match dir.canonicalize() {
             Ok(d) => d,
             Err(e) => {
-                log::error!("Failed to resolve import directory {}: {}", dir.display(), e);
+                log::error!(
+                    "Failed to resolve import directory {}: {}",
+                    dir.display(),
+                    e
+                );
                 std::process::exit(1);
             }
         };
@@ -227,7 +234,10 @@ fn main() {
                 log::error!("Directory import failed: {}", e);
             }
         } else {
-            log::error!("Import directory does not exist or is not a directory: {}", abs_dir.display());
+            log::error!(
+                "Import directory does not exist or is not a directory: {}",
+                abs_dir.display()
+            );
             std::process::exit(1);
         }
     }
@@ -252,7 +262,9 @@ fn main() {
     let display_socket = config.socket_path.clone();
     let display_photos_dir = config.photos_dir.clone();
     let _display_handle = std::thread::spawn(move || {
-        if let Err(e) = app::run_display_loop(&display_photos_dir, &display_socket, display_shutdown) {
+        if let Err(e) =
+            app::run_display_loop(&display_photos_dir, &display_socket, display_shutdown)
+        {
             log::error!("Display loop error: {}", e);
         }
     });
@@ -264,7 +276,13 @@ fn main() {
     let usb_config = config.clone();
     let usb_shutdown = shutdown.clone();
     let _usb_handle = std::thread::spawn(move || {
-        if let Err(e) = import::watch_usb_mounts(usb_photos_dir, usb_index_dir, usb_dedup_set, usb_config, usb_shutdown) {
+        if let Err(e) = import::watch_usb_mounts(
+            usb_photos_dir,
+            usb_index_dir,
+            usb_dedup_set,
+            usb_config,
+            usb_shutdown,
+        ) {
             log::error!("USB watcher error: {}", e);
         }
     });

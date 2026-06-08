@@ -34,7 +34,10 @@ pub fn run_display_loop(
 
     // Compact index on startup if ghost ratio > 50%
     if metadata.ghost_ratio() > 0.5 {
-        log::info!("Compacting index (ghost ratio: {:.2})", metadata.ghost_ratio());
+        log::info!(
+            "Compacting index (ghost ratio: {:.2})",
+            metadata.ghost_ratio()
+        );
         metadata = index::compact_index(index_dir, &metadata)?;
     }
 
@@ -46,7 +49,8 @@ pub fn run_display_loop(
         let random_offset = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos() as usize % valid_count;
+            .as_nanos() as usize
+            % valid_count;
         metadata.start_line + random_offset
     } else {
         metadata.start_line

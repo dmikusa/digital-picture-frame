@@ -82,9 +82,7 @@ impl DisplayClient {
                 {
                     // Backpressure: display app isn't reading fast enough.
                     // Pause briefly and retry on the same connection.
-                    log::debug!(
-                        "Write timed out (backpressure), retrying in 100ms"
-                    );
+                    log::debug!("Write timed out (backpressure), retrying in 100ms");
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }

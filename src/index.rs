@@ -69,11 +69,7 @@ pub fn find_index_file(dir: &Path) -> Option<(PathBuf, IndexMetadata)> {
     }
 
     // If multiple exist, prefer the one with the most recent mtime
-    candidates.sort_by_key(|(path, _)| {
-        fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
-    });
+    candidates.sort_by_key(|(path, _)| fs::metadata(path).and_then(|m| m.modified()).ok());
     candidates.pop()
 }
 
@@ -321,7 +317,11 @@ pub fn compact_index(dir: &Path, metadata: &IndexMetadata) -> io::Result<IndexMe
 
 /// Delete the oldest `count` photos and update metadata.
 /// Returns the new metadata and the number of files actually deleted.
-pub fn delete_oldest(dir: &Path, metadata: &IndexMetadata, count: usize) -> io::Result<(IndexMetadata, usize)> {
+pub fn delete_oldest(
+    dir: &Path,
+    metadata: &IndexMetadata,
+    count: usize,
+) -> io::Result<(IndexMetadata, usize)> {
     let old_name = build_index_filename(metadata);
     let old_path = dir.join(&old_name);
 

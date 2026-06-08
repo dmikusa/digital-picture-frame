@@ -48,6 +48,7 @@ jobs:
       - name: Compute version
         id: version
         run: |
+          git config --global --add safe.directory "$(pwd)"
           BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//; s/".*//')
           COMMIT=$(git rev-parse --short HEAD)
           echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
