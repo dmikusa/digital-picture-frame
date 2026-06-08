@@ -61,7 +61,7 @@ jobs:
           echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
 
       - name: Build C display app
-        run: make c
+        run: make clean -C c && make c
 
       - name: Build Rust manager
         run: cargo build --release --locked
