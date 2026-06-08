@@ -17,7 +17,7 @@ A Rust binary (`photo-frame-manager`) that runs on a Raspberry Pi Zero W2 under 
 - If the index is empty at startup, blocks and waits for entries.
 
 ### 1.2 USB Import Thread
-- Detects USB drive mounts using `usbmount` + `inotify` watching `/media`.
+- Detects USB drive mounts via `inotify` watching `/media` (works with any auto-mount solution).
 - Scans mounted drives for image files (JPEG, HEIF/HEIC) recursively.
 - For each image:
   - Computes a fast non-cryptographic hash (first 32KB + file size) for duplicate detection.
@@ -82,11 +82,11 @@ The C display app (`photo-frame-display.c`) reads these optional environment var
 
 **Why:** Full-file hashing on a Pi Zero W2 is CPU-intensive. First 32KB is enough to catch identical files while being a single `read()` syscall. File size prevents false positives from tiny collisions. The in-memory set is ~8 bytes per photo, negligible RAM.
 
-### 2.4 USB Mount Detection — `usbmount` + `inotify`
+### 2.4 USB Mount Detection — `inotify` on `/media`
 
-**Decision:** Install the `usbmount` Debian package for automatic USB mounting to `/media/usb0`, `/media/usb1`, etc. The Rust app uses `inotify` (via the `notify` crate) to watch `/media` for directory creation/deletion events.
+**Decision:** The Rust app uses `inotify` (via the `notify` crate) to watch `/media` for directory creation/deletion events. Any auto-mount solution that mounts USB drives under `/media` works — `usbmount`, DietPi's `dietpi-drive_manager`, `udisks2`, manual `fstab` entries, etc.
 
-**Why:** `usbmount` is the standard lightweight solution on minimal Debian systems. `inotify` is kernel-driven with zero CPU overhead — the app blocks until something happens, no polling needed.
+**Why:** `inotify` is kernel-driven with zero CPU overhead — the app blocks until something happens, no polling needed. This keeps the app agnostic to how drives get mounted.
 
 ### 2.5 Image Conversion — Shell Out to ImageMagick
 
@@ -154,7 +154,7 @@ The C display app (`photo-frame-display.c`) reads these optional environment var
 - **Photos:** `photos_dir/YYYY/MM/DD/DDDDD_<original_name>.jpg` where `DDDDD` is a zero-padded sequence number from the CSV line index.
 
 ### 3.5 External Dependencies
-- **System packages:** `usbmount`, `imagemagick` (or `imagemagick-7` on Trixie).
+- **System packages:** `imagemagick` (or `imagemagick-7` on Trixie). USB auto-mounting is required but can be provided by `usbmount`, `dietpi-drive_manager`, `udisks2`, or manual `fstab` entries.
 - **Rust crates:** `tokio` (async runtime, file watcher, socket), `notify` (inotify wrapper), `csv` (parsing), `serde` + `toml` (config), `log` (logging facade), `crc32fast` or `twox-hash` (fast hashing), `signal-hook` (SIGTERM/SIGINT handling).
 
 ---
@@ -183,11 +183,14 @@ mount /dev/mmcblk0p3 /mnt/photos
 ### 4.3 Required Packages
 ```bash
 apt update
-apt install -y usbmount imagemagick
+apt install -y imagemagick
 ```
 
 ### 4.4 USB Auto-Mount
-`usbmount` should work out of the box. DietPi's `dietpi-drive_manager` also has a "USB Auto-Mount" toggle.
+Any solution that mounts USB drives under `/media` works:
+- **Debian/Raspberry Pi OS:** `usbmount` (auto-mounts to `/media/usb0`, `/media/usb1`, etc.)
+- **DietPi:** Enable auto-mount in `dietpi-drive_manager`
+- **Manual:** Add entries to `/etc/fstab` or use `systemd` mount units
 
 ---
 

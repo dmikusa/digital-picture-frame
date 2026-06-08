@@ -22,7 +22,8 @@ libc = "0.2"
 maintainer = "Daniel Mikusa <dan@mikusa.com>"
 section = "graphics"
 priority = "optional"
-depends = "$auto, usbmount, imagemagick, libdrm2, libegl1-mesa, libgbm1"
+depends = "$auto, imagemagick, libdrm2, libegl1-mesa, libgbm1"
+recommends = "usbmount"
 assets = [
     ["target/release/photo-frame-manager", "usr/bin/photo-frame-manager", "755"],
     ["c/photo-frame-display", "usr/bin/photo-frame-display", "755"],

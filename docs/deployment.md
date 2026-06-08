@@ -33,12 +33,16 @@ sudo mount /dev/mmcblk0p3 /mnt/photos
 
 ```bash
 sudo apt update
-sudo apt install -y usbmount imagemagick
+sudo apt install -y imagemagick
 ```
 
 ### 4. USB auto-mount
 
-`usbmount` handles auto-mounting to `/media/usb0`, `/media/usb1`, etc. You can also use DietPi's `dietpi-drive_manager`.
+The app watches `/media` for new directories, so any auto-mount solution that mounts USB drives there works:
+
+- **Debian/Raspberry Pi OS:** `usbmount` (auto-mounts to `/media/usb0`, `/media/usb1`, etc.)
+- **DietPi:** Enable auto-mount in `dietpi-drive_manager`
+- **Manual:** Add entries to `/etc/fstab` or use `systemd` mount units
 
 ### 5. Display app
 

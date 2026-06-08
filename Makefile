@@ -58,8 +58,7 @@ setup-debian:
 		libdrm-dev \
 		libegl1-mesa-dev \
 		libgbm-dev \
-		pkg-config \
-		usbmount
+		pkg-config
 
 setup-cargo:
 	cargo install cargo-deb
