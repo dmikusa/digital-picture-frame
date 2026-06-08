@@ -89,7 +89,7 @@ a standard Debian package with minimal boilerplate.
 **`[package.metadata.deb]` in `Cargo.toml`:**
 - `name`: `photo-frame-manager`
 - `maintainer`: `Daniel Mikusa <dan@mikusa.com>`
-- `depends`: `$auto, imagemagick, libdrm2, libegl1-mesa, libgbm1`
+- `depends`: `$auto, imagemagick, libdrm2, libegl1, libgbm1`
 - `recommends`: `usbmount` (optional — any auto-mount solution that mounts under `/media` works)
 - `assets`: Rust binary, C binary, systemd units, config files, env file
 - `maintainer-scripts`: `packaging/deb-scripts/`
