@@ -21,7 +21,7 @@ ensuring forward compatibility with:
 | Runner | Container | Target Arch |
 |--------|-----------|-------------|
 | `ubuntu-22.04` | `debian:11-slim` | amd64 |
-| `ubuntu-22.04-arm64` | `debian:11-slim` | arm64 |
+| `ubuntu-22.04-arm` | `debian:11-slim` | arm64 |
 
 Both runners do a **native** build (no cross-compilation), avoiding linker and toolchain
 complexity.
@@ -54,7 +54,7 @@ Runs on `ubuntu-latest` (amd64 only — sufficient for Rust tests).
 
 **Matrix:**
 - Job A: `ubuntu-22.04` → amd64 `.deb`
-- Job B: `ubuntu-22.04-arm64` → arm64 `.deb`
+- Job B: `ubuntu-22.04-arm` → arm64 `.deb`
 
 **Steps per job:**
 1. Install system deps: `build-essential`, `pkg-config`, `libdrm-dev`,
@@ -170,9 +170,9 @@ user modifications on package upgrades.
 
 | Action | Owner | Purpose |
 |--------|-------|---------|
-| `actions/checkout@v4` | GitHub | Clone repo |
-| `actions/upload-artifact@v4` | GitHub | Upload build artifacts |
-| `actions/download-artifact@v4` | GitHub | Download artifacts in release job |
+| `actions/checkout@v6` | GitHub | Clone repo |
+| `actions/upload-artifact@v7` | GitHub | Upload build artifacts |
+| `actions/download-artifact@v8` | GitHub | Download artifacts in release job |
 
 ### Built-in Tools Used (no action needed)
 
