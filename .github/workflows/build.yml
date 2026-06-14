@@ -69,13 +69,20 @@ jobs:
         run: make clean -C c && make c
 
       - name: Build Rust manager
-        run: cargo build --release --locked
+        # Sourcing cargo env here because GITHUB_PATH is unreliable across steps in containers
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --locked
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install cargo-deb
 
       - name: Build .deb package
-        run: cargo deb --deb-version ${{ steps.version.outputs.full }}
+        run: |
+          . "$HOME/.cargo/env"
+          cargo deb --deb-version ${{ steps.version.outputs.full }}
 
       - name: Rename .deb with architecture
         run: |
