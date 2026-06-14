@@ -3,7 +3,7 @@
 ## Goal
 
 Build `.deb` packages for `amd64` and `arm64` on every push to `main`, attach them to a
-draft GitHub release, and make the application installable on Debian-based systems with
+GitHub release, and make the application installable on Debian-based systems with
 systemd.
 
 ## Build Environment
@@ -21,7 +21,7 @@ ensuring forward compatibility with:
 | Runner | Container | Target Arch |
 |--------|-----------|-------------|
 | `ubuntu-22.04` | `debian:11-slim` | amd64 |
-| `ubuntu-22.04-arm64` | `debian:11-slim` | arm64 |
+| `ubuntu-22.04-arm` | `debian:11-slim` | arm64 |
 
 Both runners do a **native** build (no cross-compilation), avoiding linker and toolchain
 complexity.
@@ -31,12 +31,9 @@ complexity.
 - The source of truth is `version` in `Cargo.toml` (currently `0.1.0`).
 - You manually bump this when starting a new release cycle.
 - CI appends the 7-character git commit hash: `0.1.0-abc1234`.
-- The draft release tag is `v0.1.0-abc1234`.
-- When you click **Publish** in the GitHub UI, the tag `v0.1.0-abc1234` is created
-  automatically, pointing to that exact commit.
 - CI uses `cargo deb --deb-version 0.1.0-abc1234` — no `Cargo.toml` mutation needed.
-- Old drafts for the same base version are deleted before uploading the new one.
-  Only one draft per version cycle survives.
+- Humans create releases with tags matching `v${BASE_VERSION}` (e.g., `v0.1.0`).
+- CI uploads built artifacts to the existing release. CI never creates or deletes releases.
 
 ## Workflows
 
@@ -57,7 +54,7 @@ Runs on `ubuntu-latest` (amd64 only — sufficient for Rust tests).
 
 **Matrix:**
 - Job A: `ubuntu-22.04` → amd64 `.deb`
-- Job B: `ubuntu-22.04-arm64` → arm64 `.deb`
+- Job B: `ubuntu-22.04-arm` → arm64 `.deb`
 
 **Steps per job:**
 1. Install system deps: `build-essential`, `pkg-config`, `libdrm-dev`,
@@ -72,9 +69,7 @@ Runs on `ubuntu-latest` (amd64 only — sufficient for Rust tests).
 **Release job (depends on both matrix jobs):**
 1. Download both `.deb` artifacts
 2. Compute base version from `Cargo.toml`
-3. Delete existing draft releases with tags matching `v${BASE_VERSION}-*`
-4. Create new draft release: `gh release create v${FULL_VERSION} --draft ...`
-5. Upload both `.deb` files to the draft
+3. Upload both `.deb` files to the existing release matching `v${BASE_VERSION}`
 
 **Concurrency:** `group: release`, `cancel-in-progress: true` — prevents race conditions
 when multiple commits land on `main` in quick succession.
@@ -175,26 +170,41 @@ user modifications on package upgrades.
 
 | Action | Owner | Purpose |
 |--------|-------|---------|
-| `actions/checkout@v4` | GitHub | Clone repo |
-| `actions/upload-artifact@v4` | GitHub | Upload build artifacts |
-| `actions/download-artifact@v4` | GitHub | Download artifacts in release job |
+| `actions/checkout@v6` | GitHub | Clone repo |
+| `actions/upload-artifact@v7` | GitHub | Upload build artifacts |
+| `actions/download-artifact@v8` | GitHub | Download artifacts in release job |
 
 ### Built-in Tools Used (no action needed)
 
-- `gh` CLI (GitHub official, pre-installed on runners) — creates/updates/deletes releases
+- `gh` CLI (GitHub official, pre-installed on runners) — uploads release assets only
 - `rustup` (installed from rust-lang in CI)
 - `cargo-deb` (installed from crates.io in CI)
 
 ### Workflow Permissions
 
+**`ci.yml`:**
 ```yaml
 permissions:
-  contents: write   # For creating/updating/deleting releases
+  contents: read   # For checking out the repo
+```
+
+**`build.yml` (build job):**
+```yaml
+permissions:
+  contents: read   # For checking out the repo
+  actions: write    # For uploading build artifacts
+```
+
+**`build.yml` (release job):**
+```yaml
+permissions:
+  contents: write   # For uploading release assets (only this job)
   actions: read     # For downloading artifacts
 ```
 
 The `GITHUB_TOKEN` is auto-injected by GitHub, scoped to this repo only, and expires
-when the job finishes.
+when the job finishes. Jobs use `persist-credentials: false` on `actions/checkout` to
+prevent the token from being persisted in the git config.
 
 ## Files to Create
 
@@ -232,7 +242,7 @@ directly.
 ## README Additions
 
 New section covering:
-1. Download `.deb` from GitHub Releases draft
+1. Download `.deb` from GitHub Releases
 2. `sudo dpkg -i photo-frame_*.deb`
 3. The `photo-frame` user is auto-created with `video` group membership
 4. Display app DRM access and the `User=root` fallback
