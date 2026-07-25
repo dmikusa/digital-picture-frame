@@ -46,7 +46,7 @@ jobs:
             libgbm-dev \
             pkg-config
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -80,19 +80,24 @@ jobs:
           cargo install cargo-deb
 
       - name: Build .deb package
+        env:
+          FULL_VERSION: ${{ steps.version.outputs.full }}
         run: |
           . "$HOME/.cargo/env"
-          cargo deb --deb-version ${{ steps.version.outputs.full }}
+          cargo deb --deb-version "$FULL_VERSION"
 
       - name: Rename .deb with architecture
+        env:
+          FULL_VERSION: ${{ steps.version.outputs.full }}
+          ARCH: ${{ matrix.arch }}
         run: |
           SRC=$(ls target/debian/*.deb | head -n1)
-          DEST="target/debian/photo-frame_${{ steps.version.outputs.full }}_${{ matrix.arch }}.deb"
+          DEST="target/debian/photo-frame_${FULL_VERSION}_${ARCH}.deb"
           mv "$SRC" "$DEST"
           echo "Built: $DEST"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: deb-${{ matrix.arch }}
           path: target/debian/*.deb
@@ -104,7 +109,7 @@ jobs:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -117,7 +122,7 @@ jobs:
           echo "full=${BASE_VERSION}-${COMMIT}" >> "$GITHUB_OUTPUT"
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           pattern: deb-*
@@ -126,8 +131,8 @@ jobs:
       - name: Upload artifacts to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_VERSION: ${{ steps.version.outputs.base }}
         run: |
-          BASE="${{ steps.version.outputs.base }}"
-          TAG="v${BASE}"
+          TAG="v${BASE_VERSION}"
           echo "Uploading artifacts to release $TAG"
           gh release upload "$TAG" artifacts/*.deb --clobber
