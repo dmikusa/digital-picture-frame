@@ -14,14 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-mod app;
-mod config;
-mod display;
-mod import;
-mod index;
-mod logger;
-
-use config::Config;
+use photo_frame_manager::config::Config;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -147,7 +140,7 @@ fn main() {
     };
 
     // Initialize logger
-    if let Err(e) = logger::TmpfsLogger::init(
+    if let Err(e) = photo_frame_manager::logger::TmpfsLogger::init(
         PathBuf::from("/tmp/photo-frame.log"),
         config.log_max_size,
         config.log_max_files,
@@ -166,7 +159,7 @@ fn main() {
     }
 
     // Initialize or find index
-    let (index_path, metadata) = match index::init_index(&config.photos_dir) {
+    let (index_path, metadata) = match photo_frame_manager::index::init_index(&config.photos_dir) {
         Ok(result) => result,
         Err(e) => {
             log::error!("Failed to initialize index: {}", e);
@@ -186,7 +179,7 @@ fn main() {
             "Compacting index (ghost ratio: {:.2})",
             metadata.ghost_ratio()
         );
-        match index::compact_index(&config.photos_dir, &metadata) {
+        match photo_frame_manager::index::compact_index(&config.photos_dir, &metadata) {
             Ok(new_meta) => new_meta,
             Err(e) => {
                 log::error!("Failed to compact index: {}", e);
@@ -198,7 +191,7 @@ fn main() {
     };
 
     // Build deduplication set
-    let dedup_set = match index::build_dedup_set(&index_path, &metadata) {
+    let dedup_set = match photo_frame_manager::index::build_dedup_set(&index_path, &metadata) {
         Ok(set) => {
             log::info!("Loaded {} unique photo hashes", set.len());
             Arc::new(Mutex::new(set))
@@ -224,7 +217,7 @@ fn main() {
         };
         if abs_dir.exists() && abs_dir.is_dir() {
             log::info!("Importing photos from: {}", abs_dir.display());
-            if let Err(e) = import::import_from_directory(
+            if let Err(e) = photo_frame_manager::import::import_from_directory(
                 &abs_dir,
                 &config.photos_dir,
                 &config.photos_dir,
@@ -262,9 +255,11 @@ fn main() {
     let display_socket = config.socket_path.clone();
     let display_photos_dir = config.photos_dir.clone();
     let _display_handle = std::thread::spawn(move || {
-        if let Err(e) =
-            app::run_display_loop(&display_photos_dir, &display_socket, display_shutdown)
-        {
+        if let Err(e) = photo_frame_manager::app::run_display_loop(
+            &display_photos_dir,
+            &display_socket,
+            display_shutdown,
+        ) {
             log::error!("Display loop error: {}", e);
         }
     });
@@ -276,7 +271,7 @@ fn main() {
     let usb_config = config.clone();
     let usb_shutdown = shutdown.clone();
     let _usb_handle = std::thread::spawn(move || {
-        if let Err(e) = import::watch_usb_mounts(
+        if let Err(e) = photo_frame_manager::import::watch_usb_mounts(
             usb_photos_dir,
             usb_index_dir,
             usb_dedup_set,
