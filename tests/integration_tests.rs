@@ -284,10 +284,12 @@ fn test_import_pipeline() {
     fs::create_dir_all(&src_dir).unwrap();
     fs::create_dir_all(&photos_dir).unwrap();
 
-    // Create two minimal JPEGs in the source directory
+    // Create two distinct minimal JPEGs (different content to avoid dedup)
     let jpeg = minimal_jpeg_bytes();
     fs::write(src_dir.join("photo1.jpg"), &jpeg).unwrap();
-    fs::write(src_dir.join("photo2.jpeg"), &jpeg).unwrap();
+    let mut jpeg2 = jpeg.clone();
+    jpeg2.push(0);
+    fs::write(src_dir.join("photo2.jpeg"), &jpeg2).unwrap();
 
     let config = make_config(photos_dir.clone(), socket_path);
     let dedup_set = Arc::new(Mutex::new(HashSet::new()));
@@ -363,7 +365,9 @@ fn test_full_pipeline_import_then_display() {
 
     let jpeg = minimal_jpeg_bytes();
     fs::write(src_dir.join("photo_a.jpg"), &jpeg).unwrap();
-    fs::write(src_dir.join("photo_b.jpg"), &jpeg).unwrap();
+    let mut jpeg2 = jpeg.clone();
+    jpeg2.push(0);
+    fs::write(src_dir.join("photo_b.jpg"), &jpeg2).unwrap();
 
     let config = make_config(photos_dir.clone(), socket_path.clone());
     let dedup_set = Arc::new(Mutex::new(HashSet::new()));
