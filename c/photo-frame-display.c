@@ -72,6 +72,7 @@
 #endif
 
 #define SOCKET_PATH            "/run/photo-frame/photo-frame.sock"
+#define CONTROL_SOCKET_PATH    "/run/photo-frame/control.sock"
 #define HOLD_DURATION_SEC      5.0f
 
 #define CHECK(cond, ...) do { \
@@ -132,6 +133,13 @@ struct app_state {
     int                  conn_fd;
     int                  epoll_fd;
     int                  socket_paused;
+
+    /* Control socket */
+    int                  control_listen_fd;
+    int                  control_conn_fd;
+    int                  paused;
+    int                  show_image;
+    char                 show_path[512];
 
     /* Fade state */
     int                  fading;
@@ -329,6 +337,76 @@ static int handle_img_cmd_wrapper(const char *path, void *ctx)
     (void)ctx;
     handle_img_command(path);
     return !(g.slots[0].occupied && g.slots[1].occupied && g.pending_pixels);
+}
+
+static void handle_control_data(void)
+{
+    static char ctrl_buf[2048];
+    static size_t ctrl_len = 0;
+
+    ssize_t n = read(g.control_conn_fd, ctrl_buf + ctrl_len,
+                     sizeof(ctrl_buf) - ctrl_len - 1);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return;
+        perror("control read");
+        close(g.control_conn_fd);
+        g.control_conn_fd = -1;
+        ctrl_len = 0;
+        return;
+    }
+    if (n == 0) {
+        printf("Control client disconnected.\n");
+        close(g.control_conn_fd);
+        g.control_conn_fd = -1;
+        ctrl_len = 0;
+        return;
+    }
+    ctrl_len += n;
+    ctrl_buf[ctrl_len] = '\0';
+
+    char *line_start = ctrl_buf;
+    while (1) {
+        char *nl = strchr(line_start, '\n');
+        if (!nl) break;
+
+        *nl = '\0';
+        char *cmd = line_start;
+        line_start = nl + 1;
+
+        if (strcmp(cmd, "CLR") == 0) {
+            printf("Control: CLR (clear queue, pause)\n");
+            g.paused = 1;
+            g.show_image = 0;
+            if (g.slots[0].occupied) { g.slots[0].occupied = 0; }
+            if (g.slots[1].occupied) { g.slots[1].occupied = 0; }
+            if (g.pending_pixels) {
+                stbi_image_free(g.pending_pixels);
+                g.pending_pixels = NULL;
+            }
+            if (g.fading) {
+                g.fading = 0;
+            }
+            g.phase = PHASE_WAITING;
+        } else if (strncmp(cmd, "SHOW ", 5) == 0) {
+            printf("Control: SHOW %s\n", cmd + 5);
+            strncpy(g.show_path, cmd + 5, sizeof(g.show_path) - 1);
+            g.show_path[sizeof(g.show_path) - 1] = '\0';
+            g.show_image = 1;
+        } else if (strcmp(cmd, "RESUME") == 0) {
+            printf("Control: RESUME\n");
+            g.paused = 0;
+            g.show_image = 0;
+        } else {
+            printf("Control: unknown command '%s'\n", cmd);
+        }
+    }
+
+    size_t remaining = ctrl_len - (line_start - ctrl_buf);
+    if (remaining > 0) {
+        memmove(ctrl_buf, line_start, remaining);
+    }
+    ctrl_len = remaining;
 }
 
 static void handle_socket_data(void)
@@ -600,6 +678,9 @@ int main(void)
     g.screen_aspect = (float)g.mode_w / (float)g.mode_h;
     printf("Mode: %dx%d (aspect %.3f)\n", g.mode_w, g.mode_h, g.screen_aspect);
 
+    const char *ctrl_sock_path_env = getenv("CONTROL_SOCKET_PATH");
+    const char *ctrl_sock_path = ctrl_sock_path_env ? ctrl_sock_path_env : CONTROL_SOCKET_PATH;
+
     uint32_t crtc_id = 0;
     drmModeEncoder *enc = drmModeGetEncoder(g.drm_fd, conn->encoder_id);
     if (enc) {
@@ -715,6 +796,25 @@ int main(void)
     int flags = fcntl(g.listen_fd, F_GETFL, 0);
     fcntl(g.listen_fd, F_SETFL, flags | O_NONBLOCK);
 
+    /* ---- Control socket setup ------------------------------------------ */
+    unlink(ctrl_sock_path);
+    g.control_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(g.control_listen_fd >= 0, "control socket");
+
+    struct sockaddr_un ctrl_addr = { .sun_family = AF_UNIX };
+    strncpy(ctrl_addr.sun_path, ctrl_sock_path, sizeof(ctrl_addr.sun_path) - 1);
+
+    old_umask = umask(077);
+    ret = bind(g.control_listen_fd, (struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr));
+    umask(old_umask);
+    CHECK(ret == 0, "bind %s", ctrl_sock_path);
+    ret = listen(g.control_listen_fd, 1);
+    CHECK(ret == 0, "control listen");
+    printf("Control listening on %s\n", ctrl_sock_path);
+
+    flags = fcntl(g.control_listen_fd, F_GETFL, 0);
+    fcntl(g.control_listen_fd, F_SETFL, flags | O_NONBLOCK);
+
     /* ---- epoll ---------------------------------------------------------- */
     g.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     CHECK(g.epoll_fd >= 0, "epoll_create1");
@@ -727,6 +827,9 @@ int main(void)
     ev.data.fd = g.listen_fd;
     epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.listen_fd, &ev);
 
+    ev.data.fd = g.control_listen_fd;
+    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.control_listen_fd, &ev);
+
     /* ---- Main event loop ----------------------------------------------- */
     drmEventContext evctx = {
         .version = 2,
@@ -738,6 +841,45 @@ int main(void)
 
     while (1) {
         if (!g.running) break;
+
+        /* Handle SHOW command from control socket (connector is accessible here) */
+        if (g.show_image && g.paused) {
+            load_image_into_slot(0, g.show_path);
+            g.current_slot = 0;
+            g.slots[1].occupied = 0;
+            g.show_image = 0;
+
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
+            glUniform1f(g.u_alpha_loc, 1.0f);
+            GLfloat verts[16];
+            build_quad((float)g.slots[0].w / (float)g.slots[0].h,
+                       g.screen_aspect, verts);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+            EGLBoolean ok_show = eglSwapBuffers(g.egl_dpy, g.egl_surf);
+            if (ok_show) {
+                if (g.scanout_fb.bo) {
+                    drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
+                    gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+                }
+                g.scanout_fb.bo = gbm_surface_lock_front_buffer(g.gbm_surf);
+                CHECK(g.scanout_fb.bo, "lock front buffer (SHOW)");
+                uint32_t hnd = gbm_bo_get_handle(g.scanout_fb.bo).u32;
+                uint32_t pit = gbm_bo_get_stride(g.scanout_fb.bo);
+                uint32_t bw  = gbm_bo_get_width(g.scanout_fb.bo);
+                uint32_t bh  = gbm_bo_get_height(g.scanout_fb.bo);
+                int ret2 = drmModeAddFB(g.drm_fd, bw, bh, 24, 32,
+                                        pit, hnd, &g.scanout_fb.fb_id);
+                CHECK(ret2 == 0, "drmModeAddFB (SHOW)");
+                ret = drmModeSetCrtc(g.drm_fd, g.crtc_id, g.scanout_fb.fb_id,
+                                     0, 0, &conn->connector_id, 1, mode);
+                CHECK(ret == 0, "drmModeSetCrtc (SHOW)");
+            }
+            printf("Control SHOW rendered: %s\n", g.show_path);
+        }
 
         int timeout = -1;
         if (g.phase == PHASE_HOLDING && !g.hold_complete) {
@@ -753,8 +895,8 @@ int main(void)
             }
         }
 
-        struct epoll_event events[4];
-        int n = epoll_wait(g.epoll_fd, events, 4, timeout);
+        struct epoll_event events[6];
+        int n = epoll_wait(g.epoll_fd, events, 6, timeout);
         if (n < 0) {
             if (errno == EINTR) {
                 if (!g.running) break;
@@ -784,6 +926,24 @@ int main(void)
                     epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.conn_fd, &ev);
                     printf("Manager connected\n");
                 }
+            } else if (fd == g.control_listen_fd) {
+                int cc = accept4(g.control_listen_fd, NULL, NULL, SOCK_CLOEXEC);
+                if (cc >= 0) {
+                    if (g.control_conn_fd >= 0) {
+                        printf("New control connection, closing old one\n");
+                        close(g.control_conn_fd);
+                        epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, g.control_conn_fd, NULL);
+                    }
+                    g.control_conn_fd = cc;
+                    int f2 = fcntl(g.control_conn_fd, F_GETFL, 0);
+                    fcntl(g.control_conn_fd, F_SETFL, f2 | O_NONBLOCK);
+                    ev.events = EPOLLIN;
+                    ev.data.fd = g.control_conn_fd;
+                    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.control_conn_fd, &ev);
+                    printf("Control client connected\n");
+                }
+            } else if (fd == g.control_conn_fd) {
+                handle_control_data();
             } else if (fd == g.conn_fd) {
                 handle_socket_data();
             }
@@ -851,8 +1011,8 @@ int main(void)
             continue;
         }
 
-        /* Holding -> start fade if we have a next image */
-        if (g.phase == PHASE_HOLDING && g.hold_complete) {
+        /* Holding -> start fade if we have a next image (unless paused) */
+        if (g.phase == PHASE_HOLDING && g.hold_complete && !g.paused) {
             int next = 1 - g.current_slot;
             if (g.slots[next].occupied) {
                 start_fade(g.current_slot, next);
@@ -889,7 +1049,10 @@ int main(void)
     close(g.drm_fd);
     if (g.conn_fd >= 0) close(g.conn_fd);
     close(g.listen_fd);
+    if (g.control_conn_fd >= 0) close(g.control_conn_fd);
+    close(g.control_listen_fd);
     close(g.epoll_fd);
     unlink(SOCKET_PATH);
+    unlink(ctrl_sock_path);
     return 0;
 }
