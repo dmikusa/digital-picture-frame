@@ -15,11 +15,13 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use photo_frame_manager::config::Config;
+use photo_frame_manager::import;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -264,6 +266,9 @@ fn main() {
         }
     });
 
+    // Shared channel for USB mount events (config mode + USB watcher)
+    let (event_tx, event_rx) = mpsc::channel::<import::MountEvent>();
+
     // Spawn USB watcher thread
     let usb_photos_dir = config.photos_dir.clone();
     let usb_index_dir = config.photos_dir.clone();
@@ -277,8 +282,24 @@ fn main() {
             usb_dedup_set,
             usb_config,
             usb_shutdown,
+            Some(event_tx),
         ) {
             log::error!("USB watcher error: {}", e);
+        }
+    });
+
+    // Spawn config mode thread
+    let mode_config = config.clone();
+    let mode_shutdown = shutdown.clone();
+    let control_socket = PathBuf::from("/run/photo-frame/control.sock");
+    let _mode_handle = std::thread::spawn(move || {
+        if let Err(e) = photo_frame_manager::config_mode::run_config_mode_loop(
+            mode_config,
+            control_socket,
+            mode_shutdown,
+            event_rx,
+        ) {
+            log::error!("Config mode error: {}", e);
         }
     });
 

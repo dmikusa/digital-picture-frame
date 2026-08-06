@@ -24,16 +24,27 @@ use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Events emitted by the USB watcher for the config mode state machine.
+#[derive(Debug, Clone)]
+pub enum MountEvent {
+    Inserted(PathBuf),
+    Removed(PathBuf),
+    ImportComplete(PathBuf),
+}
+
 /// Watches `/media` for USB drive mounts and triggers imports.
+/// If `event_tx` is provided, sends `MountEvent`s for config mode integration.
 pub fn watch_usb_mounts(
     photos_dir: PathBuf,
     index_dir: PathBuf,
     dedup_set: Arc<Mutex<HashSet<u64>>>,
     config: Config,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    event_tx: Option<mpsc::Sender<MountEvent>>,
 ) -> io::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(
@@ -68,21 +79,33 @@ pub fn watch_usb_mounts(
                         if path.is_dir() && !active_mounts.contains(&path) {
                             log::info!("USB mount detected: {}", path.display());
                             active_mounts.insert(path.clone());
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(MountEvent::Inserted(path.clone()));
+                            }
                             let photos_dir = photos_dir.clone();
                             let index_dir = index_dir.clone();
                             let dedup_set = dedup_set.clone();
                             let config = config.clone();
+                            let import_tx = event_tx.clone();
+                            let mount_path = path.clone();
                             std::thread::spawn(move || {
                                 if let Err(e) = import_from_mount(
-                                    &path,
+                                    &mount_path,
                                     &photos_dir,
                                     &index_dir,
                                     dedup_set,
                                     &config,
                                 ) {
-                                    log::error!("Import failed for {}: {}", path.display(), e);
+                                    log::error!(
+                                        "Import failed for {}: {}",
+                                        mount_path.display(),
+                                        e
+                                    );
                                 }
-                                log::info!("Import complete for {}", path.display());
+                                log::info!("Import complete for {}", mount_path.display());
+                                if let Some(ref tx) = import_tx {
+                                    let _ = tx.send(MountEvent::ImportComplete(mount_path));
+                                }
                             });
                         }
                     }
@@ -91,6 +114,9 @@ pub fn watch_usb_mounts(
                     for path in &event.paths {
                         active_mounts.remove(path);
                         log::info!("USB unmount detected: {}", path.display());
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(MountEvent::Removed(path.clone()));
+                        }
                     }
                 }
                 _ => {}
