@@ -308,25 +308,63 @@ check_interval_seconds = 86400
   server start, then string-compare on each request. No `base64` crate needed.
 - Response headers: `Content-Type`, `Content-Length`, `Connection: close`.
 
-### Task 7.2: Routes
+### Task 7.2: API Routes (JSON, REST)
 
 | Route | Method | Auth | Description |
 |-------|--------|------|-------------|
-| `/` | GET | Yes | Dashboard: configured sources, sync status, add/delete buttons |
-| `/sources/add` | GET | Yes | Choose source type (Dropbox, Google Drive) |
-| `/sources/dropbox` | GET | Yes | Form: access token, folder, interval |
-| `/sources/dropbox` | POST | Yes | Save Dropbox config to staging |
-| `/sources/google-drive` | GET | Yes | Form: API key, folder ID, interval |
-| `/sources/google-drive` | POST | Yes | Save Google Drive config to staging |
-| `/sources/delete/<name>` | POST | Yes | Remove a source from staging |
-| `/oauth/google/callback` | GET | **No** | Handles Google OAuth redirect (Phase 8) |
-| `/finish` | POST | Yes | Validate staged config, write atomically, stop server |
-| `/status` | GET | Yes | JSON: current sync state, last sync times |
+| `/api/sources` | GET | Yes | List all staged sources as JSON |
+| `/api/sources/dropbox` | POST | Yes | Save Dropbox config to staging. Returns JSON. |
+| `/api/sources/google-drive` | POST | Yes | Save Google Drive config to staging. Returns JSON. |
+| `/api/sources/<name>` | DELETE | Yes | Remove a source from staging. Returns JSON. |
+| `/api/status` | GET | Yes | Current sync state, last sync times. Returns JSON. |
+| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. Returns JSON. |
 
-### Task 7.3: Static UI
-- Inline HTML strings (no template engine — 5 simple pages).
-- Minimal styling; phone-friendly viewport meta tag.
-- Status page returns JSON for potential future use.
+### Task 7.3: HTML Pages (HTMX)
+
+| Route | Method | Auth | Description |
+|-------|--------|------|-------------|
+| `/` | GET | Yes | Dashboard: menu bar + HTMX-loaded status card from `/api/status` |
+| `/sources` | GET | Yes | Source list: menu bar + HTMX-loaded source table from `/api/sources` |
+| `/sources/add` | GET | Yes | Menu bar + source type picker (links to `/sources/dropbox` and `/sources/google-drive`) |
+| `/sources/dropbox` | GET | Yes | Menu bar + form (submits via `hx-post` to `/api/sources/dropbox`) |
+| `/sources/google-drive` | GET | Yes | Menu bar + form (submits via `hx-post` to `/api/sources/google-drive`) |
+| `/sources/google-drive-oauth` | GET | Yes | Menu bar + OAuth setup form (Phase 8) |
+| `/oauth/google/callback` | GET | **No** | Handles Google OAuth redirect (Phase 8) |
+
+### Task 7.4: Page Layout
+
+Every HTML page shares the same structure:
+
+```
+┌─────────────────────────┐
+│  Home │ Sources │ Add   │  ← menu bar, active page highlighted
+├─────────────────────────┤
+│                         │
+│  [page content here]    │  ← HTMX-loaded or server-rendered
+│                         │
+└─────────────────────────┘
+```
+
+- Menu bar across the top: `Home` (dashboard), `Sources` (list), `Add` (add new).
+- Active page highlighted in the menu bar.
+- Content area below loads data via HTMX from `/api/*` endpoints.
+- Forms use `hx-post` to `/api/*` endpoints; success responses include
+  `HX-Redirect` header to navigate to the next page.
+- Phone-friendly: viewport meta tag, no horizontal scroll, stacked layout.
+- No external CDN dependency for HTMX — the script is either inlined or
+  served as a static asset from the server itself (~14KB minified).
+
+**HTMX flow example — adding a Dropbox source:**
+
+1. User navigates to `/sources/dropbox` → server returns menu bar + form HTML.
+2. User fills in access token, folder, interval.
+3. User clicks "Save" → HTMX sends `hx-post` to `/api/sources/dropbox` with
+   form data.
+4. Server validates, saves to staging, responds `200` with
+   `HX-Redirect: /sources` header.
+5. Browser loads `/sources`, which HTMX-populates the source list from
+   `/api/sources`. A "Finish" button at the bottom triggers
+   `hx-post` to `/api/finish` to deploy the config.
 
 ---
 
@@ -383,8 +421,9 @@ handles the common case (public folders) with zero OAuth complexity.
 | 6.1 | Google Drive source (API key) + tests | Medium |
 | 6.2 | Google Drive setup docs | Small |
 | 7.1 | DIY HTTP server (TcpListener + httparse) | Medium |
-| 7.2 | Admin routes (dashboard, forms, finish) | Medium |
-| 7.3 | Inline HTML pages | Small |
+| 7.2 | API routes (JSON, REST) | Medium |
+| 7.3 | HTML pages (HTMX, menu bar layout) | Medium |
+| 7.4 | Page layout + HTMX wiring | Small |
 | 8.1 | Google Drive OAuth (deferred) | Large |
 | 8.2 | OAuth setup documentation | Small |
 
