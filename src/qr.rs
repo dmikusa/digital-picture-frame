@@ -17,7 +17,7 @@
 use crate::config::Config;
 use image::{DynamicImage, ImageBuffer, Rgb, RgbImage};
 use qrcode::QrCode;
-use std::io::{self, Read};
+use rand::{distributions::Alphanumeric, Rng};
 use std::path::PathBuf;
 
 /// Small bitmap font (5x8 pixels per character).
@@ -133,17 +133,13 @@ fn draw_centered_text(img: &mut RgbImage, y: u32, text: &str, color: Rgb<u8>) {
     let x = (img.width().saturating_sub(w)) / 2;
     draw_text(img, x, y, text, color);
 }
-
-/// Generate a cryptographically-random 8-character password from [a-zA-Z0-9].
-pub fn generate_password() -> io::Result<String> {
-    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut buf = [0u8; 8];
-    let mut f = std::fs::File::open("/dev/urandom")?;
-    f.read_exact(&mut buf)?;
-    Ok(buf
-        .iter()
-        .map(|b| CHARS[(b % 62) as usize] as char)
-        .collect())
+/// Generate a random 8-character alphanumeric password.
+pub fn generate_password() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(8)
+        .map(char::from)
+        .collect()
 }
 
 /// Generate a QR code JPEG at the given pixel dimensions.
@@ -295,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_generate_password() {
-        let pw = generate_password().unwrap();
+        let pw = generate_password();
         assert_eq!(pw.len(), 8);
         assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()));
     }
