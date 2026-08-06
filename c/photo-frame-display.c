@@ -859,8 +859,8 @@ int main(void)
             glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-            EGLBoolean ok = eglSwapBuffers(g.egl_dpy, g.egl_surf);
-            if (ok) {
+            EGLBoolean ok_show = eglSwapBuffers(g.egl_dpy, g.egl_surf);
+            if (ok_show) {
                 if (g.scanout_fb.bo) {
                     drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
                     gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);

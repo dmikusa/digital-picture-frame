@@ -20,7 +20,7 @@ use photo_frame_manager::import;
 use photo_frame_manager::index;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
