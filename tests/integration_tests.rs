@@ -54,6 +54,7 @@ fn make_config(photos_dir: PathBuf, socket_path: PathBuf) -> Config {
         batch_delete_size: 20,
         log_max_size: 262144,
         log_max_files: 2,
+        remote_sources: vec![],
     }
 }
 

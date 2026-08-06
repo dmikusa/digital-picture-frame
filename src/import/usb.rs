@@ -201,7 +201,7 @@ fn find_images(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Import a single photo. Returns Ok(true) if imported, Ok(false) if skipped (duplicate).
-fn import_single_photo(
+pub(crate) fn import_single_photo(
     src_path: &Path,
     photos_dir: &Path,
     index_dir: &Path,

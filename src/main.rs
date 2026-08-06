@@ -303,6 +303,20 @@ fn main() {
         }
     });
 
+    // Spawn remote sync scheduler thread
+    let sync_config = config.clone();
+    let sync_dedup = dedup_set.clone();
+    let sync_shutdown = shutdown.clone();
+    let _sync_handle = std::thread::spawn(move || {
+        if let Err(e) = photo_frame_manager::import::remote::run_sync_scheduler(
+            sync_config,
+            sync_dedup,
+            sync_shutdown,
+        ) {
+            log::error!("Remote sync scheduler error: {}", e);
+        }
+    });
+
     // Wait for signal
     for sig in signals.forever() {
         match sig {

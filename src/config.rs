@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -25,6 +26,21 @@ pub enum AspectRatioMode {
     Fit,
     #[serde(rename = "fill")]
     Fill,
+}
+
+fn default_check_interval() -> u64 {
+    86_400 // 24 hours
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteSourceConfig {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub name: String,
+    #[serde(flatten)]
+    pub params: HashMap<String, String>,
+    #[serde(default = "default_check_interval")]
+    pub check_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +56,8 @@ pub struct Config {
     pub log_max_size: usize,
     #[serde(default = "default_log_max_files")]
     pub log_max_files: usize,
+    #[serde(default)]
+    pub remote_sources: Vec<RemoteSourceConfig>,
 }
 
 fn default_batch_delete_size() -> usize {
@@ -121,7 +139,7 @@ impl fmt::Display for Config {
         let (w, h) = self.resolution();
         write!(
             f,
-            "Config {{ photos_dir: {}, socket_path: {}, resolution: {}x{}, aspect_ratio_mode: {:?}, batch_delete_size: {}, log_max_size: {}, log_max_files: {} }}",
+            "Config {{ photos_dir: {}, socket_path: {}, resolution: {}x{}, aspect_ratio_mode: {:?}, batch_delete_size: {}, log_max_size: {}, log_max_files: {}, remote_sources: {} }}",
             self.photos_dir.display(),
             self.socket_path.display(),
             w,
@@ -129,7 +147,8 @@ impl fmt::Display for Config {
             self.aspect_ratio_mode,
             self.batch_delete_size,
             self.log_max_size,
-            self.log_max_files
+            self.log_max_files,
+            self.remote_sources.len()
         )
     }
 }

@@ -315,6 +315,7 @@ mod tests {
             batch_delete_size: 20,
             log_max_size: 262144,
             log_max_files: 2,
+            remote_sources: vec![],
         };
         let path =
             render_config_screen(&config, "photo-frame.local:8147", "abc12345", "192.168.1.5")
