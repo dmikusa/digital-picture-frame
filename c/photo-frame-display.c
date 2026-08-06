@@ -138,6 +138,8 @@ struct app_state {
     int                  control_listen_fd;
     int                  control_conn_fd;
     int                  paused;
+    int                  show_image;
+    char                 show_path[512];
 
     /* Fade state */
     int                  fading;
@@ -375,6 +377,7 @@ static void handle_control_data(void)
         if (strcmp(cmd, "CLR") == 0) {
             printf("Control: CLR (clear queue, pause)\n");
             g.paused = 1;
+            g.show_image = 0;
             if (g.slots[0].occupied) { g.slots[0].occupied = 0; }
             if (g.slots[1].occupied) { g.slots[1].occupied = 0; }
             if (g.pending_pixels) {
@@ -387,44 +390,13 @@ static void handle_control_data(void)
             g.phase = PHASE_WAITING;
         } else if (strncmp(cmd, "SHOW ", 5) == 0) {
             printf("Control: SHOW %s\n", cmd + 5);
-            if (g.paused) {
-                load_image_into_slot(0, cmd + 5);
-                g.current_slot = 0;
-                g.slots[1].occupied = 0;
-
-                /* Render immediately */
-                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                glClear(GL_COLOR_BUFFER_BIT);
-                glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
-                glUniform1f(g.u_alpha_loc, 1.0f);
-                GLfloat verts[16];
-                build_quad((float)g.slots[0].w / (float)g.slots[0].h,
-                           g.screen_aspect, verts);
-                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-                EGLBoolean ok = eglSwapBuffers(g.egl_dpy, g.egl_surf);
-                if (ok) {
-                    if (g.scanout_fb.bo) {
-                        drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
-                        gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
-                    }
-                    g.scanout_fb.bo = gbm_surface_lock_front_buffer(g.gbm_surf);
-                    CHECK(g.scanout_fb.bo, "lock front buffer (SHOW)");
-                    uint32_t hnd = gbm_bo_get_handle(g.scanout_fb.bo).u32;
-                    uint32_t pit = gbm_bo_get_stride(g.scanout_fb.bo);
-                    uint32_t bw  = gbm_bo_get_width(g.scanout_fb.bo);
-                    uint32_t bh  = gbm_bo_get_height(g.scanout_fb.bo);
-                    int ret2 = drmModeAddFB(g.drm_fd, bw, bh, 24, 32,
-                                            pit, hnd, &g.scanout_fb.fb_id);
-                    CHECK(ret2 == 0, "drmModeAddFB (SHOW)");
-                    drmModeSetCrtc(g.drm_fd, g.crtc_id, g.scanout_fb.fb_id,
-                                   0, 0, NULL, 0, NULL, 0, NULL);
-                }
-            }
+            strncpy(g.show_path, cmd + 5, sizeof(g.show_path) - 1);
+            g.show_path[sizeof(g.show_path) - 1] = '\0';
+            g.show_image = 1;
         } else if (strcmp(cmd, "RESUME") == 0) {
             printf("Control: RESUME\n");
             g.paused = 0;
+            g.show_image = 0;
         } else {
             printf("Control: unknown command '%s'\n", cmd);
         }
@@ -869,6 +841,45 @@ int main(void)
 
     while (1) {
         if (!g.running) break;
+
+        /* Handle SHOW command from control socket (connector is accessible here) */
+        if (g.show_image && g.paused) {
+            load_image_into_slot(0, g.show_path);
+            g.current_slot = 0;
+            g.slots[1].occupied = 0;
+            g.show_image = 0;
+
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
+            glUniform1f(g.u_alpha_loc, 1.0f);
+            GLfloat verts[16];
+            build_quad((float)g.slots[0].w / (float)g.slots[0].h,
+                       g.screen_aspect, verts);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+            EGLBoolean ok = eglSwapBuffers(g.egl_dpy, g.egl_surf);
+            if (ok) {
+                if (g.scanout_fb.bo) {
+                    drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
+                    gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+                }
+                g.scanout_fb.bo = gbm_surface_lock_front_buffer(g.gbm_surf);
+                CHECK(g.scanout_fb.bo, "lock front buffer (SHOW)");
+                uint32_t hnd = gbm_bo_get_handle(g.scanout_fb.bo).u32;
+                uint32_t pit = gbm_bo_get_stride(g.scanout_fb.bo);
+                uint32_t bw  = gbm_bo_get_width(g.scanout_fb.bo);
+                uint32_t bh  = gbm_bo_get_height(g.scanout_fb.bo);
+                int ret2 = drmModeAddFB(g.drm_fd, bw, bh, 24, 32,
+                                        pit, hnd, &g.scanout_fb.fb_id);
+                CHECK(ret2 == 0, "drmModeAddFB (SHOW)");
+                ret = drmModeSetCrtc(g.drm_fd, g.crtc_id, g.scanout_fb.fb_id,
+                                     0, 0, &conn->connector_id, 1, mode);
+                CHECK(ret == 0, "drmModeSetCrtc (SHOW)");
+            }
+            printf("Control SHOW rendered: %s\n", g.show_path);
+        }
 
         int timeout = -1;
         if (g.phase == PHASE_HOLDING && !g.hold_complete) {
