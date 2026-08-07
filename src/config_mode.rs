@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::admin_server::AdminServer;
 use crate::config::Config;
 use crate::control::ControlClient;
 use crate::import::MountEvent;
@@ -25,14 +26,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How long config mode stays active without interaction (server not yet
-/// implemented; Phase 7 adds request-based reset).
+/// How long config mode stays active without interaction.
 const CONFIG_MODE_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// The URL path that will be used for the admin UI (hardcoded until Phase 7).
-const ADMIN_PORT: u16 = 8147;
 
 #[derive(Debug, PartialEq)]
 enum ConfigState {
@@ -50,8 +48,9 @@ pub struct ConfigEnvironment {
     state: ConfigState,
     control: ControlClient,
     config: Config,
-    /// In-memory staging for remote-source edits (written on "Finish" — Phase 7).
-    staged: Option<Config>,
+    /// Admin server handle (running while in ConfigMode).
+    server_handle: Option<JoinHandle<()>>,
+    server_shutdown: Arc<AtomicBool>,
 }
 
 impl ConfigEnvironment {
@@ -60,21 +59,33 @@ impl ConfigEnvironment {
             state: ConfigState::Normal,
             control: ControlClient::new(control_socket_path),
             config,
-            staged: None,
+            server_handle: None,
+            server_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Enter config mode: display the QR code and, in Phase 7, start the admin
-    /// server.
+    /// Enter config mode: display the QR code and start the admin server.
     fn enter_config_mode(&mut self, fallback_ip: &str) -> io::Result<()> {
         let password = qr::generate_password();
-        let admin_host = format!("photo-frame.local:{ADMIN_PORT}");
+
+        let server = AdminServer::new(password.clone())?;
+        let port = server.port();
+        let admin_host = format!("photo-frame.local:{port}");
 
         let qr_path = qr::render_config_screen(&self.config, &admin_host, &password, fallback_ip)
             .map_err(io::Error::other)?;
 
         self.control.clear()?;
         self.control.show(&qr_path)?;
+
+        // Start server in background
+        self.server_shutdown.store(false, Ordering::Relaxed);
+        let srv_shutdown = self.server_shutdown.clone();
+        self.server_handle = Some(std::thread::spawn(move || {
+            if let Err(e) = server.run(srv_shutdown) {
+                log::error!("Admin server error: {e}");
+            }
+        }));
 
         log::info!("Config mode active: http://{admin_host}  password={password}");
         self.state = ConfigState::ConfigMode {
@@ -85,10 +96,13 @@ impl ConfigEnvironment {
         Ok(())
     }
 
-    /// Leave config mode: discard staged changes and resume the slideshow.
+    /// Leave config mode: stop the admin server and resume the slideshow.
     fn leave_config_mode(&mut self) -> io::Result<()> {
         log::info!("Leaving config mode");
-        self.staged = None;
+        self.server_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.server_handle.take() {
+            let _ = handle.join();
+        }
         self.control.resume()?;
         self.state = ConfigState::Normal;
         Ok(())

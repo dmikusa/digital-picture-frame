@@ -845,6 +845,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "flate2",
+ "httparse",
  "image",
  "libc",
  "log",

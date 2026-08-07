@@ -32,7 +32,7 @@ fn default_check_interval() -> u64 {
     86_400 // 24 hours
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemoteSourceConfig {
     #[serde(rename = "type")]
     pub source_type: String,
