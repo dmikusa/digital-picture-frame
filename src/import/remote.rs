@@ -15,9 +15,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::Config;
+use crate::import::usb::import_single_photo;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -140,26 +141,76 @@ fn should_sync(source: &SourceState) -> bool {
 
 fn sync_source(
     source: &SourceState,
-    _config: &Config,
-    _dedup_set: &Arc<Mutex<HashSet<u64>>>,
+    config: &Config,
+    dedup_set: &Arc<Mutex<HashSet<u64>>>,
     cursors: &mut HashMap<String, String>,
 ) -> io::Result<()> {
-    let _new_cursor: String;
+    let cursor = cursors.get(&source.name).map(|s| s.as_str());
 
-    let other = source.source_type.as_str();
-    log::warn!(
-        r#"Unknown source type "{}" for "{}" — skipping"#,
-        other,
-        source.name
-    );
-    cursors.insert(
-        source.name.clone(),
-        SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string(),
-    );
+    match source.source_type.as_str() {
+        "dropbox" => {
+            let mut src = crate::import::dropbox::DropboxSource::connect(&source.params)?;
+            let (photos, new_cursor) = src.list_changes(cursor)?;
+            download_and_import(&mut src, &photos, config, dedup_set)?;
+            cursors.insert(source.name.clone(), new_cursor);
+        }
+        other => {
+            log::warn!(
+                r#"Unknown source type "{}" for "{}" — skipping"#,
+                other,
+                source.name
+            );
+            cursors.insert(
+                source.name.clone(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn download_and_import(
+    src: &mut dyn RemotePhotoSource,
+    photos: &[RemotePhoto],
+    config: &Config,
+    dedup_set: &Arc<Mutex<HashSet<u64>>>,
+) -> io::Result<()> {
+    let tmp_dir = PathBuf::from("/tmp/photo-frame-sync");
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    for photo in photos {
+        let dest = tmp_dir.join(&photo.filename);
+        if let Err(e) = src.download(&photo.remote_id, &dest) {
+            log::warn!(r#"Download failed for "{}": {}"#, photo.filename, e);
+            continue;
+        }
+
+        match import_single_photo(
+            &dest,
+            &config.photos_dir,
+            &config.photos_dir,
+            dedup_set,
+            config,
+        ) {
+            Ok(true) => {
+                log::info!(r#"Imported "{}""#, photo.filename);
+            }
+            Ok(false) => {
+                log::debug!(r#"Skipped duplicate "{}""#, photo.filename);
+            }
+            Err(e) => {
+                log::warn!(r#"Failed to import "{}": {}"#, photo.filename, e);
+            }
+        }
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
     Ok(())
 }
 
