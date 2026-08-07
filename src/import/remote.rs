@@ -153,6 +153,12 @@ fn sync_source(
             download_and_import(&mut src, &photos, config, dedup_set)?;
             cursors.insert(source.name.clone(), new_cursor);
         }
+        "google_drive" => {
+            let mut src = crate::import::gdrive::GoogleDriveSource::connect(&source.params)?;
+            let (photos, new_cursor) = src.list_changes(cursor)?;
+            download_and_import(&mut src, &photos, config, dedup_set)?;
+            cursors.insert(source.name.clone(), new_cursor);
+        }
         other => {
             log::warn!(
                 r#"Unknown source type "{}" for "{}" — skipping"#,
