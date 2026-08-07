@@ -43,7 +43,7 @@ pub struct RemoteSourceConfig {
     pub check_interval_seconds: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub photos_dir: PathBuf,
     pub socket_path: PathBuf,

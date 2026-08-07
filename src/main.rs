@@ -290,11 +290,13 @@ fn main() {
 
     // Spawn config mode thread
     let mode_config = config.clone();
+    let mode_config_path = config_path.clone();
     let mode_shutdown = shutdown.clone();
     let control_socket = PathBuf::from("/run/photo-frame/control.sock");
     let _mode_handle = std::thread::spawn(move || {
         if let Err(e) = photo_frame_manager::config_mode::run_config_mode_loop(
             mode_config,
+            mode_config_path,
             control_socket,
             mode_shutdown,
             event_rx,
