@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod dropbox;
+pub mod gdrive;
 pub mod remote;
 pub mod usb;
 

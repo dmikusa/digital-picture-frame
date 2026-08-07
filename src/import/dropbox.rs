@@ -31,6 +31,34 @@ pub struct DropboxSource {
     folder: String,
 }
 
+#[derive(Serialize)]
+struct ListFolderArgs {
+    path: String,
+    recursive: bool,
+}
+
+#[derive(Deserialize)]
+struct ListFolderResult {
+    entries: Vec<FileEntry>,
+    #[allow(dead_code)]
+    cursor: String,
+}
+
+#[derive(Deserialize)]
+struct FileEntry {
+    #[serde(rename = ".tag")]
+    tag: String,
+    path_lower: Option<String>,
+    name: Option<String>,
+    size: Option<u64>,
+    server_modified: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DownloadArgs {
+    path: String,
+}
+
 impl RemotePhotoSource for DropboxSource {
     fn connect(config: &HashMap<String, String>) -> io::Result<Self> {
         let access_token = config
@@ -67,29 +95,6 @@ impl RemotePhotoSource for DropboxSource {
 
     fn list_changes(&mut self, cursor: Option<&str>) -> io::Result<(Vec<RemotePhoto>, String)> {
         let last_sync = cursor.and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
-
-        #[derive(Serialize)]
-        struct ListFolderArgs {
-            path: String,
-            recursive: bool,
-        }
-
-        #[derive(Deserialize)]
-        struct ListFolderResult {
-            entries: Vec<FileEntry>,
-            #[allow(dead_code)]
-            cursor: String,
-        }
-
-        #[derive(Deserialize)]
-        struct FileEntry {
-            #[serde(rename = ".tag")]
-            tag: String,
-            path_lower: Option<String>,
-            name: Option<String>,
-            size: Option<u64>,
-            server_modified: Option<String>,
-        }
 
         let args = ListFolderArgs {
             path: self.folder.clone(),
@@ -130,7 +135,7 @@ impl RemotePhotoSource for DropboxSource {
             let modified = entry
                 .server_modified
                 .as_deref()
-                .and_then(parse_dropbox_time)
+                .and_then(crate::import::remote::parse_iso8601)
                 .unwrap_or(0);
             if modified <= last_sync {
                 continue;
@@ -153,11 +158,6 @@ impl RemotePhotoSource for DropboxSource {
     }
 
     fn download(&mut self, remote_id: &str, dest: &Path) -> io::Result<()> {
-        #[derive(Serialize)]
-        struct DownloadArgs {
-            path: String,
-        }
-
         let args = DownloadArgs {
             path: remote_id.to_string(),
         };
@@ -198,56 +198,9 @@ fn is_image(path: &str) -> bool {
         || lower.ends_with(".heif")
 }
 
-fn parse_dropbox_time(s: &str) -> Option<u64> {
-    // Dropbox format: "2015-05-12T15:50:38Z"
-    // Parse manually without chrono.
-    if s.len() < 20 || !s.ends_with('Z') {
-        return None;
-    }
-    let s = &s[..s.len() - 1]; // strip Z
-    let year: i32 = s[0..4].parse().ok()?;
-    let month: u32 = s[5..7].parse().ok()?;
-    let day: u32 = s[8..10].parse().ok()?;
-    let hour: u32 = s[11..13].parse().ok()?;
-    let min: u32 = s[14..16].parse().ok()?;
-    let sec: u32 = s[17..19].parse().ok()?;
-
-    // Simple date-to-unix conversion (correct for dates after 1970).
-    let days_before_month: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let mut days = (year - 1970) as i64 * 365;
-    // leap days
-    days += ((year - 1 - 1968) / 4) as i64;
-    days -= ((year - 1 - 1900) / 100) as i64;
-    days += ((year - 1 - 1600) / 400) as i64;
-    // days from months
-    days += days_before_month[(month - 1) as usize] as i64;
-    // leap day in current year
-    if month > 2 && is_leap(year) {
-        days += 1;
-    }
-    days += (day - 1) as i64;
-    let total = days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
-    Some(total as u64)
-}
-
-fn is_leap(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_dropbox_time() {
-        // 2015-05-12T15:50:38Z = 1431445838
-        let ts = parse_dropbox_time("2015-05-12T15:50:38Z").unwrap();
-        assert_eq!(ts, 1431445838);
-
-        // 2021-01-01T00:00:00Z = 1609459200
-        let ts = parse_dropbox_time("2021-01-01T00:00:00Z").unwrap();
-        assert_eq!(ts, 1609459200);
-    }
 
     #[test]
     fn test_is_image() {
