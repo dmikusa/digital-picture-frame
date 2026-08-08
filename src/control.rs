@@ -17,7 +17,7 @@
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Sends control commands to the display app's control socket.
 /// Used to pause/resume the slideshow and show overlay images.
@@ -40,10 +40,26 @@ impl ControlClient {
         if self.stream.is_some() {
             return Ok(());
         }
-        let stream = UnixStream::connect(&self.socket_path)?;
-        stream.set_write_timeout(Some(self.timeout))?;
-        self.stream = Some(stream);
-        Ok(())
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match UnixStream::connect(&self.socket_path) {
+                Ok(stream) => {
+                    stream.set_write_timeout(Some(self.timeout))?;
+                    self.stream = Some(stream);
+                    return Ok(());
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::ConnectionRefused =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn send(&mut self, cmd: &str) -> io::Result<()> {
