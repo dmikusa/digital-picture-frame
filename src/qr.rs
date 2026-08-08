@@ -81,7 +81,7 @@ fn draw_text(
     let mut cx = x;
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, font_size);
-        let glyph_y = baseline - metrics.bounds.ymin;
+        let glyph_y = baseline + metrics.bounds.ymin;
         for row in 0..metrics.height {
             for col in 0..metrics.width {
                 let alpha = bitmap[row * metrics.width + col];
@@ -206,7 +206,7 @@ pub fn render_config_screen(
     }
 
     // Text section: split remaining vertical space between QR bottom and footer
-    let font_size = (height as f32 * 0.045).max(14.0);
+    let font_size = (height as f32 * 0.04).max(12.0);
     let lh = line_height(font_size);
     let footer_font = (height as f32 * 0.03).max(12.0);
 
