@@ -67,7 +67,7 @@ c:
 rust: font
 	cargo build --release
 
-deb: font
+deb: font c
 	cargo deb
 
 test: test-rust test-c
