@@ -36,26 +36,43 @@
 #   make setup-debian      - install build/runtime dependencies on Debian
 #   make setup-cargo       - install required cargo plugins (cargo-deb)
 
+FONT_DIR := fonts
+FONT_FILE := $(FONT_DIR)/DejaVuSans.ttf
+FONT_URL := https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-sans-ttf-2.37.zip
+FONT_SHA256 := 5c6e497a2f36552cb5ffb112c413a6af39c0f3c47653662b90b4fa6499822fd7
+FONT_ZIP := $(FONT_DIR)/dejavu-sans.zip
+
 # Use podman by default, override with: make CONTAINER=docker
 CONTAINER := $(shell which podman 2>/dev/null || which docker 2>/dev/null)
 CONTAINER_IMAGE := photo-frame-c-build
 
-.PHONY: all c rust deb test test-rust test-c build-c-container clean install run-display run-manager setup-debian setup-cargo
+.PHONY: all c rust deb test test-rust test-c build-c-container clean install run-display run-manager setup-debian setup-cargo font
 
-all: c rust
+all: font c rust
+
+font: $(FONT_FILE)
+
+$(FONT_FILE): $(FONT_ZIP)
+	@mkdir -p $(FONT_DIR)
+	unzip -p $< "dejavu-sans-ttf-2.37/ttf/DejaVuSans.ttf" > $@
+
+$(FONT_ZIP):
+	@mkdir -p $(FONT_DIR)
+	curl -fsSL -o $@ $(FONT_URL)
+	@echo "$(FONT_SHA256)  $@" | shasum -a 256 -c - > /dev/null 2>&1 || { echo "ERROR: Font download hash mismatch. Expected $(FONT_SHA256)"; exit 1; }
 
 c:
 	$(MAKE) -C c
 
-rust:
+rust: font
 	cargo build --release
 
-deb:
+deb: font
 	cargo deb
 
 test: test-rust test-c
 
-test-rust:
+test-rust: font
 	cargo test
 
 test-c: build-c-container

@@ -3,3 +3,4 @@ c/*.o
 c/photo-frame-display
 c/photo-frame-display-client
 c/test_display_logic
+/fonts
