@@ -54,7 +54,9 @@ font: $(FONT_FILE)
 
 $(FONT_FILE): $(FONT_ZIP)
 	@mkdir -p $(FONT_DIR)
+	@rm -f $@
 	unzip -p $< "dejavu-sans-ttf-2.37/ttf/DejaVuSans.ttf" > $@.tmp && mv $@.tmp $@
+	@head -c4 $@ | od -An -tx1 | grep -q '00 01 00 00' || { echo "ERROR: Extracted font has invalid TTF magic bytes"; rm -f $@; exit 1; }
 
 $(FONT_ZIP):
 	@mkdir -p $(FONT_DIR)
