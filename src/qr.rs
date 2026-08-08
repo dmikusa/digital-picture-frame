@@ -38,7 +38,7 @@ pub fn generate_password() -> String {
 // ---------------------------------------------------------------------------
 
 fn load_font() -> Result<fontdue::Font, String> {
-    let data: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
+    let data: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
     fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
         .map_err(|e| format!("Failed to parse font: {e}"))
 }
@@ -58,7 +58,7 @@ fn line_height(font_size: f32) -> f32 {
 
 fn draw_centered(
     img: &mut RgbImage,
-    y: f32,
+    baseline: f32,
     text: &str,
     color: Rgb<u8>,
     font_size: f32,
@@ -66,13 +66,13 @@ fn draw_centered(
 ) {
     let width = measure_text(text, font_size, font);
     let x = ((img.width() as f32 - width) / 2.0).max(0.0);
-    draw_text(img, x, y, text, color, font_size, font);
+    draw_text(img, x, baseline, text, color, font_size, font);
 }
 
 fn draw_text(
     img: &mut RgbImage,
     x: f32,
-    y: f32,
+    baseline: f32,
     text: &str,
     color: Rgb<u8>,
     font_size: f32,
@@ -81,7 +81,7 @@ fn draw_text(
     let mut cx = x;
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, font_size);
-        let glyph_y = y + font_size - metrics.bounds.height + metrics.bounds.ymin;
+        let glyph_y = baseline - metrics.bounds.ymin;
         for row in 0..metrics.height {
             for col in 0..metrics.width {
                 let alpha = bitmap[row * metrics.width + col];
@@ -209,20 +209,20 @@ pub fn render_config_screen(
     let font_size = (height as f32 * 0.045).max(14.0);
     let lh = line_height(font_size);
     let footer_font = (height as f32 * 0.03).max(12.0);
-    let footer_lh = line_height(footer_font);
 
     let qr_bottom = qr_y + qr_pixel_h;
-    let footer_y = height as f32 - footer_lh - 10.0;
-    let available = footer_y - qr_bottom as f32;
+    let footer_baseline = height as f32 - 10.0;
+    let available = footer_baseline - qr_bottom as f32;
     let lines = 3.0;
     let text_block = lines * lh;
-    let text_y = qr_bottom as f32 + (available - text_block).max(0.0) / 2.0;
+    let text_top = qr_bottom as f32 + (available - text_block).max(0.0) / 2.0;
+    let baseline = text_top + font_size;
 
     let url_line = format!("http://{admin_url}");
-    draw_centered(&mut img, text_y, &url_line, white, font_size, &font);
+    draw_centered(&mut img, baseline, &url_line, white, font_size, &font);
 
     let pw_line = format!("Password: {password}");
-    draw_centered(&mut img, text_y + lh, &pw_line, white, font_size, &font);
+    draw_centered(&mut img, baseline + lh, &pw_line, white, font_size, &font);
 
     let ip_line = format!(
         "Or: http://{fallback_ip}:{port}",
@@ -234,7 +234,7 @@ pub fn render_config_screen(
     );
     draw_centered(
         &mut img,
-        text_y + lh * 2.0,
+        baseline + lh * 2.0,
         &ip_line,
         white,
         font_size,
@@ -242,9 +242,10 @@ pub fn render_config_screen(
     );
 
     // Footer
+    let footer_baseline = height as f32 - 10.0;
     draw_centered(
         &mut img,
-        footer_y,
+        footer_baseline,
         "Insert USB to configure (remove to cancel)",
         white,
         footer_font,
