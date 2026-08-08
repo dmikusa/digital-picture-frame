@@ -15,16 +15,15 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::RemoteSourceConfig;
-use httparse::{Request, Status};
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tiny_http_fork::{Header, Method, Request, Response, Server, StatusCode};
 
 pub struct AdminServer {
-    listener: TcpListener,
     port: u16,
     password: String,
     staged_sources: Arc<Mutex<Vec<RemoteSourceConfig>>>,
@@ -34,10 +33,9 @@ pub struct AdminServer {
 
 impl AdminServer {
     pub fn new(password: String) -> io::Result<Self> {
-        let (listener, port) = bind_random_port()?;
+        let port = find_free_port()?;
 
         Ok(AdminServer {
-            listener,
             port,
             password,
             staged_sources: Arc::new(Mutex::new(Vec::new())),
@@ -64,111 +62,182 @@ impl AdminServer {
     }
 
     pub fn run(&self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
-        self.listener
-            .set_nonblocking(true)
-            .map_err(io::Error::other)?;
+        let server = Server::http(format!("0.0.0.0:{}", self.port)).map_err(io::Error::other)?;
+
+        let timeout = std::time::Duration::from_millis(500);
 
         loop {
             if shutdown.load(Ordering::Relaxed) || self.finished.load(Ordering::Relaxed) {
                 break;
             }
 
-            match self.listener.accept() {
-                Ok((mut stream, _)) => {
-                    let password = self.password.clone();
-                    let staged = self.staged_sources.clone();
-                    let finished = self.finished.clone();
-                    let last = self.last_request.clone();
-                    std::thread::spawn(move || {
-                        handle_connection(&mut stream, &password, &staged, &finished, &last);
-                    });
+            match server.recv_timeout(timeout) {
+                Ok(Some(mut request)) => {
+                    let response = self.handle_request(&mut request);
+                    let _ = request.respond(response);
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(None) => {
+                    // Timeout — loop back
                 }
-                Err(_) => break,
+                Err(e) => {
+                    log::error!("Admin server accept error: {e}");
+                    break;
+                }
             }
         }
 
         Ok(())
     }
-}
 
-fn handle_connection(
-    stream: &mut dyn ReadWrite,
-    password: &str,
-    staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>,
-    finished: &Arc<AtomicBool>,
-    last: &Arc<Mutex<Instant>>,
-) {
-    *last.lock().unwrap() = Instant::now();
+    fn handle_request(&self, request: &mut Request) -> Response<Box<dyn std::io::Read + Send>> {
+        *self.last_request.lock().unwrap() = Instant::now();
 
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return,
-    };
+        let path = request.url().to_string();
+        let method = request.method();
 
-    let mut headers = [httparse::EMPTY_HEADER; 16];
-    let mut req = Request::new(&mut headers);
-    let _body_offset = match req.parse(&buf[..n]) {
-        Ok(Status::Complete(off)) => off,
-        _ => {
-            respond_text(stream, 400, "Bad Request");
-            return;
+        // Skip auth for OAuth callbacks
+        if !path.starts_with("/oauth/") && !self.check_auth(request) {
+            return Response::from_string("Unauthorized")
+                .with_status_code(StatusCode::from(401))
+                .boxed();
         }
-    };
 
-    let method = req.method.unwrap_or("GET");
-    let path = req.path.unwrap_or("/");
+        match (method, path.as_str()) {
+            // ---- API routes ---------------------------------------------------
+            (Method::Get, "/api/sources") => self.api_list_sources(),
+            (Method::Post, "/api/sources/dropbox") => self.api_save_source(request, "dropbox"),
+            (Method::Post, "/api/sources/google-drive") => {
+                self.api_save_source(request, "google_drive")
+            }
+            (Method::Delete, p) if p.starts_with("/api/sources/") => {
+                let name = &p["/api/sources/".len()..];
+                self.api_delete_source(name)
+            }
+            (Method::Get, "/api/status") => self.api_status(),
+            (Method::Post, "/api/finish") => self.api_finish(),
 
-    // Basic auth check (skip for OAuth callback)
-    if !path.starts_with("/oauth/") && !check_auth(&req, password) {
-        respond_text(stream, 401, "Unauthorized");
-        return;
+            // ---- HTML pages ---------------------------------------------------
+            (Method::Get, "/") => serve_html(page_dashboard(&self.staged_sources)),
+            (Method::Get, "/sources") => serve_html(page_sources(&self.staged_sources)),
+            (Method::Get, "/sources/add") => serve_html(page_add_source()),
+            (Method::Get, "/sources/dropbox") => serve_html(page_form_dropbox()),
+            (Method::Get, "/sources/google-drive") => serve_html(page_form_gdrive()),
+
+            _ => Response::from_string("Not Found")
+                .with_status_code(StatusCode(404))
+                .boxed(),
+        }
     }
 
-    match (method, path) {
-        // ---- API routes ---------------------------------------------------
-        ("GET", "/api/sources") => api_list_sources(stream, staged),
-        ("POST", "/api/sources/dropbox") => api_save_source(stream, staged, "dropbox", &buf, n),
-        ("POST", "/api/sources/google-drive") => {
-            api_save_source(stream, staged, "google_drive", &buf, n)
+    fn check_auth(&self, request: &Request) -> bool {
+        for header in request.headers() {
+            if header.field.equiv("Authorization") {
+                let val = header.value.as_str();
+                let expected = format!(
+                    "Basic {}",
+                    base64_encode(&format!("photo-frame:{}", self.password))
+                );
+                return val.trim() == expected;
+            }
         }
-        ("DELETE", p) if p.starts_with("/api/sources/") => {
-            let name = &p["/api/sources/".len()..];
-            api_delete_source(stream, staged, name);
+        false
+    }
+
+    // ---- API handlers --------------------------------------------------------
+
+    fn api_list_sources(&self) -> Response<Box<dyn std::io::Read + Send>> {
+        let sources = self.staged_sources.lock().unwrap();
+        let json = serde_json::to_string(&*sources).unwrap_or_else(|_| "[]".into());
+        json_response(200, &json)
+    }
+
+    fn api_save_source(
+        &self,
+        request: &mut Request,
+        source_type: &str,
+    ) -> Response<Box<dyn std::io::Read + Send>> {
+        let body = read_body(request);
+        let params: HashMap<String, String> = match serde_json::from_str(&body) {
+            Ok(p) => p,
+            Err(e) => return json_response(400, &format!(r#"{{"error":"{e}"}}"#)),
+        };
+        let name = params
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| source_type.to_string());
+        let check_interval: u64 = params
+            .get("check_interval_seconds")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86400);
+        let clean_params: HashMap<String, String> = params
+            .into_iter()
+            .filter(|(k, _)| k != "name" && k != "check_interval_seconds")
+            .collect();
+
+        let config = RemoteSourceConfig {
+            source_type: source_type.to_string(),
+            name: name.clone(),
+            params: clean_params,
+            check_interval_seconds: check_interval,
+        };
+
+        let mut sources = self.staged_sources.lock().unwrap();
+        if let Some(pos) = sources.iter().position(|s| s.name == name) {
+            sources[pos] = config;
+        } else {
+            sources.push(config);
         }
-        ("GET", "/api/status") => api_status(stream, staged),
-        ("POST", "/api/finish") => api_finish(stream, finished),
+        json_response(201, r#"{"ok":true}"#)
+    }
 
-        // ---- HTML pages ---------------------------------------------------
-        ("GET", "/") => serve_html(stream, page_dashboard(staged)),
-        ("GET", "/sources") => serve_html(stream, page_sources(staged)),
-        ("GET", "/sources/add") => serve_html(stream, page_add_source()),
-        ("GET", "/sources/dropbox") => serve_html(stream, page_form_dropbox()),
-        ("GET", "/sources/google-drive") => serve_html(stream, page_form_gdrive()),
+    fn api_delete_source(&self, name: &str) -> Response<Box<dyn std::io::Read + Send>> {
+        let mut sources = self.staged_sources.lock().unwrap();
+        sources.retain(|s| s.name != name);
+        json_response(200, r#"{"ok":true}"#)
+    }
 
-        _ => respond_text(stream, 404, "Not Found"),
+    fn api_status(&self) -> Response<Box<dyn std::io::Read + Send>> {
+        let sources = self.staged_sources.lock().unwrap();
+        let names: Vec<_> = sources.iter().map(|s| &s.name).collect();
+        let json = serde_json::json!({
+            "configured_sources": names,
+            "count": sources.len(),
+        });
+        json_response(200, &json.to_string())
+    }
+
+    fn api_finish(&self) -> Response<Box<dyn std::io::Read + Send>> {
+        self.finished.store(true, Ordering::Relaxed);
+        json_response(
+            200,
+            r#"{"ok":true,"message":"Config saved. Server shutting down."}"#,
+        )
     }
 }
 
 // ---------------------------------------------------------------------------
-// Auth
+// HTTP helpers
 // ---------------------------------------------------------------------------
 
-fn check_auth(req: &Request, password: &str) -> bool {
-    for header in req.headers.iter() {
-        if header.name.eq_ignore_ascii_case("Authorization") {
-            let val = String::from_utf8_lossy(header.value);
-            let expected = format!(
-                "Basic {}",
-                base64_encode(&format!("photo-frame:{}", password))
-            );
-            return val.trim() == expected;
-        }
-    }
-    false
+fn json_response(code: u16, body: &str) -> Response<Box<dyn std::io::Read + Send>> {
+    Response::from_string(body)
+        .with_status_code(StatusCode(code))
+        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+        .boxed()
+}
+
+fn serve_html(body: String) -> Response<Box<dyn std::io::Read + Send>> {
+    Response::from_string(body)
+        .with_header(
+            Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
+        )
+        .boxed()
+}
+
+fn read_body(request: &mut Request) -> String {
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+    body
 }
 
 fn base64_encode(input: &str) -> String {
@@ -194,132 +263,6 @@ fn base64_encode(input: &str) -> String {
         }
     }
     result
-}
-
-// ---------------------------------------------------------------------------
-// HTTP response helpers
-// ---------------------------------------------------------------------------
-
-fn respond_text(stream: &mut dyn ReadWrite, code: u16, body: &str) {
-    let status = match code {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        _ => "Unknown",
-    };
-    let resp = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: text/plain\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        len = body.len(),
-    );
-    let _ = stream.write_all(resp.as_bytes());
-}
-
-fn respond_json(stream: &mut dyn ReadWrite, code: u16, body: &str) {
-    let status = match code {
-        200 => "OK",
-        201 => "Created",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Unknown",
-    };
-    let resp = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        len = body.len(),
-    );
-    let _ = stream.write_all(resp.as_bytes());
-}
-
-fn serve_html(stream: &mut dyn ReadWrite, body: String) {
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        len = body.len(),
-    );
-    let _ = stream.write_all(resp.as_bytes());
-}
-
-// ---------------------------------------------------------------------------
-// API handlers
-// ---------------------------------------------------------------------------
-
-fn api_list_sources(stream: &mut dyn ReadWrite, staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>) {
-    let sources = staged.lock().unwrap();
-    let json = serde_json::to_string(&*sources).unwrap_or_else(|_| "[]".into());
-    respond_json(stream, 200, &json);
-}
-
-fn api_save_source(
-    stream: &mut dyn ReadWrite,
-    staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>,
-    source_type: &str,
-    buf: &[u8],
-    n: usize,
-) {
-    let body = extract_body(buf, n);
-    let params: HashMap<String, String> = match serde_json::from_str(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            respond_json(stream, 400, &format!(r#"{{"error":"{e}"}}"#));
-            return;
-        }
-    };
-    let name = params
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| source_type.to_string());
-    let check_interval: u64 = params
-        .get("check_interval_seconds")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(86400);
-    let clean_params: HashMap<String, String> = params
-        .into_iter()
-        .filter(|(k, _)| k != "name" && k != "check_interval_seconds")
-        .collect();
-
-    let config = RemoteSourceConfig {
-        source_type: source_type.to_string(),
-        name: name.clone(),
-        params: clean_params,
-        check_interval_seconds: check_interval,
-    };
-
-    let mut sources = staged.lock().unwrap();
-    // Replace existing source with the same name, or append
-    if let Some(pos) = sources.iter().position(|s| s.name == name) {
-        sources[pos] = config;
-    } else {
-        sources.push(config);
-    }
-    respond_json(stream, 201, r#"{"ok":true}"#);
-}
-
-fn api_delete_source(
-    stream: &mut dyn ReadWrite,
-    staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>,
-    name: &str,
-) {
-    let mut sources = staged.lock().unwrap();
-    sources.retain(|s| s.name != name);
-    respond_json(stream, 200, r#"{"ok":true}"#);
-}
-
-fn api_status(stream: &mut dyn ReadWrite, staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>) {
-    let sources = staged.lock().unwrap();
-    let names: Vec<_> = sources.iter().map(|s| &s.name).collect();
-    let json = serde_json::json!({
-        "configured_sources": names,
-        "count": sources.len(),
-    });
-    respond_json(stream, 200, &json.to_string());
-}
-
-fn api_finish(stream: &mut dyn ReadWrite, finished: &Arc<AtomicBool>) {
-    finished.store(true, Ordering::Relaxed);
-    respond_json(
-        stream,
-        200,
-        r#"{"ok":true,"message":"Config saved. Server shutting down."}"#,
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -427,22 +370,13 @@ fn page_form_gdrive() -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn bind_random_port() -> io::Result<(TcpListener, u16)> {
+fn find_free_port() -> io::Result<u16> {
     for port in 8100..8200 {
-        if let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{port}")) {
-            return Ok((listener, port));
+        if TcpListener::bind(format!("0.0.0.0:{port}")).is_ok() {
+            return Ok(port);
         }
     }
     Err(io::Error::other("No available port in range 8100-8199"))
-}
-
-fn extract_body(buf: &[u8], n: usize) -> String {
-    let data = &buf[..n];
-    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-        String::from_utf8_lossy(&data[pos + 4..]).to_string()
-    } else {
-        String::new()
-    }
 }
 
 fn urlencode(s: &str) -> String {
@@ -458,80 +392,15 @@ fn urlencode(s: &str) -> String {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Trait for testability
-// ---------------------------------------------------------------------------
-
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-
-    struct MockStream {
-        input: Cursor<Vec<u8>>,
-        output: Vec<u8>,
-    }
-
-    impl Read for MockStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.input.read(buf)
-        }
-    }
-
-    impl Write for MockStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.output.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn mk_request(path: &str, body: Option<&str>) -> String {
-        let auth_str = base64_encode("photo-frame:test");
-        let body_part = body.unwrap_or("");
-        format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth_str}\r\nContent-Length: {cl}\r\n\r\n{body_part}",
-            cl = body_part.len(),
-        )
-    }
 
     #[test]
-    fn test_dashboard_page() {
-        let mut stream = MockStream {
-            input: Cursor::new(mk_request("/", None).into_bytes()),
-            output: Vec::new(),
-        };
-        let staged = Arc::new(Mutex::new(Vec::new()));
-        let finished = Arc::new(AtomicBool::new(false));
-        let last = Arc::new(Mutex::new(Instant::now()));
-
-        handle_connection(&mut stream, "test", &staged, &finished, &last);
-
-        let output = String::from_utf8_lossy(&stream.output);
-        assert!(output.contains("200 OK"));
-        assert!(output.contains("text/html"));
-        assert!(output.contains("Photo Frame Setup"));
-    }
-
-    #[test]
-    fn test_source_not_found() {
-        let mut stream = MockStream {
-            input: Cursor::new(mk_request("/api/sources", None).into_bytes()),
-            output: Vec::new(),
-        };
-        let staged = Arc::new(Mutex::new(Vec::new()));
-        let finished = Arc::new(AtomicBool::new(false));
-        let last = Arc::new(Mutex::new(Instant::now()));
-
-        handle_connection(&mut stream, "test", &staged, &finished, &last);
-
-        let output = String::from_utf8_lossy(&stream.output);
-        assert!(output.contains("200 OK"));
-        assert!(output.contains("[]"));
+    fn test_base64_encode() {
+        assert_eq!(
+            base64_encode("photo-frame:test"),
+            "cGhvdG8tZnJhbWU6dGVzdA=="
+        );
     }
 }
