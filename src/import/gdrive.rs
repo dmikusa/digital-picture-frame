@@ -16,17 +16,55 @@
 
 use crate::import::remote::{RemotePhoto, RemotePhotoSource};
 use reqwest::blocking::Client;
+use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
 const API_BASE: &str = "https://www.googleapis.com/drive/v3";
+const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+enum AuthMode {
+    ApiKey(String),
+    OAuth {
+        #[allow(dead_code)]
+        client_id: String,
+        #[allow(dead_code)]
+        client_secret: String,
+        #[allow(dead_code)]
+        refresh_token: String,
+        access_token: String,
+    },
+}
 
 pub struct GoogleDriveSource {
     client: Client,
-    api_key: String,
+    auth: AuthMode,
     folder_id: String,
+}
+
+impl GoogleDriveSource {
+    fn make_get(&self, url: &str) -> io::Result<reqwest::blocking::Response> {
+        let mut req = self.client.get(url);
+        match &self.auth {
+            AuthMode::ApiKey(key) => {
+                // key already in url via ?key= param
+                let _ = key;
+            }
+            AuthMode::OAuth { access_token, .. } => {
+                req = req.header(AUTHORIZATION, bearer(access_token));
+            }
+        }
+        req.send().map_err(io::Error::other)
+    }
+
+    fn auth_param(&self) -> String {
+        match &self.auth {
+            AuthMode::ApiKey(key) => format!("key={key}"),
+            AuthMode::OAuth { .. } => String::new(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -51,33 +89,56 @@ struct DriveFile {
 
 impl RemotePhotoSource for GoogleDriveSource {
     fn connect(config: &HashMap<String, String>) -> io::Result<Self> {
-        let api_key = config
-            .get("api_key")
-            .cloned()
-            .ok_or_else(|| io::Error::other("Missing 'api_key' for Google Drive source"))?;
         let folder_id = config
             .get("folder_id")
             .cloned()
             .ok_or_else(|| io::Error::other("Missing 'folder_id' for Google Drive source"))?;
 
+        let auth = if let Some(refresh_token) = config.get("refresh_token").cloned() {
+            let client_id = config
+                .get("client_id")
+                .cloned()
+                .ok_or_else(|| io::Error::other("Missing 'client_id' for OAuth"))?;
+            let client_secret = config
+                .get("client_secret")
+                .cloned()
+                .ok_or_else(|| io::Error::other("Missing 'client_secret' for OAuth"))?;
+            let access_token = refresh_access_token(&refresh_token, &client_id, &client_secret)?;
+            AuthMode::OAuth {
+                client_id,
+                client_secret,
+                refresh_token,
+                access_token,
+            }
+        } else if let Some(api_key) = config.get("api_key").cloned() {
+            AuthMode::ApiKey(api_key)
+        } else {
+            return Err(io::Error::other(
+                "Google Drive source requires either 'api_key' or 'refresh_token'+'client_id'+'client_secret'",
+            ));
+        };
+
         let client = Client::new();
+        let source = GoogleDriveSource {
+            client,
+            auth,
+            folder_id: folder_id.clone(),
+        };
 
-        // Validate by listing 1 file
-        let url = format!("{API_BASE}/files?q='{folder_id}'+in+parents&pageSize=1&key={api_key}");
-        let resp = client.get(&url).send().map_err(io::Error::other)?;
-
+        // Validate connectivity
+        let url = format!(
+            "{API_BASE}/files?q='{folder_id}'+in+parents&pageSize=1&{}",
+            source.auth_param()
+        );
+        let resp = source.make_get(&url)?;
         if !resp.status().is_success() {
             return Err(io::Error::other(format!(
-                "Google Drive API key validation failed: {} — ensure the folder is shared publicly",
+                "Google Drive validation failed: {} — ensure folder access is granted",
                 resp.status()
             )));
         }
 
-        Ok(GoogleDriveSource {
-            client,
-            api_key,
-            folder_id,
-        })
+        Ok(source)
     }
 
     fn list_changes(&mut self, cursor: Option<&str>) -> io::Result<(Vec<RemotePhoto>, String)> {
@@ -88,12 +149,12 @@ impl RemotePhotoSource for GoogleDriveSource {
             self.folder_id
         );
         let url = format!(
-            "{API_BASE}/files?q={}&orderBy=modifiedTime&fields=files(id,name,size,mimeType,modifiedTime)&key={}",
+            "{API_BASE}/files?q={}&orderBy=modifiedTime&fields=files(id,name,size,mimeType,modifiedTime)&{}",
             urlencoding(&query),
-            self.api_key
+            self.auth_param()
         );
 
-        let resp = self.client.get(&url).send().map_err(io::Error::other)?;
+        let resp = self.make_get(&url)?;
 
         if !resp.status().is_success() {
             return Err(io::Error::other(format!(
@@ -134,11 +195,12 @@ impl RemotePhotoSource for GoogleDriveSource {
 
     fn download(&mut self, remote_id: &str, dest: &Path) -> io::Result<()> {
         let url = format!(
-            "{API_BASE}/files/{}?alt=media&key={}",
-            remote_id, self.api_key
+            "{API_BASE}/files/{}?alt=media&{}",
+            remote_id,
+            self.auth_param()
         );
 
-        let resp = self.client.get(&url).send().map_err(io::Error::other)?;
+        let resp = self.make_get(&url)?;
 
         if !resp.status().is_success() {
             return Err(io::Error::other(format!(
@@ -166,6 +228,71 @@ fn urlencoding(s: &str) -> String {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// OAuth helpers
+// ---------------------------------------------------------------------------
+
+fn refresh_access_token(
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> io::Result<String> {
+    let client = Client::new();
+    let params = [
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ];
+    let resp = client
+        .post(TOKEN_URL)
+        .form(&params)
+        .send()
+        .map_err(io::Error::other)?;
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+    }
+
+    let token: TokenResponse = resp.json().map_err(io::Error::other)?;
+    Ok(token.access_token)
+}
+
+/// Exchange an authorization code for tokens (used by the admin server).
+pub fn exchange_code(
+    code: &str,
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+) -> io::Result<String> {
+    let client = Client::new();
+    let params = [
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("code", code),
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", redirect_uri),
+    ];
+    let resp = client
+        .post(TOKEN_URL)
+        .form(&params)
+        .send()
+        .map_err(io::Error::other)?;
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        refresh_token: String,
+    }
+
+    let token: TokenResponse = resp.json().map_err(io::Error::other)?;
+    Ok(token.refresh_token)
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
 }
 
 #[cfg(test)]

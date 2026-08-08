@@ -122,6 +122,12 @@ impl AdminServer {
             (Method::Get, "/sources/add") => serve_html(page_add_source()),
             (Method::Get, "/sources/dropbox") => serve_html(page_form_dropbox()),
             (Method::Get, "/sources/google-drive") => serve_html(page_form_gdrive()),
+            (Method::Get, "/sources/google-drive-oauth") => {
+                serve_html(page_form_gdrive_oauth(self.port))
+            }
+            (Method::Get, p) if p.starts_with("/oauth/google/callback") => {
+                self.handle_oauth_callback(request)
+            }
 
             _ => Response::from_string("Not Found")
                 .with_status_code(StatusCode(404))
@@ -212,6 +218,77 @@ impl AdminServer {
             200,
             r#"{"ok":true,"message":"Config saved. Server shutting down."}"#,
         )
+    }
+
+    fn handle_oauth_callback(&self, request: &Request) -> Response<Box<dyn std::io::Read + Send>> {
+        let url = request.url();
+        let code = url
+            .split("?code=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .unwrap_or("");
+
+        if code.is_empty() {
+            return serve_html(page_oauth_error("No authorization code received"));
+        }
+
+        // We need the client_id and client_secret from the form submission.
+        // They are stored in the most recent OAuth source entry.
+        let oauth_params = {
+            let sources = self.staged_sources.lock().unwrap();
+            sources
+                .iter()
+                .find(|s| s.source_type == "google_drive" && s.params.contains_key("oauth_pending"))
+                .map(|s| (s.params.clone(), s.name.clone()))
+        };
+
+        let (params, name) = match oauth_params {
+            Some(p) => p,
+            None => {
+                return serve_html(page_oauth_error(
+                    "No OAuth setup found. Start from /sources/google-drive-oauth first.",
+                ));
+            }
+        };
+
+        let client_id = params.get("client_id").cloned().unwrap_or_default();
+        let client_secret = params.get("client_secret").cloned().unwrap_or_default();
+        let redirect_uri = format!(
+            "http://photo-frame.local:{}/oauth/google/callback",
+            self.port
+        );
+
+        match crate::import::gdrive::exchange_code(code, &client_id, &client_secret, &redirect_uri)
+        {
+            Ok(refresh_token) => {
+                // Replace the OAuth-pending entry with the real config
+                let mut clean = params.clone();
+                clean.remove("oauth_pending");
+                clean.insert("refresh_token".into(), refresh_token);
+
+                let interval = clean
+                    .get("check_interval_seconds")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86400);
+
+                let config = RemoteSourceConfig {
+                    source_type: "google_drive".into(),
+                    name: name.clone(),
+                    params: clean,
+                    check_interval_seconds: interval,
+                };
+
+                let mut sources = self.staged_sources.lock().unwrap();
+                if let Some(pos) = sources.iter().position(|s| s.name == name) {
+                    sources[pos] = config;
+                } else {
+                    sources.push(config);
+                }
+
+                serve_html(page_oauth_success(&name))
+            }
+            Err(e) => serve_html(page_oauth_error(&format!("Failed to exchange code: {e}"))),
+        }
     }
 }
 
@@ -352,7 +429,7 @@ fn page_sources(staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>) -> String {
 }
 
 fn page_add_source() -> String {
-    let body = r#"<h1>Add Source</h1><div class="card"><a href="/sources/dropbox" class="btn">Dropbox</a></div><div class="card"><a href="/sources/google-drive" class="btn">Google Drive</a></div>"#;
+    let body = r#"<h1>Add Source</h1><div class="card"><a href="/sources/dropbox" class="btn">Dropbox</a></div><div class="card"><a href="/sources/google-drive" class="btn">Google Drive (Public)</a></div><div class="card"><a href="/sources/google-drive-oauth" class="btn">Google Drive (Private, OAuth)</a></div>"#;
     page_wrap("/sources/add", "Add Source", body)
 }
 
@@ -364,6 +441,47 @@ fn page_form_dropbox() -> String {
 fn page_form_gdrive() -> String {
     let body = r#"<h1>Add Google Drive Source</h1><p class="muted">Requires a publicly shared folder and a Google Cloud API key.</p><form method="post" action="/api/sources/google-drive"><label>Name</label><input name="name" placeholder="My Drive"><label>API Key</label><input name="api_key" type="password" placeholder="AIza..."><label>Folder ID</label><input name="folder_id" placeholder="1abc123..."><label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number"><br><button>Save</button></form>"#;
     page_wrap("/sources/google-drive", "Google Drive", body)
+}
+
+fn page_form_gdrive_oauth(port: u16) -> String {
+    let redirect_uri = format!("http://photo-frame.local:{port}/oauth/google/callback");
+    let body = format!(
+        r#"<h1>Google Drive OAuth Setup</h1>
+<div class="card">
+    <p class="muted">Before continuing, you must create a Google Cloud project:</p>
+    <ol class="muted" style="padding-left:20px;line-height:1.6">
+        <li>Go to <a href="https://console.cloud.google.com" target="_blank">console.cloud.google.com</a></li>
+        <li>Create a project and enable the <b>Google Drive API</b></li>
+        <li>Go to <b>APIs & Services → Credentials</b></li>
+        <li>Create an <b>OAuth 2.0 Client ID</b> (Web application)</li>
+        <li>Add this <b>Redirect URI</b>:</li>
+    </ol>
+    <pre style="background:#222;padding:8px;border-radius:4px;word-break:break-all;font-size:.85em">{redirect_uri}</pre>
+</div>
+<form method="post" action="/api/sources/google-drive">
+    <input type="hidden" name="oauth_pending" value="1">
+    <label>Name</label><input name="name" placeholder="My Drive">
+    <label>Client ID</label><input name="client_id" placeholder="xxx.apps.googleusercontent.com">
+    <label>Client Secret</label><input name="client_secret" type="password" placeholder="GOCSPX-xxx">
+    <label>Folder ID</label><input name="folder_id" placeholder="1abc123...">
+    <label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number">
+    <button>Save &amp; Authorize</button>
+</form>"#
+    );
+    page_wrap("/sources/google-drive-oauth", "Google Drive OAuth", &body)
+}
+
+fn page_oauth_success(name: &str) -> String {
+    let body = format!(
+        r#"<h1>Connected!</h1><p>Google Drive source <b>{name}</b> has been authorized.</p><a href="/sources" class="btn">Back to Sources</a>"#
+    );
+    page_wrap("/", "Connected", &body)
+}
+
+fn page_oauth_error(msg: &str) -> String {
+    let body =
+        format!(r#"<h1>Error</h1><p>{msg}</p><a href="/sources/add" class="btn">Try Again</a>"#);
+    page_wrap("/", "Error", &body)
 }
 
 // ---------------------------------------------------------------------------
