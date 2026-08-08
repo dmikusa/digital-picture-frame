@@ -61,7 +61,7 @@ $(FONT_FILE): $(FONT_ZIP)
 $(FONT_ZIP):
 	@mkdir -p $(FONT_DIR)
 	curl -fsSL -o $@ $(FONT_URL)
-	@echo "$(FONT_SHA256)  $@" | shasum -a 256 -c - > /dev/null 2>&1 || { echo "ERROR: Font download hash mismatch. Expected $(FONT_SHA256)"; exit 1; }
+	@echo "$(FONT_SHA256)  $@" | shasum -a 256 -c - > /dev/null 2>&1 || { echo "ERROR: Font download hash mismatch. Expected $(FONT_SHA256)"; rm -f $@; exit 1; }
 
 c:
 	$(MAKE) -C c
