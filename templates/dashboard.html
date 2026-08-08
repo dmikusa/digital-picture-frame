@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block home_active %}active{% endblock %}
+{% block content %}
+<h1>Photo Frame Setup</h1>
+<div class="card">
+    <h2>Configured Sources</h2>
+    <p>{{ sources.len() }} source(s) configured</p>
+</div>
+{% for source in sources %}
+<div class="card">
+    <h2>{{ source.name }}</h2>
+    <p class="muted">Type: {{ source.source_type }}</p>
+</div>
+{% endfor %}
+<form method="post" action="/api/finish">
+    <button>Finish Setup</button>
+</form>
+{% endblock %}

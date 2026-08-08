@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Google Drive OAuth{% endblock %}
+{% block content %}
+<h1>Google Drive OAuth Setup</h1>
+<div class="card">
+    <p class="muted">Before continuing, you must create a Google Cloud project:</p>
+    <ol class="muted" style="padding-left:20px">
+        <li>Go to <a href="https://console.cloud.google.com" target="_blank">console.cloud.google.com</a></li>
+        <li>Create a project and enable the <b>Google Drive API</b></li>
+        <li>Go to <b>APIs &amp; Services → Credentials</b></li>
+        <li>Create an <b>OAuth 2.0 Client ID</b> (Web application)</li>
+        <li>Add this <b>Redirect URI</b>:</li>
+    </ol>
+    <pre>{{ redirect_uri }}</pre>
+</div>
+<form method="post" action="/api/sources/google-drive">
+    <input type="hidden" name="oauth_pending" value="1">
+    <label>Name</label><input name="name" placeholder="My Drive">
+    <label>Client ID</label><input name="client_id" placeholder="xxx.apps.googleusercontent.com">
+    <label>Client Secret</label><input name="client_secret" type="password" placeholder="GOCSPX-xxx">
+    <label>Folder ID</label><input name="folder_id" placeholder="1abc123...">
+    <label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number">
+    <button>Save &amp; Authorize</button>
+</form>
+{% endblock %}

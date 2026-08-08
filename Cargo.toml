@@ -26,6 +26,7 @@ qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 tiny_http_fork = "=0.12.8"
 oauth2 = "5"
+askama = "0.12"
 
 [package.metadata.deb]
 maintainer = "Daniel Mikusa <dan@mikusa.com>"

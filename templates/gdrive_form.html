@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Google Drive{% endblock %}
+{% block content %}
+<h1>Add Google Drive Source</h1>
+<p class="muted">Requires a publicly shared folder and a Google Cloud API key.</p>
+<form method="post" action="/api/sources/google-drive">
+    <label>Name</label><input name="name" placeholder="My Drive">
+    <label>API Key</label><input name="api_key" type="password" placeholder="AIza...">
+    <label>Folder ID</label><input name="folder_id" placeholder="1abc123...">
+    <label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number">
+    <br><button>Save</button>
+</form>
+{% endblock %}
