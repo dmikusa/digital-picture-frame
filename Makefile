@@ -88,6 +88,7 @@ build-c-container:
 clean:
 	$(MAKE) -C c clean
 	cargo clean
+	rm -rf $(FONT_DIR)
 	-$(CONTAINER) rmi $(CONTAINER_IMAGE) 2>/dev/null || true
 
 install: all
