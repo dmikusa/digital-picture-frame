@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Add Source{% endblock %}
+{% block add_active %}active{% endblock %}
+{% block content %}
+<h1>Add Source</h1>
+<div class="card"><a href="/sources/dropbox" class="btn">Dropbox</a></div>
+<div class="card"><a href="/sources/google-drive" class="btn">Google Drive (Public)</a></div>
+<div class="card"><a href="/sources/google-drive-oauth" class="btn">Google Drive (Private, OAuth)</a></div>
+{% endblock %}

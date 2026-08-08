@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Dropbox{% endblock %}
+{% block content %}
+<h1>Add Dropbox Source</h1>
+<form method="post" action="/api/sources/dropbox">
+    <label>Name</label><input name="name" placeholder="My Dropbox">
+    <label>Access Token</label><input name="access_token" type="password" placeholder="sl.xxxx">
+    <label>Folder</label><input name="folder" value="/Photos">
+    <label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number">
+    <br><button>Save</button>
+</form>
+{% endblock %}

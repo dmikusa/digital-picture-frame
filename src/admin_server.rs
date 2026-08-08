@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::RemoteSourceConfig;
+use askama::Template;
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpListener;
@@ -22,6 +23,52 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tiny_http_fork::{Header, Method, Request, Response, Server, StatusCode};
+
+// ---------------------------------------------------------------------------
+// Askama templates — compiled from templates/*.html at build time
+// ---------------------------------------------------------------------------
+
+#[derive(Template)]
+#[template(path = "dashboard.html")]
+struct DashboardTemplate<'a> {
+    sources: &'a Vec<RemoteSourceConfig>,
+}
+
+#[derive(Template)]
+#[template(path = "sources.html")]
+struct SourcesTemplate<'a> {
+    sources: &'a Vec<RemoteSourceConfig>,
+}
+
+#[derive(Template)]
+#[template(path = "add_source.html")]
+struct AddSourceTemplate;
+
+#[derive(Template)]
+#[template(path = "dropbox_form.html")]
+struct DropboxFormTemplate;
+
+#[derive(Template)]
+#[template(path = "gdrive_form.html")]
+struct GdriveFormTemplate;
+
+#[derive(Template)]
+#[template(path = "gdrive_oauth_form.html")]
+struct GdriveOauthFormTemplate {
+    redirect_uri: String,
+}
+
+#[derive(Template)]
+#[template(path = "oauth_success.html")]
+struct OauthSuccessTemplate {
+    name: String,
+}
+
+#[derive(Template)]
+#[template(path = "oauth_error.html")]
+struct OauthErrorTemplate {
+    message: String,
+}
 
 pub struct AdminServer {
     port: u16,
@@ -117,13 +164,23 @@ impl AdminServer {
             (Method::Post, "/api/finish") => self.api_finish(),
 
             // ---- HTML pages ---------------------------------------------------
-            (Method::Get, "/") => serve_html(page_dashboard(&self.staged_sources)),
-            (Method::Get, "/sources") => serve_html(page_sources(&self.staged_sources)),
-            (Method::Get, "/sources/add") => serve_html(page_add_source()),
-            (Method::Get, "/sources/dropbox") => serve_html(page_form_dropbox()),
-            (Method::Get, "/sources/google-drive") => serve_html(page_form_gdrive()),
+            (Method::Get, "/") => {
+                let sources = self.staged_sources.lock().unwrap();
+                serve_template(&DashboardTemplate { sources: &sources })
+            }
+            (Method::Get, "/sources") => {
+                let sources = self.staged_sources.lock().unwrap();
+                serve_template(&SourcesTemplate { sources: &sources })
+            }
+            (Method::Get, "/sources/add") => serve_template(&AddSourceTemplate),
+            (Method::Get, "/sources/dropbox") => serve_template(&DropboxFormTemplate),
+            (Method::Get, "/sources/google-drive") => serve_template(&GdriveFormTemplate),
             (Method::Get, "/sources/google-drive-oauth") => {
-                serve_html(page_form_gdrive_oauth(self.port))
+                let redirect_uri = format!(
+                    "http://photo-frame.local:{}/oauth/google/callback",
+                    self.port
+                );
+                serve_template(&GdriveOauthFormTemplate { redirect_uri })
             }
             (Method::Get, p) if p.starts_with("/oauth/google/callback") => {
                 self.handle_oauth_callback(request)
@@ -229,7 +286,9 @@ impl AdminServer {
             .unwrap_or("");
 
         if code.is_empty() {
-            return serve_html(page_oauth_error("No authorization code received"));
+            return serve_template(&OauthErrorTemplate {
+                message: "No authorization code received".into(),
+            });
         }
 
         // We need the client_id and client_secret from the form submission.
@@ -245,9 +304,10 @@ impl AdminServer {
         let (params, name) = match oauth_params {
             Some(p) => p,
             None => {
-                return serve_html(page_oauth_error(
-                    "No OAuth setup found. Start from /sources/google-drive-oauth first.",
-                ));
+                return serve_template(&OauthErrorTemplate {
+                    message: "No OAuth setup found. Start from /sources/google-drive-oauth first."
+                        .into(),
+                });
             }
         };
 
@@ -285,9 +345,11 @@ impl AdminServer {
                     sources.push(config);
                 }
 
-                serve_html(page_oauth_success(&name))
+                serve_template(&OauthSuccessTemplate { name: name.clone() })
             }
-            Err(e) => serve_html(page_oauth_error(&format!("Failed to exchange code: {e}"))),
+            Err(e) => serve_template(&OauthErrorTemplate {
+                message: format!("Failed to exchange code: {e}"),
+            }),
         }
     }
 }
@@ -309,6 +371,15 @@ fn serve_html(body: String) -> Response<Box<dyn std::io::Read + Send>> {
             Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
         )
         .boxed()
+}
+
+fn serve_template<T: Template>(t: &T) -> Response<Box<dyn std::io::Read + Send>> {
+    match t.render() {
+        Ok(html) => serve_html(html),
+        Err(e) => Response::from_string(format!("Template error: {e}"))
+            .with_status_code(StatusCode(500))
+            .boxed(),
+    }
 }
 
 fn read_body(request: &mut Request) -> String {
@@ -343,148 +414,6 @@ fn base64_encode(input: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// HTML pages
-// ---------------------------------------------------------------------------
-
-const STYLE: &str = r#"
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,sans-serif;background:#111;color:#eee;max-width:480px;margin:0 auto;padding:8px}
-nav{display:flex;gap:8px;margin-bottom:16px;border-bottom:1px solid #333;padding-bottom:8px}
-nav a{color:#8af;text-decoration:none;padding:4px 8px;border-radius:4px}
-nav a.active,nav a:hover{background:#222}
-h1{font-size:1.2em;margin-bottom:12px}
-.card{background:#1a1a1a;border:1px solid #333;border-radius:6px;padding:12px;margin-bottom:12px}
-.card h2{font-size:1em;margin-bottom:8px}
-form label{display:block;font-size:.85em;margin:8px 0 4px;color:#aaa}
-form input,form select{width:100%;padding:8px;background:#222;border:1px solid #444;border-radius:4px;color:#eee;font-size:1em;margin-bottom:8px}
-button,.btn{display:inline-block;padding:8px 16px;background:#246;color:#eee;border:none;border-radius:4px;font-size:1em;cursor:pointer;text-decoration:none}
-button:hover,.btn:hover{background:#358}
-.danger{background:#622}.danger:hover{background:#844}
-.row{display:flex;justify-content:space-between;align-items:center;gap:8px}
-.muted{color:#888;font-size:.85em}
-"#;
-
-fn nav_bar(active: &str) -> String {
-    let pages = [
-        ("/", "Home"),
-        ("/sources", "Sources"),
-        ("/sources/add", "Add"),
-    ];
-    let mut links = String::new();
-    for (href, label) in &pages {
-        let cls = if *href == active { "active" } else { "" };
-        links.push_str(&format!(r#"<a href="{href}" class="{cls}">{label}</a>"#));
-    }
-    format!("<nav>{links}</nav>")
-}
-
-fn page_wrap(active: &str, title: &str, content: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>{STYLE}</style></head><body>{nav}{content}</body></html>"#,
-        nav = nav_bar(active),
-    )
-}
-
-fn page_dashboard(staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>) -> String {
-    let sources = staged.lock().unwrap();
-    let count = sources.len();
-    let list: String = sources
-        .iter()
-        .map(|s| {
-            format!(
-                r#"<div class="card"><h2>{}</h2><p class="muted">Type: {}</p></div>"#,
-                s.name, s.source_type
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-
-    let body = format!(
-        r#"<h1>Photo Frame Setup</h1><div class="card"><h2>Configured Sources</h2><p>{count} source(s) configured</p></div>{list}<form method="post" action="/api/finish"><button>Finish Setup</button></form>"#
-    );
-    page_wrap("/", "Dashboard", &body)
-}
-
-fn page_sources(staged: &Arc<Mutex<Vec<RemoteSourceConfig>>>) -> String {
-    let sources = staged.lock().unwrap();
-    let list: String = if sources.is_empty() {
-        r#"<p class="muted">No sources configured.</p>"#.to_string()
-    } else {
-        sources
-            .iter()
-            .map(|s| {
-                format!(
-                    r#"<div class="card"><div class="row"><div><h2>{}</h2><p class="muted">Type: {}</p></div><form method="post" action="/api/sources/{}" style="margin:0"><button class="danger">Delete</button></form></div></div>"#,
-                    s.name, s.source_type,
-                    urlencode(&s.name),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    };
-    let body = format!(
-        r#"<h1>Sources</h1>{list}<a href="/sources/add" class="btn">+ Add Source</a><br><br><form method="post" action="/api/finish"><button>Finish Setup</button></form>"#
-    );
-    page_wrap("/sources", "Sources", &body)
-}
-
-fn page_add_source() -> String {
-    let body = r#"<h1>Add Source</h1><div class="card"><a href="/sources/dropbox" class="btn">Dropbox</a></div><div class="card"><a href="/sources/google-drive" class="btn">Google Drive (Public)</a></div><div class="card"><a href="/sources/google-drive-oauth" class="btn">Google Drive (Private, OAuth)</a></div>"#;
-    page_wrap("/sources/add", "Add Source", body)
-}
-
-fn page_form_dropbox() -> String {
-    let body = r#"<h1>Add Dropbox Source</h1><form method="post" action="/api/sources/dropbox"><label>Name</label><input name="name" placeholder="My Dropbox"><label>Access Token</label><input name="access_token" type="password" placeholder="sl.xxxx"><label>Folder</label><input name="folder" value="/Photos"><label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number"><br><button>Save</button></form>"#;
-    page_wrap("/sources/dropbox", "Dropbox", body)
-}
-
-fn page_form_gdrive() -> String {
-    let body = r#"<h1>Add Google Drive Source</h1><p class="muted">Requires a publicly shared folder and a Google Cloud API key.</p><form method="post" action="/api/sources/google-drive"><label>Name</label><input name="name" placeholder="My Drive"><label>API Key</label><input name="api_key" type="password" placeholder="AIza..."><label>Folder ID</label><input name="folder_id" placeholder="1abc123..."><label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number"><br><button>Save</button></form>"#;
-    page_wrap("/sources/google-drive", "Google Drive", body)
-}
-
-fn page_form_gdrive_oauth(port: u16) -> String {
-    let redirect_uri = format!("http://photo-frame.local:{port}/oauth/google/callback");
-    let body = format!(
-        r#"<h1>Google Drive OAuth Setup</h1>
-<div class="card">
-    <p class="muted">Before continuing, you must create a Google Cloud project:</p>
-    <ol class="muted" style="padding-left:20px;line-height:1.6">
-        <li>Go to <a href="https://console.cloud.google.com" target="_blank">console.cloud.google.com</a></li>
-        <li>Create a project and enable the <b>Google Drive API</b></li>
-        <li>Go to <b>APIs & Services → Credentials</b></li>
-        <li>Create an <b>OAuth 2.0 Client ID</b> (Web application)</li>
-        <li>Add this <b>Redirect URI</b>:</li>
-    </ol>
-    <pre style="background:#222;padding:8px;border-radius:4px;word-break:break-all;font-size:.85em">{redirect_uri}</pre>
-</div>
-<form method="post" action="/api/sources/google-drive">
-    <input type="hidden" name="oauth_pending" value="1">
-    <label>Name</label><input name="name" placeholder="My Drive">
-    <label>Client ID</label><input name="client_id" placeholder="xxx.apps.googleusercontent.com">
-    <label>Client Secret</label><input name="client_secret" type="password" placeholder="GOCSPX-xxx">
-    <label>Folder ID</label><input name="folder_id" placeholder="1abc123...">
-    <label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number">
-    <button>Save &amp; Authorize</button>
-</form>"#
-    );
-    page_wrap("/sources/google-drive-oauth", "Google Drive OAuth", &body)
-}
-
-fn page_oauth_success(name: &str) -> String {
-    let body = format!(
-        r#"<h1>Connected!</h1><p>Google Drive source <b>{name}</b> has been authorized.</p><a href="/sources" class="btn">Back to Sources</a>"#
-    );
-    page_wrap("/", "Connected", &body)
-}
-
-fn page_oauth_error(msg: &str) -> String {
-    let body =
-        format!(r#"<h1>Error</h1><p>{msg}</p><a href="/sources/add" class="btn">Try Again</a>"#);
-    page_wrap("/", "Error", &body)
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -495,19 +424,6 @@ fn find_free_port() -> io::Result<u16> {
         }
     }
     Err(io::Error::other("No available port in range 8100-8199"))
-}
-
-fn urlencode(s: &str) -> String {
-    let mut result = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(b as char)
-            }
-            _ => result.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    result
 }
 
 #[cfg(test)]

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Sources{% endblock %}
+{% block sources_active %}active{% endblock %}
+{% block content %}
+<h1>Sources</h1>
+{% if sources.is_empty() %}
+<p class="muted">No sources configured.</p>
+{% endif %}
+{% for source in sources %}
+<div class="card">
+    <div class="row">
+        <div>
+            <h2>{{ source.name }}</h2>
+            <p class="muted">Type: {{ source.source_type }}</p>
+        </div>
+        <form method="post" action="/api/sources/{{ source.name|urlencode }}" style="margin:0">
+            <button class="danger">Delete</button>
+        </form>
+    </div>
+</div>
+{% endfor %}
+<a href="/sources/add" class="btn">+ Add Source</a>
+<br><br>
+<form method="post" action="/api/finish">
+    <button>Finish Setup</button>
+</form>
+{% endblock %}
