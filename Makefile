@@ -54,7 +54,7 @@ font: $(FONT_FILE)
 
 $(FONT_FILE): $(FONT_ZIP)
 	@mkdir -p $(FONT_DIR)
-	unzip -p $< "dejavu-sans-ttf-2.37/ttf/DejaVuSans.ttf" > $@
+	unzip -p $< "dejavu-sans-ttf-2.37/ttf/DejaVuSans.ttf" > $@.tmp && mv $@.tmp $@
 
 $(FONT_ZIP):
 	@mkdir -p $(FONT_DIR)
