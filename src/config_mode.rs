@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::admin_server::AdminServer;
 use crate::config::Config;
 use crate::control::ControlClient;
 use crate::import::MountEvent;
@@ -25,14 +26,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-/// How long config mode stays active without interaction (server not yet
-/// implemented; Phase 7 adds request-based reset).
-const CONFIG_MODE_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// The URL path that will be used for the admin UI (hardcoded until Phase 7).
-const ADMIN_PORT: u16 = 8147;
 
 #[derive(Debug, PartialEq)]
 enum ConfigState {
@@ -50,31 +45,53 @@ pub struct ConfigEnvironment {
     state: ConfigState,
     control: ControlClient,
     config: Config,
-    /// In-memory staging for remote-source edits (written on "Finish" — Phase 7).
-    staged: Option<Config>,
+    config_path: PathBuf,
+    server: Option<Arc<AdminServer>>,
+    server_handle: Option<JoinHandle<()>>,
+    server_shutdown: Arc<AtomicBool>,
 }
 
 impl ConfigEnvironment {
-    pub fn new(config: Config, control_socket_path: &std::path::Path) -> Self {
+    pub fn new(
+        config: Config,
+        control_socket_path: &std::path::Path,
+        config_path: PathBuf,
+    ) -> Self {
         ConfigEnvironment {
             state: ConfigState::Normal,
             control: ControlClient::new(control_socket_path),
             config,
-            staged: None,
+            config_path,
+            server: None,
+            server_handle: None,
+            server_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Enter config mode: display the QR code and, in Phase 7, start the admin
-    /// server.
+    /// Enter config mode: display the QR code and start the admin server.
     fn enter_config_mode(&mut self, fallback_ip: &str) -> io::Result<()> {
         let password = qr::generate_password();
-        let admin_host = format!("photo-frame.local:{ADMIN_PORT}");
+
+        let server = Arc::new(AdminServer::new(password.clone())?);
+        let port = server.port();
+        let admin_host = format!("photo-frame.local:{port}");
 
         let qr_path = qr::render_config_screen(&self.config, &admin_host, &password, fallback_ip)
             .map_err(io::Error::other)?;
 
         self.control.clear()?;
         self.control.show(&qr_path)?;
+
+        self.server_shutdown.store(false, Ordering::Relaxed);
+        let srv = server.clone();
+        let srv_shutdown = self.server_shutdown.clone();
+        self.server_handle = Some(std::thread::spawn(move || {
+            if let Err(e) = srv.run(srv_shutdown) {
+                log::error!("Admin server error: {e}");
+            }
+        }));
+
+        self.server = Some(server);
 
         log::info!("Config mode active: http://{admin_host}  password={password}");
         self.state = ConfigState::ConfigMode {
@@ -85,10 +102,31 @@ impl ConfigEnvironment {
         Ok(())
     }
 
-    /// Leave config mode: discard staged changes and resume the slideshow.
-    fn leave_config_mode(&mut self) -> io::Result<()> {
-        log::info!("Leaving config mode");
-        self.staged = None;
+    /// Leave config mode: stop the admin server and resume the slideshow.
+    /// If `save` is true, write the staged remote sources to config.toml.
+    fn leave_config_mode(&mut self, save: bool) -> io::Result<()> {
+        log::info!("Leaving config mode (save={save})");
+        self.server_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.server_handle.take() {
+            let _ = handle.join();
+        }
+
+        if save {
+            if let Some(ref server) = self.server {
+                let sources = server.take_sources();
+                if !sources.is_empty() {
+                    let mut config = self.config.clone();
+                    config.remote_sources = sources;
+                    let toml_str = toml::to_string_pretty(&config).map_err(io::Error::other)?;
+                    let tmp = self.config_path.with_extension("toml.tmp");
+                    std::fs::write(&tmp, toml_str)?;
+                    std::fs::rename(&tmp, &self.config_path)?;
+                    log::info!("Config saved to {}", self.config_path.display());
+                }
+            }
+        }
+
+        self.server = None;
         self.control.resume()?;
         self.state = ConfigState::Normal;
         Ok(())
@@ -133,7 +171,7 @@ impl ConfigEnvironment {
                     "USB removed — leaving config mode  ({path})",
                     path = path.display()
                 );
-                self.leave_config_mode()?;
+                self.leave_config_mode(false)?;
             }
             (ConfigState::Normal, MountEvent::Removed(path)) => {
                 log::info!("USB removed: {}", path.display());
@@ -147,17 +185,6 @@ impl ConfigEnvironment {
             _ => {}
         }
 
-        Ok(())
-    }
-
-    /// Check whether the config-mode timeout has elapsed (no server activity).
-    fn check_timeout(&mut self) -> io::Result<()> {
-        if let ConfigState::ConfigMode { entered, .. } = self.state {
-            if entered.elapsed() >= CONFIG_MODE_TIMEOUT {
-                log::info!("Config mode timed out");
-                self.leave_config_mode()?;
-            }
-        }
         Ok(())
     }
 }
@@ -186,6 +213,7 @@ pub fn detect_fallback_ip() -> String {
 /// Runs the config-mode state machine in a dedicated thread.
 pub fn run_config_mode_loop(
     config: Config,
+    config_path: PathBuf,
     control_socket_path: PathBuf,
     shutdown: Arc<AtomicBool>,
     event_rx: mpsc::Receiver<MountEvent>,
@@ -198,9 +226,8 @@ pub fn run_config_mode_loop(
         let (_, meta) = crate::index::init_index(&config.photos_dir)?;
         meta.valid_count == 0
     };
-    // TODO: also check for absence of [[remote_sources]] in config (Phase 4).
 
-    let mut env = ConfigEnvironment::new(config, &control_socket_path);
+    let mut env = ConfigEnvironment::new(config, &control_socket_path, config_path);
 
     if first_boot {
         log::info!("First boot detected — entering config mode");
@@ -211,12 +238,27 @@ pub fn run_config_mode_loop(
         if shutdown.load(Ordering::Relaxed) {
             log::info!("Config mode shutting down");
             if env.state != ConfigState::Normal {
-                let _ = env.leave_config_mode();
+                let save = env.server.as_ref().map(|s| s.finished()).unwrap_or(false);
+                let _ = env.leave_config_mode(save);
             }
             break;
         }
 
-        env.check_timeout()?;
+        // Check if user finished setup
+        if let ConfigState::ConfigMode { .. } = env.state {
+            if let Some(ref server) = env.server {
+                if server.finished() {
+                    log::info!("User finished setup — saving config");
+                    env.leave_config_mode(true)?;
+                    continue;
+                }
+                if server.timed_out() {
+                    log::info!("Config mode timed out");
+                    env.leave_config_mode(false)?;
+                    continue;
+                }
+            }
+        }
 
         match event_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(event) => {

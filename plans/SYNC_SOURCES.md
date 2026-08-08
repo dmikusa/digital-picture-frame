@@ -295,10 +295,18 @@ check_interval_seconds = 86400
 
 ### Task 7.1: HTTP Server
 - New `src/admin_server.rs` module.
-- Uses `std::net::TcpListener` + `httparse` (1 dep, 0 transitive deps).
-  `httparse` maintained by the hyper team, 636M+ downloads.
-- Thread-per-connection via `std::thread::spawn()` — acceptable for a
-  config panel with sporadic, single-user traffic.
+- Uses `tiny_http_fork = "=0.12.8"` (pinned) instead of the DIY `TcpListener`
+  + `httparse` approach originally considered.
+  - **Rationale:** The DIY server was chosen to avoid dependency bloat, but
+    after research the team identified `tiny_http_fork` as a drop-in
+    replacement for the original (unmaintained) `tiny_http`. The fork fixes
+    CVE-2026-66752 (Transfer-Encoding smuggling), CVE-2026-66753 (CR/LF header
+    injection), and several panic-on-drop / ECONNABORTED bugs from the
+    original. A full diff review against upstream confirmed no malicious code —
+    all changes are from publicly-tracked PRs (#275, #284, #285) or CVE
+    mitigations.
+  - **Dependency tree:** `ascii`, `chunked_transfer`, `httpdate`, `log` (4
+    deps, matching the original `tiny_http` footprint).
 - Starts on a random port in range 8100–8199 during CONFIG_MODE state.
 - Stops on: `POST /finish`, USB removal, 10-minute idle timeout (reset on
   each request).
@@ -306,7 +314,6 @@ check_interval_seconds = 86400
   rotating 8-char password.
 - Basic auth guard: pre-compute the expected `Basic <base64>` string once at
   server start, then string-compare on each request. No `base64` crate needed.
-- Response headers: `Content-Type`, `Content-Length`, `Connection: close`.
 
 ### Task 7.2: API Routes (JSON, REST)
 
@@ -395,7 +402,8 @@ handles the common case (public folders) with zero OAuth complexity.
 | `image` | 2 | QR PNG → JPEG encode, screen-size rendering |
 | `serde_json` | 4 | Cursor file format, config serialization |
 | `reqwest` (blocking) | 5, 6 | HTTP client for Dropbox, Google Drive |
-| `httparse` | 7 | HTTP request parsing for admin server |
+| `httparse` | — (replaced by tiny_http_fork) | — |
+| `tiny_http_fork` | 7 | HTTP server (CVE-fixed fork of tiny_http) |
 | `oauth2` | 8 (deferred) | Google Drive OAuth client/refresh flow |
 
 ---
