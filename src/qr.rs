@@ -99,40 +99,54 @@ fn font_lookup(ch: char) -> Option<&'static [u8; 5]> {
     }
 }
 
-fn draw_char(img: &mut RgbImage, x: u32, y: u32, ch: char, color: Rgb<u8>) -> Option<u32> {
+fn draw_char_scaled(
+    img: &mut RgbImage,
+    x: u32,
+    y: u32,
+    ch: char,
+    color: Rgb<u8>,
+    scale: u32,
+) -> Option<u32> {
     let glyph = font_lookup(ch)?;
     for (col, bits) in glyph.iter().enumerate() {
         for row in 0..7 {
             if (bits >> row) & 1 != 0 {
-                let px = x + col as u32;
-                let py = y + row as u32;
-                if px < img.width() && py < img.height() {
-                    img.put_pixel(px, py, color);
+                let px = x + col as u32 * scale;
+                let py = y + row as u32 * scale;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let cx = px + dx;
+                        let cy = py + dy;
+                        if cx < img.width() && cy < img.height() {
+                            img.put_pixel(cx, cy, color);
+                        }
+                    }
                 }
             }
         }
     }
-    Some(CHAR_W)
+    Some(CHAR_W * scale)
 }
 
-fn text_width(text: &str) -> u32 {
-    text.chars().filter_map(font_lookup).count() as u32 * (CHAR_W + CHAR_SPACING)
+fn text_width_scaled(text: &str, scale: u32) -> u32 {
+    text.chars().filter_map(font_lookup).count() as u32 * (CHAR_W + CHAR_SPACING) * scale
 }
 
-fn draw_text(img: &mut RgbImage, x: u32, y: u32, text: &str, color: Rgb<u8>) {
+fn draw_text_scaled(img: &mut RgbImage, x: u32, y: u32, text: &str, color: Rgb<u8>, scale: u32) {
     let mut cx = x;
     for ch in text.chars() {
-        if let Some(w) = draw_char(img, cx, y, ch, color) {
-            cx += w + CHAR_SPACING;
+        if let Some(w) = draw_char_scaled(img, cx, y, ch, color, scale) {
+            cx += w + CHAR_SPACING * scale;
         }
     }
 }
 
-fn draw_centered_text(img: &mut RgbImage, y: u32, text: &str, color: Rgb<u8>) {
-    let w = text_width(text);
+fn draw_centered_text_scaled(img: &mut RgbImage, y: u32, text: &str, color: Rgb<u8>, scale: u32) {
+    let w = text_width_scaled(text, scale);
     let x = (img.width().saturating_sub(w)) / 2;
-    draw_text(img, x, y, text, color);
+    draw_text_scaled(img, x, y, text, color, scale);
 }
+
 /// Generate a random 8-character alphanumeric password.
 pub fn generate_password() -> String {
     rand::thread_rng()
@@ -209,13 +223,15 @@ pub fn render_config_screen(
     let code = QrCode::new(&qr_url).map_err(|e| format!("QR encode error: {e}"))?;
     let module_count = code.width() as u32;
 
-    // QR takes up the upper portion of the screen
-    let qr_area_height = height * 70 / 100;
+    // QR takes up the upper portion of the screen, centered vertically
+    // within its allocated area.
+    let qr_area_height = height * 55 / 100;
     let qr_size = qr_area_height.min(width * 8 / 10).max(32);
     let module_px = (qr_size / module_count).max(1);
 
     let qr_x = (width.saturating_sub(module_count * module_px)) / 2;
-    let qr_y = qr_x; // top padding equals side padding
+    let qr_pixel_h = module_count * module_px;
+    let qr_y = (qr_area_height.saturating_sub(qr_pixel_h)) / 2;
 
     let mut img: RgbImage = ImageBuffer::new(width, height);
 
@@ -243,15 +259,17 @@ pub fn render_config_screen(
         }
     }
 
-    // Text below the QR code
+    // Text below the QR code — scaled 3x for readability
     let white = Rgb([255u8, 255, 255]);
-    let text_y = qr_y + module_count * module_px + 12;
+    let text_scale = 3u32;
+    let text_line_h = (CHAR_H + 2) * text_scale;
+    let text_y = qr_area_height + 20;
 
     let url_line = format!("http://{admin_url}");
-    draw_centered_text(&mut img, text_y, &url_line, white);
+    draw_centered_text_scaled(&mut img, text_y, &url_line, white, text_scale);
 
     let pw_line = format!("Password: {password}");
-    draw_centered_text(&mut img, text_y + CHAR_H + 6, &pw_line, white);
+    draw_centered_text_scaled(&mut img, text_y + text_line_h, &pw_line, white, text_scale);
 
     let ip_line = format!(
         "Or: http://{fallback_ip}:{port}",
@@ -265,15 +283,22 @@ pub fn render_config_screen(
                 .unwrap_or("8080")
         }
     );
-    draw_centered_text(&mut img, text_y + (CHAR_H + 6) * 2, &ip_line, white);
+    draw_centered_text_scaled(
+        &mut img,
+        text_y + text_line_h * 2,
+        &ip_line,
+        white,
+        text_scale,
+    );
 
     // Footer
-    let footer_y = height.saturating_sub(CHAR_H + 10);
-    draw_centered_text(
+    let footer_y = height.saturating_sub(CHAR_H * 3 + 10);
+    draw_centered_text_scaled(
         &mut img,
         footer_y,
         "Insert USB to configure (remove to cancel)",
         white,
+        2,
     );
 
     let out_path = std::path::PathBuf::from("/tmp/photo-frame-qr.jpg");
