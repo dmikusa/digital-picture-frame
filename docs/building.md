@@ -21,7 +21,15 @@ Needs: `gcc`, `libdrm-dev`, `libegl1-mesa-dev`, `libgbm-dev`
 
 ## Rust manager app requirements
 
-Needs: `rustup` & stable Rust toolchain.
+Needs: `rustup` & stable Rust toolchain. Also needs `unzip` for font extraction.
+
+Before building, download the embedded font:
+
+```bash
+make font
+```
+
+This downloads DejaVu Sans TTF from GitHub releases and verifies its SHA256 hash. The font is embedded in the Rust binary via `include_bytes!()` at compile time. Only needed once (or when running `make clean`).
 
 ## Debian VM with GPU acceleration (UTM/QEMU)
 

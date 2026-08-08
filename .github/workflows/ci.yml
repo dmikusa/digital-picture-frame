@@ -24,7 +24,10 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends imagemagick
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends imagemagick unzip
+
+      - name: Download font
+        run: make font
 
       - name: Check formatting
         run: cargo fmt -- --check
