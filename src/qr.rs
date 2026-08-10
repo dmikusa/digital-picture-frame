@@ -38,7 +38,7 @@ pub fn generate_password() -> String {
 // ---------------------------------------------------------------------------
 
 fn load_font() -> Result<fontdue::Font, String> {
-    let data: &[u8] = include_bytes!("../fonts/DejaVuSans.ttf");
+    let data: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
     fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
         .map_err(|e| format!("Failed to parse font: {e}"))
 }
@@ -52,13 +52,9 @@ fn measure_text(text: &str, font_size: f32, font: &fontdue::Font) -> f32 {
         .sum()
 }
 
-fn line_height(font_size: f32) -> f32 {
-    font_size * 1.4
-}
-
 fn draw_centered(
     img: &mut RgbImage,
-    y: f32,
+    baseline: f32,
     text: &str,
     color: Rgb<u8>,
     font_size: f32,
@@ -66,13 +62,13 @@ fn draw_centered(
 ) {
     let width = measure_text(text, font_size, font);
     let x = ((img.width() as f32 - width) / 2.0).max(0.0);
-    draw_text(img, x, y, text, color, font_size, font);
+    draw_text(img, x, baseline, text, color, font_size, font);
 }
 
 fn draw_text(
     img: &mut RgbImage,
     x: f32,
-    y: f32,
+    baseline: f32,
     text: &str,
     color: Rgb<u8>,
     font_size: f32,
@@ -81,7 +77,7 @@ fn draw_text(
     let mut cx = x;
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, font_size);
-        let glyph_y = y + font_size - metrics.bounds.height + metrics.bounds.ymin;
+        let glyph_y = baseline + metrics.bounds.ymin;
         for row in 0..metrics.height {
             for col in 0..metrics.width {
                 let alpha = bitmap[row * metrics.width + col];
@@ -205,24 +201,27 @@ pub fn render_config_screen(
         }
     }
 
-    // Text section: split remaining vertical space between QR bottom and footer
-    let font_size = (height as f32 * 0.045).max(14.0);
-    let lh = line_height(font_size);
+    // Text section: use font metrics for accurate positioning
+    let font_size = (height as f32 * 0.04).max(12.0);
+    let hl = font
+        .horizontal_line_metrics(font_size)
+        .unwrap_or(fontdue::LineMetrics {
+            ascent: font_size * 0.7,
+            descent: font_size * 0.3,
+            line_gap: 0.0,
+            new_line_size: font_size * 1.2,
+        });
+    let lh = hl.new_line_size;
     let footer_font = (height as f32 * 0.03).max(12.0);
-    let footer_lh = line_height(footer_font);
 
     let qr_bottom = qr_y + qr_pixel_h;
-    let footer_y = height as f32 - footer_lh - 10.0;
-    let available = footer_y - qr_bottom as f32;
-    let lines = 3.0;
-    let text_block = lines * lh;
-    let text_y = qr_bottom as f32 + (available - text_block).max(0.0) / 2.0;
+    let baseline = qr_bottom as f32 + font_size * 0.8 + hl.ascent;
 
     let url_line = format!("http://{admin_url}");
-    draw_centered(&mut img, text_y, &url_line, white, font_size, &font);
+    draw_centered(&mut img, baseline, &url_line, white, font_size, &font);
 
     let pw_line = format!("Password: {password}");
-    draw_centered(&mut img, text_y + lh, &pw_line, white, font_size, &font);
+    draw_centered(&mut img, baseline + lh, &pw_line, white, font_size, &font);
 
     let ip_line = format!(
         "Or: http://{fallback_ip}:{port}",
@@ -234,7 +233,7 @@ pub fn render_config_screen(
     );
     draw_centered(
         &mut img,
-        text_y + lh * 2.0,
+        baseline + lh * 2.0,
         &ip_line,
         white,
         font_size,
@@ -242,9 +241,18 @@ pub fn render_config_screen(
     );
 
     // Footer
+    let footer_hl = font
+        .horizontal_line_metrics(footer_font)
+        .unwrap_or(fontdue::LineMetrics {
+            ascent: footer_font * 0.7,
+            descent: footer_font * 0.3,
+            line_gap: 0.0,
+            new_line_size: footer_font * 1.2,
+        });
+    let footer_baseline = height as f32 - footer_hl.descent - 10.0;
     draw_centered(
         &mut img,
-        footer_y,
+        footer_baseline,
         "Insert USB to configure (remove to cancel)",
         white,
         footer_font,
@@ -295,5 +303,38 @@ mod tests {
         assert!(path.exists());
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn test_font_metrics() {
+        let font = load_font().unwrap();
+        let size = 24.0;
+
+        let (hm, _) = font.rasterize('H', size);
+        let (pm, _) = font.rasterize('p', size);
+
+        // H has ymin=0, p has negative ymin (descender extends below baseline)
+        assert!(pm.bounds.ymin < 0.0, "p should have negative ymin");
+        assert!(hm.bounds.ymin >= 0.0, "H should have ymin >= 0");
+
+        // With baseline + ymin positioning, descenders push glyphs upward
+        let baseline = 100.0;
+        let h_top = baseline + hm.bounds.ymin;
+        let p_top = baseline + pm.bounds.ymin;
+        assert!(
+            p_top < h_top,
+            "p top ({p_top}) should be above H top ({h_top}) — descender pulls glyph up"
+        );
+
+        // Verify horizontal_line_metrics gives reasonable spacing
+        let hl = font.horizontal_line_metrics(size).unwrap();
+        assert!(
+            hl.new_line_size > size * 0.8,
+            "line height should be close to font size"
+        );
+        assert!(
+            hl.new_line_size < size * 2.0,
+            "line height should not be double font size"
+        );
     }
 }
