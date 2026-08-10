@@ -52,10 +52,6 @@ fn measure_text(text: &str, font_size: f32, font: &fontdue::Font) -> f32 {
         .sum()
 }
 
-fn line_height(font_size: f32) -> f32 {
-    font_size * 1.4
-}
-
 fn draw_centered(
     img: &mut RgbImage,
     baseline: f32,
@@ -205,18 +201,21 @@ pub fn render_config_screen(
         }
     }
 
-    // Text section: split remaining vertical space between QR bottom and footer
+    // Text section: use font metrics for accurate positioning
     let font_size = (height as f32 * 0.04).max(12.0);
-    let lh = line_height(font_size);
+    let hl = font
+        .horizontal_line_metrics(font_size)
+        .unwrap_or(fontdue::LineMetrics {
+            ascent: font_size * 0.7,
+            descent: font_size * 0.3,
+            line_gap: 0.0,
+            new_line_size: font_size * 1.2,
+        });
+    let lh = hl.new_line_size;
     let footer_font = (height as f32 * 0.03).max(12.0);
 
     let qr_bottom = qr_y + qr_pixel_h;
-    let footer_baseline = height as f32 - 10.0;
-    let available = footer_baseline - qr_bottom as f32;
-    let lines = 3.0;
-    let text_block = lines * lh;
-    let text_top = qr_bottom as f32 + (available - text_block).max(0.0) / 2.0;
-    let baseline = text_top + font_size;
+    let baseline = qr_bottom as f32 + font_size * 0.8 + hl.ascent;
 
     let url_line = format!("http://{admin_url}");
     draw_centered(&mut img, baseline, &url_line, white, font_size, &font);
@@ -242,7 +241,15 @@ pub fn render_config_screen(
     );
 
     // Footer
-    let footer_baseline = height as f32 - 10.0;
+    let footer_hl = font
+        .horizontal_line_metrics(footer_font)
+        .unwrap_or(fontdue::LineMetrics {
+            ascent: footer_font * 0.7,
+            descent: footer_font * 0.3,
+            line_gap: 0.0,
+            new_line_size: footer_font * 1.2,
+        });
+    let footer_baseline = height as f32 - footer_hl.descent - 10.0;
     draw_centered(
         &mut img,
         footer_baseline,
@@ -296,5 +303,38 @@ mod tests {
         assert!(path.exists());
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn test_font_metrics() {
+        let font = load_font().unwrap();
+        let size = 24.0;
+
+        let (hm, _) = font.rasterize('H', size);
+        let (pm, _) = font.rasterize('p', size);
+
+        // H has ymin=0, p has negative ymin (descender extends below baseline)
+        assert!(pm.bounds.ymin < 0.0, "p should have negative ymin");
+        assert!(hm.bounds.ymin >= 0.0, "H should have ymin >= 0");
+
+        // With baseline + ymin positioning, descenders push glyphs upward
+        let baseline = 100.0;
+        let h_top = baseline + hm.bounds.ymin;
+        let p_top = baseline + pm.bounds.ymin;
+        assert!(
+            p_top < h_top,
+            "p top ({p_top}) should be above H top ({h_top}) — descender pulls glyph up"
+        );
+
+        // Verify horizontal_line_metrics gives reasonable spacing
+        let hl = font.horizontal_line_metrics(size).unwrap();
+        assert!(
+            hl.new_line_size > size * 0.8,
+            "line height should be close to font size"
+        );
+        assert!(
+            hl.new_line_size < size * 2.0,
+            "line height should not be double font size"
+        );
     }
 }
