@@ -42,6 +42,13 @@ FONT_URL := https://github.com/dejavu-fonts/dejavu-fonts/releases/download/versi
 FONT_SHA256 := 7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a
 FONT_ZIP := $(FONT_DIR)/fonts.zip
 
+# Debian/Ubuntu ship sha256sum; macOS ships shasum instead.
+ifneq ($(shell command -v sha256sum 2>/dev/null),)
+SHA256_CHECK := sha256sum -c -
+else
+SHA256_CHECK := shasum -a 256 -c -
+endif
+
 # Use podman by default, override with: make CONTAINER=docker
 CONTAINER := $(shell which podman 2>/dev/null || which docker 2>/dev/null)
 CONTAINER_IMAGE := photo-frame-c-build
@@ -61,7 +68,7 @@ $(FONT_FILE): $(FONT_ZIP)
 $(FONT_ZIP):
 	@mkdir -p $(FONT_DIR)
 	curl -fsSL -o $@ $(FONT_URL)
-	@echo "$(FONT_SHA256)  $@" | shasum -a 256 -c - > /dev/null 2>&1 || { echo "ERROR: Font download hash mismatch. Expected $(FONT_SHA256)"; rm -f $@; exit 1; }
+	@echo "$(FONT_SHA256)  $@" | $(SHA256_CHECK) > /dev/null 2>&1 || { echo "ERROR: Font download hash mismatch. Expected $(FONT_SHA256)"; rm -f $@; exit 1; }
 
 c:
 	$(MAKE) -C c
@@ -112,7 +119,9 @@ setup-debian:
 		libdrm-dev \
 		libegl1-mesa-dev \
 		libgbm-dev \
-		pkg-config
+		libssl-dev \
+		pkg-config \
+		unzip
 
 setup-cargo:
 	cargo install cargo-deb
