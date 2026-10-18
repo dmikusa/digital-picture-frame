@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -43,6 +43,22 @@ fn has_imagemagick() -> bool {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+}
+
+/// The original import's file stem, e.g. "photo2.jpeg" -> "photo2".
+fn original_stem(original_name: &str) -> String {
+    Path::new(original_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| original_name.to_string())
+}
+
+/// The suffix expected on a stored path: the original stem with a .jpg extension.
+///
+/// Imports are always re-encoded to JPEG, so the stored file is named
+/// `{seq}_{stem}.jpg` regardless of the source extension.
+fn normalized_stored_name(original_name: &str) -> String {
+    format!("{}.jpg", original_stem(original_name))
 }
 
 fn make_config(photos_dir: PathBuf, socket_path: PathBuf) -> Config {
@@ -321,7 +337,15 @@ fn test_import_pipeline() {
         "Unexpected original name: {}",
         rec1.original_name
     );
-    assert!(rec1.path.ends_with(&rec1.original_name));
+    // Imports are always stored as JPEG, so the stored path keeps the original
+    // file stem but normalizes the extension to .jpg.
+    assert!(
+        rec1.path
+            .ends_with(&normalized_stored_name(&rec1.original_name)),
+        "Stored path '{}' should end with '{}.jpg'",
+        rec1.path,
+        original_stem(&rec1.original_name)
+    );
 
     let rec2 = reader.next_record().unwrap().expect("second record");
     assert!(
@@ -329,7 +353,13 @@ fn test_import_pipeline() {
         "Unexpected original name: {}",
         rec2.original_name
     );
-    assert!(rec2.path.ends_with(&rec2.original_name));
+    assert!(
+        rec2.path
+            .ends_with(&normalized_stored_name(&rec2.original_name)),
+        "Stored path '{}' should end with '{}.jpg'",
+        rec2.path,
+        original_stem(&rec2.original_name)
+    );
     assert_ne!(rec1.original_name, rec2.original_name);
 
     assert!(reader.next_record().unwrap().is_none());
