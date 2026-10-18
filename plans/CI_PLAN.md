@@ -142,8 +142,11 @@ The `postinst` also:
 # Required: directory where photos are stored and imported. Must exist.
 photos_dir = "/var/lib/photo-frame/photos"
 
-# Required: path to the Unix domain socket for the C display app.
-socket_path = "/run/photo-frame/photo-frame.sock"
+# Required: socket the display app creates for image paths (IMG).
+display_socket_path = "/run/photo-frame/photo-frame.sock"
+
+# Optional: socket the display app creates for control commands. Default shown.
+control_socket_path = "/run/photo-frame/control.sock"
 
 # Required: display resolution in "WxH" format. Used for import resizing.
 native_resolution = "1920x1080"

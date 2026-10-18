@@ -32,6 +32,10 @@ fn default_check_interval() -> u64 {
     86_400 // 24 hours
 }
 
+fn default_control_socket_path() -> PathBuf {
+    PathBuf::from("/run/photo-frame/control.sock")
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemoteSourceConfig {
     #[serde(rename = "type")]
@@ -46,7 +50,17 @@ pub struct RemoteSourceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub photos_dir: PathBuf,
-    pub socket_path: PathBuf,
+    /// Socket the display app creates to receive image paths (`IMG`), which the
+    /// manager connects to. The display app reads the same path from
+    /// `DISPLAY_SOCKET_PATH`. Accepts the legacy `socket_path` key for
+    /// compatibility with existing config files.
+    #[serde(alias = "socket_path")]
+    pub display_socket_path: PathBuf,
+    /// Socket the display app creates for control commands (`CLR`/`SHOW`/`RESUME`),
+    /// used by config mode. The display app reads the same path from
+    /// `CONTROL_SOCKET_PATH`.
+    #[serde(default = "default_control_socket_path")]
+    pub control_socket_path: PathBuf,
     pub native_resolution: String,
     #[serde(default)]
     pub aspect_ratio_mode: AspectRatioMode,
@@ -139,9 +153,10 @@ impl fmt::Display for Config {
         let (w, h) = self.resolution();
         write!(
             f,
-            "Config {{ photos_dir: {}, socket_path: {}, resolution: {}x{}, aspect_ratio_mode: {:?}, batch_delete_size: {}, log_max_size: {}, log_max_files: {}, remote_sources: {} }}",
+            "Config {{ photos_dir: {}, display_socket_path: {}, control_socket_path: {}, resolution: {}x{}, aspect_ratio_mode: {:?}, batch_delete_size: {}, log_max_size: {}, log_max_files: {}, remote_sources: {} }}",
             self.photos_dir.display(),
-            self.socket_path.display(),
+            self.display_socket_path.display(),
+            self.control_socket_path.display(),
             w,
             h,
             self.aspect_ratio_mode,
@@ -162,7 +177,8 @@ mod tests {
     fn test_parse_valid_config() {
         let toml_str = r#"
 photos_dir = "/tmp/photos"
-socket_path = "/run/photo-frame/photo-frame.sock"
+display_socket_path = "/run/photo-frame/photo-frame.sock"
+control_socket_path = "/run/photo-frame/control.sock"
 native_resolution = "1920x1080"
 aspect_ratio_mode = "fit"
 batch_delete_size = 10
@@ -172,8 +188,12 @@ log_max_files = 3
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.photos_dir, PathBuf::from("/tmp/photos"));
         assert_eq!(
-            config.socket_path,
+            config.display_socket_path,
             PathBuf::from("/run/photo-frame/photo-frame.sock")
+        );
+        assert_eq!(
+            config.control_socket_path,
+            PathBuf::from("/run/photo-frame/control.sock")
         );
         assert_eq!(config.native_resolution, "1920x1080");
         assert_eq!(config.aspect_ratio_mode, AspectRatioMode::Fit);
@@ -184,12 +204,21 @@ log_max_files = 3
 
     #[test]
     fn test_parse_defaults() {
+        // Uses the legacy `socket_path` key; `control_socket_path` is optional.
         let toml_str = r#"
 photos_dir = "/tmp/photos"
 socket_path = "/run/photo-frame/photo-frame.sock"
 native_resolution = "800x600"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.display_socket_path,
+            PathBuf::from("/run/photo-frame/photo-frame.sock")
+        );
+        assert_eq!(
+            config.control_socket_path,
+            PathBuf::from("/run/photo-frame/control.sock")
+        );
         assert_eq!(config.aspect_ratio_mode, AspectRatioMode::Fit);
         assert_eq!(config.batch_delete_size, 20);
         assert_eq!(config.log_max_size, 262_144);
@@ -200,7 +229,7 @@ native_resolution = "800x600"
     fn test_validate_resolution() {
         let toml_str = r#"
 photos_dir = "/tmp"
-socket_path = "/tmp/sock"
+display_socket_path = "/tmp/sock"
 native_resolution = "abcxdef"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -220,5 +249,11 @@ native_resolution = "1024x768"
         assert!(config.is_ok());
         let config = config.unwrap();
         assert_eq!(config.resolution(), (1024, 768));
+        // The legacy `socket_path` key still maps to display_socket_path.
+        assert_eq!(config.display_socket_path, PathBuf::from("/tmp/sock"));
+        assert_eq!(
+            config.control_socket_path,
+            PathBuf::from("/run/photo-frame/control.sock")
+        );
     }
 }

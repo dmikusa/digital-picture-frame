@@ -8,10 +8,12 @@ Type=simple
 ExecStart=/usr/bin/photo-frame-manager /etc/photo-frame/config.toml
 Restart=on-failure
 User=photo-frame
-RuntimeDirectory=photo-frame
+# NOTE: /run/photo-frame is created and owned by photo-frame-display.service.
+# Do not add RuntimeDirectory= here: systemd removes a RuntimeDirectory when its
+# unit stops, and sharing the path means restarting this service would delete the
+# display app's socket files out from under it.
 StandardOutput=null
 StandardError=null
-RuntimeDirectoryMode=0700
 UMask=0077
 
 [Install]

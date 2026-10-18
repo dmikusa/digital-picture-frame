@@ -37,7 +37,8 @@ A Rust binary (`photo-frame-manager`) that runs on a Raspberry Pi Zero W2 under 
 - TOML config file, path passed as command-line argument.
 - Fields:
   - `photos_dir`: path to photo storage
-  - `socket_path`: Unix domain socket for display app
+  - `display_socket_path`: Unix domain socket the display app creates for `IMG` commands (legacy alias: `socket_path`)
+  - `control_socket_path`: Unix domain socket the display app creates for `CLR`/`SHOW`/`RESUME` control commands. Default: `/run/photo-frame/control.sock`.
   - `native_resolution`: e.g., `"1920x1080"`
   - `aspect_ratio_mode`: `"fit"` (letterbox/pillarbox) or `"fill"` (crop to center). Default: `"fit"`.
   - `batch_delete_size`: number of photos to delete per rotation cycle. Default: 20.

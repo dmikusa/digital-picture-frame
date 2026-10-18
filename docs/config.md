@@ -10,12 +10,20 @@ The manager reads `config.toml` at startup. All paths are resolved to absolute p
 # Example: "/var/lib/photo-frame/photos"
 photos_dir = "/var/lib/photo-frame/photos"
 
-# Required: path to the Unix domain socket used to communicate with the C display app.
-# The C display app creates the socket. The directory should be owned by the service user
-# with mode 0700 so only the service can connect (e.g., /run/photo-frame/ with systemd
-# RuntimeDirectoryMode=0700). Both apps must run as the same user.
+# Required: Unix socket the display app creates to receive image paths (IMG).
+# The manager connects here to send photos to the screen. The display app reads
+# the same path from DISPLAY_SOCKET_PATH in display.env, so the two must match.
+# The directory should be owned by the service user with mode 0700 so only the
+# service can connect (the display service sets RuntimeDirectoryMode=0700).
 # Example: "/run/photo-frame/photo-frame.sock"
-socket_path = "/run/photo-frame/photo-frame.sock"
+display_socket_path = "/run/photo-frame/photo-frame.sock"
+
+# Optional: Unix socket the display app creates for control commands
+# (CLR/SHOW/RESUME). The manager uses it in config mode to show the setup QR
+# screen. The display app reads the same path from CONTROL_SOCKET_PATH in
+# display.env, so the two must match.
+# Default: "/run/photo-frame/control.sock"
+control_socket_path = "/run/photo-frame/control.sock"
 
 # Required: native resolution of the display in "WxH" format.
 # Used by the import thread to resize photos via ImageMagick.
@@ -50,7 +58,8 @@ log_max_files = 2
 | Field | Required | Default | Acceptable values |
 |-------|----------|---------|-------------------|
 | `photos_dir` | Yes | — | Any valid absolute or relative path to an existing directory |
-| `socket_path` | Yes | — | Any valid absolute or relative path |
+| `display_socket_path` | Yes | — | Any valid absolute or relative path. Legacy alias: `socket_path` |
+| `control_socket_path` | No | `"/run/photo-frame/control.sock"` | Any valid absolute or relative path |
 | `native_resolution` | Yes | — | `"WxH"` where W and H are positive integers (e.g., `"1920x1080"`) |
 | `aspect_ratio_mode` | No | `"fit"` | `"fit"` or `"fill"` |
 | `batch_delete_size` | No | `20` | Any positive integer (> 0) |
@@ -59,12 +68,16 @@ log_max_files = 2
 
 ## Display app environment variables
 
-The C display app reads these environment variables at startup. They are **not** in `config.toml`.
+The C display app reads these environment variables at startup. The two socket
+paths are shared with the manager and must match the corresponding
+`config.toml` values; the fade/skip settings are display-only.
 
 | Variable | Default | Description | Acceptable values |
 |----------|---------|-------------|-------------------|
 | `PHOTO_FRAME_FADE_DURATION` | `1.5` | Fade duration between photos in seconds. `0` = instant cut (no fade). | Any non-negative float (e.g., `0`, `1.5`, `3`) |
 | `PHOTO_FRAME_SKIP_FRAMES` | `0` | Skip frames during fade to reduce CPU load. `0` = render every frame, `1` = render every 2nd frame, etc. | Any non-negative integer |
+| `DISPLAY_SOCKET_PATH` | `/run/photo-frame/photo-frame.sock` | Socket to listen on for image paths (`IMG`). Must match `display_socket_path`. | Any valid absolute path |
+| `CONTROL_SOCKET_PATH` | `/run/photo-frame/control.sock` | Socket to listen on for control commands (`CLR`/`SHOW`/`RESUME`). Must match `control_socket_path`. | Any valid absolute path |
 
 ```bash
 # Example: 2-second fade, skip every other frame during fade

@@ -98,9 +98,23 @@ sudo systemctl restart photo-frame-display
 
 ### Security
 
-Both services run as the `photo-frame` user. The systemd units use `RuntimeDirectory=photo-frame` with `RuntimeDirectoryMode=0700` and `UMask=0077`, so the `/run/photo-frame/` directory and the Unix socket inside it are only accessible to the owner. The C display app also sets `umask(077)` before `bind()` as defense in depth.
+Both services run as the `photo-frame` user. The **display** service owns
+`/run/photo-frame/` via `RuntimeDirectory=photo-frame` with
+`RuntimeDirectoryMode=0700`, so the directory and the sockets inside it are only
+accessible to the owner. The C display app also sets `umask(077)` before `bind()`
+as defense in depth.
 
-If you change the socket path via config, ensure the directory is restricted to the service user (e.g., `chmod 700 /run/my-socket-dir`). Both services must run as the same user for the manager to connect to the display socket.
+The manager service deliberately does **not** declare `RuntimeDirectory`. systemd
+removes a `RuntimeDirectory` when its owning unit stops, and because the two
+services share this path, restarting the manager would otherwise delete the
+display app's socket files while it keeps running. Only the display service owns
+the directory.
+
+If you change either socket path, update both `display_socket_path` /
+`control_socket_path` in `config.toml` and `DISPLAY_SOCKET_PATH` /
+`CONTROL_SOCKET_PATH` in `display.env` so the two apps agree. Ensure the
+directory is restricted to the service user (e.g., `chmod 700 /run/my-socket-dir`).
+Both services must run as the same user for the manager to connect.
 
 ### Configuration
 
