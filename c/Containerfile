@@ -1,7 +1,7 @@
 # Container image for building and linting the C display app.
 # Works with Podman or Docker.
 
-FROM debian:11-slim
+FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
