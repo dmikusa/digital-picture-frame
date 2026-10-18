@@ -236,29 +236,35 @@ pub fn import_from_directory(
     // Resolve to an absolute path so downstream syscalls are not affected
     // by the process's current working directory.
     let abs_dir = dir.canonicalize()?;
-    let images = find_images(&abs_dir);
+    let scan = scan_images(&abs_dir);
     log::info!(
-        "Found {} image file(s) under {}",
-        images.len(),
-        abs_dir.display()
+        "Found {} image file(s) under {} ({} skipped: not images or OS metadata)",
+        scan.images.len(),
+        abs_dir.display(),
+        scan.skipped
     );
+    let skipped = scan.skipped;
     let mut imported = 0;
-    let mut skipped = 0;
+    let mut duplicates = 0;
+    let mut failed = 0;
 
-    for photo_path in images {
+    for photo_path in scan.images {
         match import_single_photo(&photo_path, photos_dir, index_dir, dedup_set, config) {
             Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
+            Ok(false) => duplicates += 1,
             Err(e) => {
+                failed += 1;
                 log::warn!("Failed to import {}: {}", photo_path.display(), e);
             }
         }
     }
 
     log::info!(
-        "Import summary from {}: {} imported, {} skipped (duplicates)",
+        "Import summary from {}: {} imported, {} duplicates, {} failed, {} skipped (non-images)",
         abs_dir.display(),
         imported,
+        duplicates,
+        failed,
         skipped
     );
     Ok(())
@@ -286,14 +292,26 @@ fn is_ignored_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("System Volume Information")
 }
 
-/// Find all image files under a directory, recursively.
-fn find_images(dir: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
+/// Result of scanning a directory tree for importable images.
+struct ScanResult {
+    /// Image files that will be imported.
+    images: Vec<PathBuf>,
+    /// Entries that were skipped: OS metadata and files that are not images.
+    skipped: usize,
+}
+
+/// Find all image files under a directory, recursively, along with a count of
+/// the entries that were skipped.
+fn scan_images(dir: &Path) -> ScanResult {
+    let mut result = ScanResult {
+        images: Vec::new(),
+        skipped: 0,
+    };
     collect_images(dir, &mut result);
     result
 }
 
-fn collect_images(dir: &Path, result: &mut Vec<PathBuf>) {
+fn collect_images(dir: &Path, result: &mut ScanResult) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -317,6 +335,7 @@ fn collect_images(dir: &Path, result: &mut Vec<PathBuf>) {
         // Skip OS metadata: macOS AppleDouble sidecars (`._IMG_1234.jpeg`), and
         // hidden/system directories (`.fseventsd`, `.Trashes`, ...).
         if is_ignored_name(&entry.file_name().to_string_lossy()) {
+            result.skipped += 1;
             continue;
         }
 
@@ -325,8 +344,13 @@ fn collect_images(dir: &Path, result: &mut Vec<PathBuf>) {
         } else if let Some(ext) = path.extension() {
             let ext = ext.to_string_lossy().to_lowercase();
             if IMAGE_EXTENSIONS.contains(&ext.as_ref()) {
-                result.push(path);
+                result.images.push(path);
+            } else {
+                result.skipped += 1;
             }
+        } else {
+            // A file with no extension.
+            result.skipped += 1;
         }
     }
 }
@@ -537,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_images() {
+    fn test_scan_images() {
         let tmpdir = tempfile::tempdir().unwrap();
         File::create(tmpdir.path().join("photo1.jpg")).unwrap();
         File::create(tmpdir.path().join("photo2.JPEG")).unwrap();
@@ -563,15 +587,18 @@ mod tests {
             File::create(dir.join("junk.jpg")).unwrap();
         }
 
-        let images = find_images(tmpdir.path());
-        assert_eq!(images.len(), 5);
+        let scan = scan_images(tmpdir.path());
+        assert_eq!(scan.images.len(), 5);
         assert!(
-            images.iter().all(|p| {
+            scan.images.iter().all(|p| {
                 let name = p.file_name().unwrap().to_string_lossy();
                 !is_ignored_name(&name)
             }),
-            "OS metadata files should be skipped: {images:?}"
+            "OS metadata files should be skipped: {:?}",
+            scan.images
         );
+        // notaphoto.txt, ._photo5.jpeg, .DS_Store, and the four ignored dirs.
+        assert_eq!(scan.skipped, 7);
     }
 
     #[test]
