@@ -21,7 +21,8 @@ Needs: `gcc`, `libdrm-dev`, `libegl1-mesa-dev`, `libgbm-dev`
 
 ## Rust manager app requirements
 
-Needs: `rustup` & stable Rust toolchain. Also needs `unzip` for font extraction.
+Needs: `rustup` & stable Rust toolchain. Also needs `libssl-dev` and `pkg-config` to
+build the `native-tls` backend used for HTTP requests, plus `unzip` for font extraction.
 
 Before building, download the embedded font:
 

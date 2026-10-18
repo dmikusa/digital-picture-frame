@@ -30,7 +30,7 @@ jobs:
             arch: arm64
 
     runs-on: ${{ matrix.runner }}
-    container: debian:11-slim
+    container: ubuntu:22.04
 
     steps:
       - name: Install system dependencies
@@ -44,11 +44,16 @@ jobs:
             libdrm-dev \
             libegl1-mesa-dev \
             libgbm-dev \
-            pkg-config
+            libssl-dev \
+            pkg-config \
+            unzip
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Download font
+        run: make font
 
       - name: Compute version
         id: version

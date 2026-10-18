@@ -8,20 +8,28 @@ systemd.
 
 ## Build Environment
 
-We run the entire build inside a `debian:11-slim` Docker container on GitHub Actions.
-This pins the build environment to glibc 2.31, the oldest glibc in our target matrix,
+We run the entire build inside an `ubuntu:22.04` Docker container on GitHub Actions.
+This pins the build environment to glibc 2.35 and system OpenSSL 3 (`libssl3`),
 ensuring forward compatibility with:
 
-- Debian 11+ (bullseye)
-- Debian 12 (bookworm)
 - Ubuntu 22.04+ (Jammy)
+- Debian 12+ (bookworm)
+- Debian 13 (trixie)
 - Raspberry Pi OS (bookworm-based)
 - DietPi (bookworm-based)
 
+Debian 11 (bullseye, glibc 2.31) is no longer targeted: it reached end of life and its
+`deb.debian.org` packages are gone, and it ships OpenSSL 1.1 (`libssl1.1`). Building for
+it required dynamically linking `libssl1.1`, which does not exist on any current target.
+Ubuntu 22.04 is still in standard support (until May 2027, ESM until May 2032) and gives
+a glibc 2.35 / `libssl3` baseline that also runs on Debian 12/13 and Pi OS/DietPi
+bookworm+. The C test container (`c/Containerfile`) is separate and builds on Debian 12
+because it only runs tests and produces no distributable artifacts.
+
 | Runner | Container | Target Arch |
 |--------|-----------|-------------|
-| `ubuntu-22.04` | `debian:11-slim` | amd64 |
-| `ubuntu-22.04-arm` | `debian:11-slim` | arm64 |
+| `ubuntu-22.04` | `ubuntu:22.04` | amd64 |
+| `ubuntu-22.04-arm` | `ubuntu:22.04` | arm64 |
 
 Both runners do a **native** build (no cross-compilation), avoiding linker and toolchain
 complexity.
@@ -58,13 +66,14 @@ Runs on `ubuntu-latest` (amd64 only — sufficient for Rust tests).
 
 **Steps per job:**
 1. Install system deps: `build-essential`, `pkg-config`, `libdrm-dev`,
-   `libegl1-mesa-dev`, `libgbm-dev`, `curl`, `git`
+   `libegl1-mesa-dev`, `libgbm-dev`, `libssl-dev`, `curl`, `git`, `unzip`
 2. Install Rust via rustup (stable toolchain)
-3. Build C display app: `make c`
-4. Build Rust manager: `cargo build --release --locked`
-5. Install `cargo-deb`
-6. Build `.deb`: `cargo deb --deb-version $FULL_VERSION`
-7. Upload `.deb` as artifact
+3. Download the embedded font: `make font`
+4. Build C display app: `make c`
+5. Build Rust manager: `cargo build --release --locked`
+6. Install `cargo-deb`
+7. Build `.deb`: `cargo deb --deb-version $FULL_VERSION`
+8. Upload `.deb` as artifact
 
 **Release job (depends on both matrix jobs):**
 1. Download both `.deb` artifacts
