@@ -37,10 +37,10 @@
 #   make setup-cargo       - install required cargo plugins (cargo-deb)
 
 FONT_DIR := fonts
-FONT_FILE := $(FONT_DIR)/DejaVuSans.ttf
-FONT_URL := https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-sans-ttf-2.37.zip
-FONT_SHA256 := 5c6e497a2f36552cb5ffb112c413a6af39c0f3c47653662b90b4fa6499822fd7
-FONT_ZIP := $(FONT_DIR)/dejavu-sans.zip
+FONT_FILE := $(FONT_DIR)/DejaVuSansMono.ttf
+FONT_URL := https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip
+FONT_SHA256 := 7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a
+FONT_ZIP := $(FONT_DIR)/fonts.zip
 
 # Use podman by default, override with: make CONTAINER=docker
 CONTAINER := $(shell which podman 2>/dev/null || which docker 2>/dev/null)
@@ -54,12 +54,14 @@ font: $(FONT_FILE)
 
 $(FONT_FILE): $(FONT_ZIP)
 	@mkdir -p $(FONT_DIR)
-	unzip -p $< "dejavu-sans-ttf-2.37/ttf/DejaVuSans.ttf" > $@
+	@rm -f $@
+	unzip -p $< "dejavu-fonts-ttf-2.37/ttf/DejaVuSansMono.ttf" > $@.tmp && mv $@.tmp $@
+	@head -c4 $@ | od -An -tx1 | grep -q '00 01 00 00' || { echo "ERROR: Extracted font has invalid TTF magic bytes"; rm -f $@; exit 1; }
 
 $(FONT_ZIP):
 	@mkdir -p $(FONT_DIR)
 	curl -fsSL -o $@ $(FONT_URL)
-	@echo "$(FONT_SHA256)  $@" | shasum -a 256 -c - > /dev/null 2>&1 || { echo "ERROR: Font download hash mismatch. Expected $(FONT_SHA256)"; exit 1; }
+	@echo "$(FONT_SHA256)  $@" | shasum -a 256 -c - > /dev/null 2>&1 || { echo "ERROR: Font download hash mismatch. Expected $(FONT_SHA256)"; rm -f $@; exit 1; }
 
 c:
 	$(MAKE) -C c
@@ -67,7 +69,7 @@ c:
 rust: font
 	cargo build --release
 
-deb: font
+deb: font c
 	cargo deb
 
 test: test-rust test-c
@@ -86,6 +88,7 @@ build-c-container:
 clean:
 	$(MAKE) -C c clean
 	cargo clean
+	rm -rf $(FONT_DIR)
 	-$(CONTAINER) rmi $(CONTAINER_IMAGE) 2>/dev/null || true
 
 install: all

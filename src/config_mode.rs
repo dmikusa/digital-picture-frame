@@ -36,7 +36,7 @@ enum ConfigState {
     /// USB insert detected; waiting for import threads to complete.
     Importing { pending: HashSet<PathBuf> },
     /// Showing config-QR on screen, admin server running (Phase 7).
-    ConfigMode { entered: Instant, password: String },
+    ConfigMode { entered: Instant },
 }
 
 /// Owns the config-mode state machine.  Communicates with the USB-watcher via
@@ -93,10 +93,9 @@ impl ConfigEnvironment {
 
         self.server = Some(server);
 
-        log::info!("Config mode active: http://{admin_host}  password={password}");
+        log::info!("Config mode active: http://{admin_host}");
         self.state = ConfigState::ConfigMode {
             entered: Instant::now(),
-            password,
         };
 
         Ok(())
