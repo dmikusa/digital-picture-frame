@@ -18,7 +18,7 @@ use crate::config::{AspectRatioMode, Config};
 use crate::index::{self, IndexWriter};
 use crc32fast::Hasher;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
@@ -63,7 +63,10 @@ pub fn watch_usb_mounts(
 
     log::info!("Watching /media for USB mounts");
 
-    let mut active_mounts: HashSet<PathBuf> = HashSet::new();
+    // Mount points we have already started an import for, and when we first saw
+    // them. The timestamp distinguishes a mount that is still settling from one
+    // that has gone away.
+    let mut active_mounts: HashMap<PathBuf, Instant> = HashMap::new();
 
     // Import drives that are already mounted at startup. Attaching a filesystem
     // over an existing directory does not emit a Create event, so without this a
@@ -77,18 +80,36 @@ pub fn watch_usb_mounts(
         &event_tx,
     );
 
+    // Reconcile periodically. A manual `mount`/`umount`, or a re-mount over an
+    // existing mountpoint directory, does not emit an inotify event under
+    // /media, so polling is the only reliable way to notice it.
+    const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+    let mut last_sweep = Instant::now();
+
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             log::info!("USB watcher shutting down");
             break;
         }
 
+        if last_sweep.elapsed() >= SWEEP_INTERVAL {
+            sweep_mounts(
+                &mut active_mounts,
+                &photos_dir,
+                &index_dir,
+                &dedup_set,
+                &config,
+                &event_tx,
+            );
+            last_sweep = Instant::now();
+        }
+
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => match event.kind {
                 notify::EventKind::Create(notify::event::CreateKind::Folder) => {
                     for path in event.paths {
-                        if path.is_dir() && !active_mounts.contains(&path) {
-                            active_mounts.insert(path.clone());
+                        if path.is_dir() && !active_mounts.contains_key(&path) {
+                            active_mounts.insert(path.clone(), Instant::now());
                             spawn_import(
                                 path,
                                 photos_dir.clone(),
@@ -124,17 +145,34 @@ pub fn watch_usb_mounts(
     Ok(())
 }
 
-/// Scan `/media` for mount points that have not been imported yet and start an
-/// import for each. Covers drives that are already mounted when the watcher
-/// starts.
+/// Reconcile `active_mounts` with what is actually mounted under `/media`:
+/// forget mounts that have gone away and start imports for new ones. Covers
+/// drives already mounted at startup, manual `mount`/`umount`, and re-mounts
+/// over an existing mountpoint directory (none of which emit a Create event).
 fn sweep_mounts(
-    active_mounts: &mut HashSet<PathBuf>,
+    active_mounts: &mut HashMap<PathBuf, Instant>,
     photos_dir: &Path,
     index_dir: &Path,
     dedup_set: &Arc<Mutex<HashSet<u64>>>,
     config: &Config,
     event_tx: &Option<mpsc::Sender<MountEvent>>,
 ) {
+    // Forget mounts that are no longer present. Ignore paths seen very recently
+    // so we don't race a mount that is still being attached.
+    const STALE_AFTER: Duration = Duration::from_secs(8);
+    let stale: Vec<PathBuf> = active_mounts
+        .iter()
+        .filter(|(path, since)| since.elapsed() >= STALE_AFTER && !is_mount_point(path))
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in stale {
+        active_mounts.remove(&path);
+        log::info!("USB unmounted: {}", path.display());
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(MountEvent::Removed(path));
+        }
+    }
+
     let entries = match fs::read_dir("/media") {
         Ok(entries) => entries,
         Err(e) => {
@@ -145,8 +183,8 @@ fn sweep_mounts(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() && is_mount_point(&path) && !active_mounts.contains(&path) {
-            active_mounts.insert(path.clone());
+        if path.is_dir() && is_mount_point(&path) && !active_mounts.contains_key(&path) {
+            active_mounts.insert(path.clone(), Instant::now());
             spawn_import(
                 path,
                 photos_dir.to_path_buf(),
