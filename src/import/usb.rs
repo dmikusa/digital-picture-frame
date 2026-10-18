@@ -324,11 +324,18 @@ fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime) -> Pat
         .as_secs();
     let seq_str = format!("{:05}", seq % 100000);
 
-    photos_dir
+    let mut dest = photos_dir
         .join(year)
         .join(month)
         .join(day)
-        .join(format!("{}_{}", seq_str, original_name))
+        .join(format!("{}_{}", seq_str, original_name));
+
+    // ImageMagick picks the output format from the destination extension, so a
+    // HEIC/HEIF source would otherwise be re-encoded as HEIC. The display app's
+    // stb_image decoder cannot read HEIC, so normalize every import to JPEG. The
+    // original filename (extension included) is kept separately in the index.
+    dest.set_extension("jpg");
+    dest
 }
 
 /// Convert an image using ImageMagick.
@@ -431,5 +438,34 @@ mod tests {
         let dest_str = dest.to_string_lossy();
         assert!(dest_str.contains("/photos/2021/01/01/"));
         assert!(dest_str.contains("myphoto.jpg"));
+    }
+
+    #[test]
+    fn test_build_dest_path_normalizes_to_jpg() {
+        let photos_dir = PathBuf::from("/photos");
+        let mtime = UNIX_EPOCH + Duration::from_secs(1609459200); // 2021-01-01
+
+        for src in [
+            "/usb/photo.HEIC",
+            "/usb/photo.heif",
+            "/usb/photo.png",
+            "/usb/photo",
+        ] {
+            let dest = build_dest_path(Path::new(src), &photos_dir, mtime);
+            assert_eq!(
+                dest.extension().and_then(|ext| ext.to_str()),
+                Some("jpg"),
+                "source {src} should convert to JPEG, got {}",
+                dest.display()
+            );
+            assert!(
+                dest.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("photo"),
+                "source {src} should keep its name, got {}",
+                dest.display()
+            );
+        }
     }
 }
