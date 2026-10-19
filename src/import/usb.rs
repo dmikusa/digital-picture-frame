@@ -28,6 +28,24 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Serializes photo imports across the whole process. USB mounts spawn import
+/// threads while the remote sync scheduler imports on its own thread; both
+/// mutate the same index and dedup set. `IndexWriter` captures metadata when it
+/// is opened and `sync_metadata` renames the file based on that snapshot, so two
+/// concurrent imports can rename over each other and lose entries. The
+/// check-then-insert on the dedup set is racy for the same reason.
+static IMPORT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the process-wide import lock.
+///
+/// A panic in an earlier import must not wedge imports forever, so a poisoned
+/// lock is recovered instead of propagating the panic.
+fn lock_imports() -> std::sync::MutexGuard<'static, ()> {
+    IMPORT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Events emitted by the USB watcher for the config mode state machine.
 #[derive(Debug, Clone)]
 pub enum MountEvent {
@@ -401,6 +419,11 @@ pub(crate) fn import_single_photo(
     dedup_set: &Arc<Mutex<HashSet<u64>>>,
     config: &Config,
 ) -> io::Result<bool> {
+    // Hold the import lock for the whole operation: dedup check, conversion,
+    // rotation, index append, and dedup insert. Scanning happens before this is
+    // called, so the lock is only held per photo.
+    let _import_guard = lock_imports();
+
     // Compute hash
     let hash = compute_file_hash(src_path)?;
 
