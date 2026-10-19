@@ -436,11 +436,14 @@ pub(crate) fn import_single_photo(
         }
     }
 
-    // Determine destination path based on file mtime
+    // Determine destination path based on file mtime. The sequence number is the
+    // CSV line index this photo will occupy, so same-named photos imported close
+    // together cannot overwrite each other.
     let mtime = fs::metadata(src_path)?
         .modified()
         .unwrap_or(SystemTime::now());
-    let dest_path = build_dest_path(src_path, photos_dir, mtime);
+    let (_index_path, meta) = index::init_index(index_dir)?;
+    let dest_path = build_dest_path(src_path, photos_dir, mtime, meta.total_lines());
 
     // Ensure parent directory exists
     if let Some(parent) = dest_path.parent() {
@@ -464,6 +467,9 @@ pub(crate) fn import_single_photo(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    // Re-read the index metadata before opening the writer: rotation deletes
+    // photos and renames the index (changing `start_line`), so the snapshot taken
+    // before the conversion may be stale even though `total_lines` is stable.
     let (_index_path, meta) = index::init_index(index_dir)?;
     let mut writer = IndexWriter::open(index_dir, meta)?;
     let line_number = writer.append(&dest_path.to_string_lossy(), &original_name, hash)?;
@@ -502,7 +508,9 @@ fn compute_file_hash(path: &Path) -> io::Result<u64> {
 }
 
 /// Build the destination path: photos_dir/YYYY/MM/DD/DDDDD_original_name.jpg
-fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime) -> PathBuf {
+///
+/// `seq` is the CSV line index the photo will be appended at.
+fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime, seq: usize) -> PathBuf {
     let duration = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
     let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
         .unwrap_or_else(chrono::Utc::now);
@@ -517,19 +525,11 @@ fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime) -> Pat
         .to_string_lossy()
         .to_string();
 
-    // For now, use a timestamp-based sequence number since we don't know the CSV line yet
-    // The actual sequence number will be assigned after CSV append
-    let seq = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let seq_str = format!("{:05}", seq % 100000);
-
     let mut dest = photos_dir
         .join(year)
         .join(month)
         .join(day)
-        .join(format!("{}_{}", seq_str, original_name));
+        .join(format!("{:05}_{}", seq, original_name));
 
     // ImageMagick picks the output format from the destination extension, so a
     // HEIC/HEIF source would otherwise be re-encoded as HEIC. The display app's
@@ -859,10 +859,54 @@ mod tests {
         let photos_dir = PathBuf::from("/photos");
         let src = PathBuf::from("/usb/myphoto.jpg");
         let mtime = UNIX_EPOCH + Duration::from_secs(1609459200); // 2021-01-01
-        let dest = build_dest_path(&src, &photos_dir, mtime);
+        let dest = build_dest_path(&src, &photos_dir, mtime, 42);
         let dest_str = dest.to_string_lossy();
         assert!(dest_str.contains("/photos/2021/01/01/"));
-        assert!(dest_str.contains("myphoto.jpg"));
+        assert_eq!(
+            dest.file_name().unwrap().to_string_lossy(),
+            "00042_myphoto.jpg",
+            "filename should use the zero-padded CSV line number"
+        );
+    }
+
+    #[test]
+    fn test_build_dest_path_pads_small_sequence_numbers() {
+        let photos_dir = PathBuf::from("/photos");
+        let src = PathBuf::from("/usb/myphoto.jpg");
+        let mtime = UNIX_EPOCH + Duration::from_secs(1609459200);
+
+        let dest = build_dest_path(&src, &photos_dir, mtime, 7);
+        assert_eq!(
+            dest.file_name().unwrap().to_string_lossy(),
+            "00007_myphoto.jpg"
+        );
+
+        // Numbers wider than five digits are not truncated.
+        let dest = build_dest_path(&src, &photos_dir, mtime, 123456);
+        assert_eq!(
+            dest.file_name().unwrap().to_string_lossy(),
+            "123456_myphoto.jpg"
+        );
+    }
+
+    #[test]
+    fn test_build_dest_path_same_name_different_sequence_does_not_collide() {
+        let photos_dir = PathBuf::from("/photos");
+        let src = PathBuf::from("/usb/IMG_0001.jpg");
+        let mtime = UNIX_EPOCH + Duration::from_secs(1609459200);
+
+        let first = build_dest_path(&src, &photos_dir, mtime, 10);
+        let second = build_dest_path(&src, &photos_dir, mtime, 11);
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.file_name().unwrap().to_string_lossy(),
+            "00010_IMG_0001.jpg"
+        );
+        assert_eq!(
+            second.file_name().unwrap().to_string_lossy(),
+            "00011_IMG_0001.jpg"
+        );
     }
 
     #[test]
@@ -876,7 +920,7 @@ mod tests {
             "/usb/photo.png",
             "/usb/photo",
         ] {
-            let dest = build_dest_path(Path::new(src), &photos_dir, mtime);
+            let dest = build_dest_path(Path::new(src), &photos_dir, mtime, 0);
             assert_eq!(
                 dest.extension().and_then(|ext| ext.to_str()),
                 Some("jpg"),

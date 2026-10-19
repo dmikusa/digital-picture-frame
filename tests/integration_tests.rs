@@ -61,6 +61,15 @@ fn normalized_stored_name(original_name: &str) -> String {
     format!("{}.jpg", original_stem(original_name))
 }
 
+/// Full stored-name suffix, including the zero-padded CSV line number.
+fn expected_stored_suffix(original_name: &str, line_number: usize) -> String {
+    format!(
+        "{:05}_{}",
+        line_number,
+        normalized_stored_name(original_name)
+    )
+}
+
 fn make_config(photos_dir: PathBuf, display_socket_path: PathBuf) -> Config {
     Config {
         photos_dir,
@@ -339,13 +348,16 @@ fn test_import_pipeline() {
         rec1.original_name
     );
     // Imports are always stored as JPEG, so the stored path keeps the original
-    // file stem but normalizes the extension to .jpg.
+    // file stem but normalizes the extension to .jpg. The sequence prefix is the
+    // CSV line number.
     assert!(
-        rec1.path
-            .ends_with(&normalized_stored_name(&rec1.original_name)),
-        "Stored path '{}' should end with '{}.jpg'",
+        rec1.path.ends_with(&expected_stored_suffix(
+            &rec1.original_name,
+            rec1.line_number
+        )),
+        "Stored path '{}' should end with '{}'",
         rec1.path,
-        original_stem(&rec1.original_name)
+        expected_stored_suffix(&rec1.original_name, rec1.line_number)
     );
 
     let rec2 = reader.next_record().unwrap().expect("second record");
@@ -355,11 +367,13 @@ fn test_import_pipeline() {
         rec2.original_name
     );
     assert!(
-        rec2.path
-            .ends_with(&normalized_stored_name(&rec2.original_name)),
-        "Stored path '{}' should end with '{}.jpg'",
+        rec2.path.ends_with(&expected_stored_suffix(
+            &rec2.original_name,
+            rec2.line_number
+        )),
+        "Stored path '{}' should end with '{}'",
         rec2.path,
-        original_stem(&rec2.original_name)
+        expected_stored_suffix(&rec2.original_name, rec2.line_number)
     );
     assert_ne!(rec1.original_name, rec2.original_name);
 
