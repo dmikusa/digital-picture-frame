@@ -447,31 +447,16 @@ pub(crate) fn import_single_photo(
         fs::create_dir_all(parent)?;
     }
 
-    // Convert and copy
+    // Convert and copy. If the photos partition is full, delete the oldest
+    // photos and retry until the conversion succeeds or there is nothing left
+    // to delete.
     let (width, height) = config.resolution();
     let mode = &config.aspect_ratio_mode;
-    match convert_image(src_path, &dest_path, width, height, mode) {
-        Ok(()) => {}
-        Err(e) => {
-            // If ENOSPC, try to free space and retry once
-            if e.kind() == io::ErrorKind::WriteZero {
-                log::warn!("Disk full, attempting rotation");
-                let (_index_path, meta) = index::init_index(index_dir)?;
-                let (_new_meta, deleted) =
-                    index::delete_oldest(index_dir, &meta, config.batch_delete_size)?;
-                log::info!("Deleted {} old photos to free space", deleted);
-                // Retry the conversion
-                if let Err(e2) = convert_image(src_path, &dest_path, width, height, mode) {
-                    return Err(io::Error::other(format!(
-                        "Conversion failed after rotation: {}",
-                        e2
-                    )));
-                }
-            } else {
-                return Err(e);
-            }
-        }
-    }
+    convert_with_rotation(
+        || convert_image(src_path, &dest_path, width, height, mode),
+        index_dir,
+        config.batch_delete_size,
+    )?;
 
     // Append to index
     let original_name = src_path
@@ -597,10 +582,79 @@ fn convert_image(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let lower = stderr.to_lowercase();
+        // ImageMagick reports write failures on stdout/stderr with a human
+        // readable errno string, not a Rust io::Error, so translate it here.
+        if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
+            log::warn!(
+                "ImageMagick could not write {}: {}",
+                dest.display(),
+                stderr.trim()
+            );
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
         return Err(io::Error::other(format!("ImageMagick failed: {}", stderr)));
     }
 
     Ok(())
+}
+
+/// True when an error means the photos partition is out of space.
+fn is_enospc(e: &io::Error) -> bool {
+    if e.raw_os_error() == Some(libc::ENOSPC) {
+        return true;
+    }
+
+    // Some failure paths only preserve the message (for example a shelled-out
+    // tool wrapped with `io::Error::other`), so check that too.
+    let message = e.to_string().to_lowercase();
+    message.contains("no space left on device") || message.contains("disk quota exceeded")
+}
+
+/// Run `convert`, rotating out the oldest photos whenever it fails with ENOSPC.
+///
+/// Returns the number of photos deleted. Rotation always makes progress or
+/// errors out, so this cannot loop forever: each pass consumes valid index
+/// entries, and we stop as soon as the index or the filesystem is empty.
+fn convert_with_rotation<F>(
+    mut convert: F,
+    index_dir: &Path,
+    batch_delete_size: usize,
+) -> io::Result<usize>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    let mut deleted_total = 0;
+
+    loop {
+        match convert() {
+            Ok(()) => return Ok(deleted_total),
+            Err(e) if !is_enospc(&e) => return Err(e),
+            Err(e) => {
+                log::warn!("Disk full while converting ({}), attempting rotation", e);
+
+                let (_index_path, meta) = index::init_index(index_dir)?;
+                if meta.valid_count == 0 {
+                    return Err(io::Error::other(format!(
+                        "Conversion failed and there are no photos left to delete: {}",
+                        e
+                    )));
+                }
+
+                let (_new_meta, deleted) =
+                    index::delete_oldest(index_dir, &meta, batch_delete_size)?;
+                log::info!("Deleted {} old photos to free space", deleted);
+                if deleted == 0 {
+                    return Err(io::Error::other(format!(
+                        "Conversion failed and rotation freed no space: {}",
+                        e
+                    )));
+                }
+
+                deleted_total += deleted;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -676,6 +730,128 @@ mod tests {
             !is_mount_point(tmpdir.path()),
             "a fresh temp directory should not look like a mount point"
         );
+    }
+
+    #[test]
+    fn test_is_enospc_recognizes_raw_os_error_and_message() {
+        assert!(is_enospc(&io::Error::from_raw_os_error(libc::ENOSPC)));
+        assert!(is_enospc(&io::Error::other(
+            "ImageMagick failed: unable to write image: No space left on device"
+        )));
+        assert!(is_enospc(&io::Error::other(
+            "write failed: Disk quota exceeded"
+        )));
+        assert!(!is_enospc(&io::Error::other(
+            "ImageMagick failed: corrupt image"
+        )));
+        assert!(!is_enospc(&io::Error::from_raw_os_error(libc::EACCES)));
+    }
+
+    /// Create `count` placeholder photos plus an index that references them.
+    fn create_index_with_photos(dir: &Path, count: usize) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for i in 0..count {
+            let path = dir.join(format!("{i:05}_photo.jpg"));
+            File::create(&path).unwrap();
+            paths.push(path);
+        }
+
+        let meta = index::IndexMetadata {
+            start_line: 0,
+            valid_count: count,
+        };
+        let mut file = File::create(dir.join(index::build_index_filename(&meta))).unwrap();
+        for (i, path) in paths.iter().enumerate() {
+            writeln!(file, "{},photo{}.jpg,{}", path.display(), i, i + 1).unwrap();
+        }
+        file.flush().unwrap();
+
+        paths
+    }
+
+    #[test]
+    fn test_convert_with_rotation_deletes_oldest_and_retries() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 5);
+        let mut calls = 0;
+
+        let deleted = convert_with_rotation(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                } else {
+                    Ok(())
+                }
+            },
+            tmpdir.path(),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(calls, 2, "conversion should be retried after rotation");
+        assert_eq!(deleted, 2);
+        assert!(!photos[0].exists(), "oldest photo should be deleted");
+        assert!(!photos[1].exists(), "second oldest photo should be deleted");
+        for photo in &photos[2..] {
+            assert!(photo.exists(), "newer photo should be kept: {photo:?}");
+        }
+
+        let (_path, meta) = index::init_index(tmpdir.path()).unwrap();
+        assert_eq!(meta.start_line, 2);
+        assert_eq!(meta.valid_count, 3);
+    }
+
+    #[test]
+    fn test_convert_with_rotation_errors_when_no_photos_remain() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 2);
+
+        let result = convert_with_rotation(
+            || Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+            tmpdir.path(),
+            5,
+        );
+
+        assert!(result.is_err(), "should give up when nothing is left");
+        assert!(photos.iter().all(|photo| !photo.exists()));
+
+        let (_path, meta) = index::init_index(tmpdir.path()).unwrap();
+        assert_eq!(meta.valid_count, 0);
+    }
+
+    #[test]
+    fn test_convert_with_rotation_errors_with_empty_index() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        index::init_index(tmpdir.path()).unwrap();
+
+        let result = convert_with_rotation(
+            || Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+            tmpdir.path(),
+            20,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_with_rotation_propagates_non_enospc_errors() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 2);
+        let mut calls = 0;
+
+        let result = convert_with_rotation(
+            || {
+                calls += 1;
+                Err(io::Error::other("ImageMagick failed: corrupt image"))
+            },
+            tmpdir.path(),
+            1,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "non-ENOSPC errors must not trigger rotation");
+        assert!(photos.iter().all(|photo| photo.exists()));
     }
 
     #[test]
