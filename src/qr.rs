@@ -382,7 +382,8 @@ mod tests {
     fn test_config(width: u32, height: u32) -> Config {
         Config {
             photos_dir: PathBuf::from("/tmp/photos"),
-            socket_path: PathBuf::from("/tmp/sock"),
+            display_socket_path: PathBuf::from("/tmp/sock"),
+            control_socket_path: PathBuf::from("/tmp/control.sock"),
             native_resolution: format!("{width}x{height}"),
             aspect_ratio_mode: crate::config::AspectRatioMode::Fit,
             batch_delete_size: 20,

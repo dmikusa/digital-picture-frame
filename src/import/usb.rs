@@ -18,7 +18,7 @@ use crate::config::{AspectRatioMode, Config};
 use crate::index::{self, IndexWriter};
 use crc32fast::Hasher;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Events emitted by the USB watcher for the config mode state machine.
 #[derive(Debug, Clone)]
@@ -63,7 +63,28 @@ pub fn watch_usb_mounts(
 
     log::info!("Watching /media for USB mounts");
 
-    let mut active_mounts: HashSet<PathBuf> = HashSet::new();
+    // Mount points we have already started an import for, and when we first saw
+    // them. The timestamp distinguishes a mount that is still settling from one
+    // that has gone away.
+    let mut active_mounts: HashMap<PathBuf, Instant> = HashMap::new();
+
+    // Import drives that are already mounted at startup. Attaching a filesystem
+    // over an existing directory does not emit a Create event, so without this a
+    // drive that is mounted before the manager starts would never be imported.
+    sweep_mounts(
+        &mut active_mounts,
+        &photos_dir,
+        &index_dir,
+        &dedup_set,
+        &config,
+        &event_tx,
+    );
+
+    // Reconcile periodically. A manual `mount`/`umount`, or a re-mount over an
+    // existing mountpoint directory, does not emit an inotify event under
+    // /media, so polling is the only reliable way to notice it.
+    const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+    let mut last_sweep = Instant::now();
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -71,42 +92,32 @@ pub fn watch_usb_mounts(
             break;
         }
 
+        if last_sweep.elapsed() >= SWEEP_INTERVAL {
+            sweep_mounts(
+                &mut active_mounts,
+                &photos_dir,
+                &index_dir,
+                &dedup_set,
+                &config,
+                &event_tx,
+            );
+            last_sweep = Instant::now();
+        }
+
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => match event.kind {
                 notify::EventKind::Create(notify::event::CreateKind::Folder) => {
-                    let paths: Vec<PathBuf> = event.paths.clone();
-                    for path in paths {
-                        if path.is_dir() && !active_mounts.contains(&path) {
-                            log::info!("USB mount detected: {}", path.display());
-                            active_mounts.insert(path.clone());
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(MountEvent::Inserted(path.clone()));
-                            }
-                            let photos_dir = photos_dir.clone();
-                            let index_dir = index_dir.clone();
-                            let dedup_set = dedup_set.clone();
-                            let config = config.clone();
-                            let import_tx = event_tx.clone();
-                            let mount_path = path.clone();
-                            std::thread::spawn(move || {
-                                if let Err(e) = import_from_mount(
-                                    &mount_path,
-                                    &photos_dir,
-                                    &index_dir,
-                                    dedup_set,
-                                    &config,
-                                ) {
-                                    log::error!(
-                                        "Import failed for {}: {}",
-                                        mount_path.display(),
-                                        e
-                                    );
-                                }
-                                log::info!("Import complete for {}", mount_path.display());
-                                if let Some(ref tx) = import_tx {
-                                    let _ = tx.send(MountEvent::ImportComplete(mount_path));
-                                }
-                            });
+                    for path in event.paths {
+                        if path.is_dir() && !active_mounts.contains_key(&path) {
+                            active_mounts.insert(path.clone(), Instant::now());
+                            spawn_import(
+                                path,
+                                photos_dir.clone(),
+                                index_dir.clone(),
+                                dedup_set.clone(),
+                                config.clone(),
+                                event_tx.clone(),
+                            );
                         }
                     }
                 }
@@ -134,6 +145,124 @@ pub fn watch_usb_mounts(
     Ok(())
 }
 
+/// Reconcile `active_mounts` with what is actually mounted under `/media`:
+/// forget mounts that have gone away and start imports for new ones. Covers
+/// drives already mounted at startup, manual `mount`/`umount`, and re-mounts
+/// over an existing mountpoint directory (none of which emit a Create event).
+fn sweep_mounts(
+    active_mounts: &mut HashMap<PathBuf, Instant>,
+    photos_dir: &Path,
+    index_dir: &Path,
+    dedup_set: &Arc<Mutex<HashSet<u64>>>,
+    config: &Config,
+    event_tx: &Option<mpsc::Sender<MountEvent>>,
+) {
+    // Forget mounts that are no longer present. Ignore paths seen very recently
+    // so we don't race a mount that is still being attached.
+    const STALE_AFTER: Duration = Duration::from_secs(8);
+    let stale: Vec<PathBuf> = active_mounts
+        .iter()
+        .filter(|(path, since)| since.elapsed() >= STALE_AFTER && !is_mount_point(path))
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in stale {
+        active_mounts.remove(&path);
+        log::info!("USB unmounted: {}", path.display());
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(MountEvent::Removed(path));
+        }
+    }
+
+    let entries = match fs::read_dir("/media") {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("Failed to scan /media for mounts: {}", e);
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && is_mount_point(&path) && !active_mounts.contains_key(&path) {
+            active_mounts.insert(path.clone(), Instant::now());
+            spawn_import(
+                path,
+                photos_dir.to_path_buf(),
+                index_dir.to_path_buf(),
+                dedup_set.clone(),
+                config.clone(),
+                event_tx.clone(),
+            );
+        }
+    }
+}
+
+/// Spawn the import thread for a detected mount and notify the state machine.
+fn spawn_import(
+    path: PathBuf,
+    photos_dir: PathBuf,
+    index_dir: PathBuf,
+    dedup_set: Arc<Mutex<HashSet<u64>>>,
+    config: Config,
+    event_tx: Option<mpsc::Sender<MountEvent>>,
+) {
+    log::info!("USB mount detected: {}", path.display());
+    if let Some(ref tx) = event_tx {
+        let _ = tx.send(MountEvent::Inserted(path.clone()));
+    }
+
+    let import_tx = event_tx;
+    std::thread::spawn(move || {
+        // The mountpoint directory is created before the filesystem is actually
+        // attached, so wait until something is mounted before scanning.
+        wait_for_mount(&path);
+
+        if let Err(e) = import_from_mount(&path, &photos_dir, &index_dir, dedup_set, &config) {
+            log::error!("Import failed for {}: {}", path.display(), e);
+        }
+        log::info!("Import complete for {}", path.display());
+
+        if let Some(tx) = import_tx {
+            let _ = tx.send(MountEvent::ImportComplete(path));
+        }
+    });
+}
+
+/// Return true if `path` is a mount point, detected by comparing its device with
+/// its parent's device. Used to avoid scanning an empty mountpoint directory
+/// before the filesystem has been attached.
+fn is_mount_point(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    match (fs::metadata(path), fs::metadata(parent)) {
+        (Ok(child), Ok(parent)) => child.dev() != parent.dev(),
+        _ => false,
+    }
+}
+
+/// Block until `path` is a mount point, or until `MOUNT_READY_TIMEOUT` elapses.
+fn wait_for_mount(path: &Path) {
+    const MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let deadline = Instant::now() + MOUNT_READY_TIMEOUT;
+    while Instant::now() < deadline {
+        if is_mount_point(path) {
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    log::warn!(
+        "{} is not a mount point after {:?}; scanning anyway",
+        path.display(),
+        MOUNT_READY_TIMEOUT
+    );
+}
+
 /// Import all JPEGs from a directory (USB mount or local folder).
 pub fn import_from_directory(
     dir: &Path,
@@ -145,24 +274,35 @@ pub fn import_from_directory(
     // Resolve to an absolute path so downstream syscalls are not affected
     // by the process's current working directory.
     let abs_dir = dir.canonicalize()?;
-    let images = find_images(&abs_dir);
+    let scan = scan_images(&abs_dir);
+    log::info!(
+        "Found {} image file(s) under {} ({} skipped: not images or OS metadata)",
+        scan.images.len(),
+        abs_dir.display(),
+        scan.skipped
+    );
+    let skipped = scan.skipped;
     let mut imported = 0;
-    let mut skipped = 0;
+    let mut duplicates = 0;
+    let mut failed = 0;
 
-    for photo_path in images {
+    for photo_path in scan.images {
         match import_single_photo(&photo_path, photos_dir, index_dir, dedup_set, config) {
             Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
+            Ok(false) => duplicates += 1,
             Err(e) => {
+                failed += 1;
                 log::warn!("Failed to import {}: {}", photo_path.display(), e);
             }
         }
     }
 
     log::info!(
-        "Import summary from {}: {} imported, {} skipped (duplicates)",
+        "Import summary from {}: {} imported, {} duplicates, {} failed, {} skipped (non-images)",
         abs_dir.display(),
         imported,
+        duplicates,
+        failed,
         skipped
     );
     Ok(())
@@ -181,23 +321,76 @@ fn import_from_mount(
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "heif", "heifs", "heic", "heics"];
 
-/// Find all image files under a directory, recursively.
-fn find_images(dir: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_dir() {
-                result.extend(find_images(&path));
-            } else if let Some(ext) = path.extension() {
-                let ext = ext.to_string_lossy().to_lowercase();
-                if IMAGE_EXTENSIONS.contains(&ext.as_ref()) {
-                    result.push(path);
-                }
+/// Names that only ever hold OS metadata and should never be imported. The
+/// leading-dot rule covers macOS (`._*`, `.DS_Store`, `.fseventsd`, `.Trashes`,
+/// `.Spotlight-V100`, ...); the rest are the Windows equivalents.
+fn is_ignored_name(name: &str) -> bool {
+    name.starts_with('.')
+        || name.eq_ignore_ascii_case("$RECYCLE.BIN")
+        || name.eq_ignore_ascii_case("System Volume Information")
+}
+
+/// Result of scanning a directory tree for importable images.
+struct ScanResult {
+    /// Image files that will be imported.
+    images: Vec<PathBuf>,
+    /// Entries that were skipped: OS metadata and files that are not images.
+    skipped: usize,
+}
+
+/// Find all image files under a directory, recursively, along with a count of
+/// the entries that were skipped.
+fn scan_images(dir: &Path) -> ScanResult {
+    let mut result = ScanResult {
+        images: Vec::new(),
+        skipped: 0,
+    };
+    collect_images(dir, &mut result);
+    result
+}
+
+fn collect_images(dir: &Path, result: &mut ScanResult) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Without this, an unreadable directory looks like an empty one.
+            log::warn!("Failed to read directory {}: {}", dir.display(), e);
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::warn!("Failed to read entry in {}: {}", dir.display(), e);
+                continue;
             }
+        };
+
+        let path = entry.path();
+
+        // Skip OS metadata: macOS AppleDouble sidecars (`._IMG_1234.jpeg`), and
+        // hidden/system directories (`.fseventsd`, `.Trashes`, ...).
+        if is_ignored_name(&entry.file_name().to_string_lossy()) {
+            result.skipped += 1;
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_images(&path, result);
+        } else if let Some(ext) = path.extension() {
+            let ext = ext.to_string_lossy().to_lowercase();
+            if IMAGE_EXTENSIONS.contains(&ext.as_ref()) {
+                result.images.push(path);
+            } else {
+                result.skipped += 1;
+            }
+        } else {
+            // A file with no extension.
+            result.skipped += 1;
         }
     }
-    result
 }
 
 /// Import a single photo. Returns Ok(true) if imported, Ok(false) if skipped (duplicate).
@@ -413,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_images() {
+    fn test_scan_images() {
         let tmpdir = tempfile::tempdir().unwrap();
         File::create(tmpdir.path().join("photo1.jpg")).unwrap();
         File::create(tmpdir.path().join("photo2.JPEG")).unwrap();
@@ -425,8 +618,41 @@ mod tests {
         fs::create_dir(&subdir).unwrap();
         File::create(subdir.join("nested.jpg")).unwrap();
 
-        let images = find_images(tmpdir.path());
-        assert_eq!(images.len(), 5);
+        // OS metadata must be skipped, even when it carries an image extension.
+        File::create(tmpdir.path().join("._photo5.jpeg")).unwrap();
+        File::create(tmpdir.path().join(".DS_Store")).unwrap();
+        for junk_dir in [
+            ".fseventsd",
+            ".Trashes",
+            "$RECYCLE.BIN",
+            "System Volume Information",
+        ] {
+            let dir = tmpdir.path().join(junk_dir);
+            fs::create_dir(&dir).unwrap();
+            File::create(dir.join("junk.jpg")).unwrap();
+        }
+
+        let scan = scan_images(tmpdir.path());
+        assert_eq!(scan.images.len(), 5);
+        assert!(
+            scan.images.iter().all(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                !is_ignored_name(&name)
+            }),
+            "OS metadata files should be skipped: {:?}",
+            scan.images
+        );
+        // notaphoto.txt, ._photo5.jpeg, .DS_Store, and the four ignored dirs.
+        assert_eq!(scan.skipped, 7);
+    }
+
+    #[test]
+    fn test_is_mount_point_for_plain_directory() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        assert!(
+            !is_mount_point(tmpdir.path()),
+            "a fresh temp directory should not look like a mount point"
+        );
     }
 
     #[test]

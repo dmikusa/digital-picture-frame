@@ -48,16 +48,22 @@ impl ControlClient {
                     self.stream = Some(stream);
                     return Ok(());
                 }
-                Err(e)
-                    if e.kind() == io::ErrorKind::NotFound
-                        || e.kind() == io::ErrorKind::ConnectionRefused =>
-                {
-                    if Instant::now() >= deadline {
-                        return Err(e);
+                Err(e) => {
+                    let kind = e.kind();
+                    let retryable =
+                        kind == io::ErrorKind::NotFound || kind == io::ErrorKind::ConnectionRefused;
+                    if !retryable || Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            kind,
+                            format!(
+                                "cannot connect to control socket {} (is the display app running?): {}",
+                                self.socket_path.display(),
+                                e
+                            ),
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                Err(e) => return Err(e),
             }
         }
     }

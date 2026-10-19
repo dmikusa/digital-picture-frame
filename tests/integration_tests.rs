@@ -61,10 +61,11 @@ fn normalized_stored_name(original_name: &str) -> String {
     format!("{}.jpg", original_stem(original_name))
 }
 
-fn make_config(photos_dir: PathBuf, socket_path: PathBuf) -> Config {
+fn make_config(photos_dir: PathBuf, display_socket_path: PathBuf) -> Config {
     Config {
         photos_dir,
-        socket_path,
+        display_socket_path,
+        control_socket_path: PathBuf::from("/run/photo-frame/control.sock"),
         native_resolution: "32x32".to_string(),
         aspect_ratio_mode: AspectRatioMode::Fit,
         batch_delete_size: 20,

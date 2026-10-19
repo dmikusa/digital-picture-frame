@@ -678,6 +678,8 @@ int main(void)
     g.screen_aspect = (float)g.mode_w / (float)g.mode_h;
     printf("Mode: %dx%d (aspect %.3f)\n", g.mode_w, g.mode_h, g.screen_aspect);
 
+    const char *sock_path_env = getenv("DISPLAY_SOCKET_PATH");
+    const char *sock_path = sock_path_env ? sock_path_env : SOCKET_PATH;
     const char *ctrl_sock_path_env = getenv("CONTROL_SOCKET_PATH");
     const char *ctrl_sock_path = ctrl_sock_path_env ? ctrl_sock_path_env : CONTROL_SOCKET_PATH;
 
@@ -777,21 +779,21 @@ int main(void)
     }
 
     /* ---- Socket setup -------------------------------------------------- */
-    unlink(SOCKET_PATH);
+    unlink(sock_path);
     g.listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     CHECK(g.listen_fd >= 0, "socket");
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
     /* Restrict socket permissions so only the owner can connect */
     mode_t old_umask = umask(077);
     int ret = bind(g.listen_fd, (struct sockaddr *)&addr, sizeof(addr));
     umask(old_umask);
-    CHECK(ret == 0, "bind %s", SOCKET_PATH);
+    CHECK(ret == 0, "bind %s", sock_path);
     ret = listen(g.listen_fd, 1);
     CHECK(ret == 0, "listen");
-    printf("Listening on %s\n", SOCKET_PATH);
+    printf("Listening on %s\n", sock_path);
 
     int flags = fcntl(g.listen_fd, F_GETFL, 0);
     fcntl(g.listen_fd, F_SETFL, flags | O_NONBLOCK);
@@ -1052,7 +1054,7 @@ int main(void)
     if (g.control_conn_fd >= 0) close(g.control_conn_fd);
     close(g.control_listen_fd);
     close(g.epoll_fd);
-    unlink(SOCKET_PATH);
+    unlink(sock_path);
     unlink(ctrl_sock_path);
     return 0;
 }

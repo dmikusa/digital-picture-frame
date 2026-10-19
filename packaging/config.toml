@@ -1,10 +1,18 @@
 # Required: directory where photos are stored and imported. Must exist.
 photos_dir = "/var/lib/photo-frame/photos"
 
-# Required: path to the Unix domain socket for the C display app.
-# The display app creates the socket at this path.
-# Example: "/run/photo-frame/photo-frame.sock"
-socket_path = "/run/photo-frame/photo-frame.sock"
+# Required: Unix socket the display app creates to receive image paths (IMG).
+# The manager connects to this socket to send photos to the screen.
+# The display app reads the same path from DISPLAY_SOCKET_PATH in display.env,
+# so the two must match.
+display_socket_path = "/run/photo-frame/photo-frame.sock"
+
+# Optional: Unix socket the display app creates for control commands
+# (CLR/SHOW/RESUME), which the manager uses in config mode to show the setup QR
+# screen. The display app reads the same path from CONTROL_SOCKET_PATH in
+# display.env, so the two must match.
+# Default: "/run/photo-frame/control.sock"
+control_socket_path = "/run/photo-frame/control.sock"
 
 # Required: display resolution in "WxH" format. Used for import resizing.
 # Example: "1920x1080", "1024x768"

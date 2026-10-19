@@ -9,6 +9,7 @@ EnvironmentFile=-/etc/photo-frame/display.env
 Restart=on-failure
 User=photo-frame
 Group=video
+# Owns /run/photo-frame and the sockets inside it; the manager only reads it.
 RuntimeDirectory=photo-frame
 StandardOutput=null
 StandardError=null

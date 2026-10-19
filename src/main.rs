@@ -254,7 +254,7 @@ fn main() {
 
     // Spawn display thread
     let display_shutdown = shutdown.clone();
-    let display_socket = config.socket_path.clone();
+    let display_socket = config.display_socket_path.clone();
     let display_photos_dir = config.photos_dir.clone();
     let _display_handle = std::thread::spawn(move || {
         if let Err(e) = photo_frame_manager::app::run_display_loop(
@@ -292,7 +292,7 @@ fn main() {
     let mode_config = config.clone();
     let mode_config_path = config_path.clone();
     let mode_shutdown = shutdown.clone();
-    let control_socket = PathBuf::from("/run/photo-frame/control.sock");
+    let control_socket = config.control_socket_path.clone();
     let _mode_handle = std::thread::spawn(move || {
         if let Err(e) = photo_frame_manager::config_mode::run_config_mode_loop(
             mode_config,
