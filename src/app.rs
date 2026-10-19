@@ -88,22 +88,28 @@ pub fn run_display_loop(
             break;
         }
 
-        // Check for index change notifications
-        if let Ok(event) = notify_rx.try_recv() {
-            match event.kind {
-                notify::EventKind::Modify(_) | notify::EventKind::Create(_) => {
-                    log::info!("Index file changed, reopening");
-                    // Re-init index and seek to previous position
-                    let (new_path, new_meta) = index::init_index(index_dir)?;
-                    metadata = new_meta;
-                    reader = IndexReader::open(&new_path, metadata)?;
-                    if let Err(e) = reader.seek_to(current_line) {
-                        log::warn!("Failed to seek to previous position: {}", e);
-                        // If seek fails, just start from the beginning of valid lines
-                        let _ = reader.seek_to(metadata.start_line);
-                    }
-                }
-                _ => {}
+        // Check for index change notifications. Drain and coalesce them: a USB
+        // import appends one line per photo, and reopening (with a log line) for
+        // every single append is wasteful and noisy.
+        let mut index_changed = false;
+        while let Ok(event) = notify_rx.try_recv() {
+            if matches!(
+                event.kind,
+                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+            ) {
+                index_changed = true;
+            }
+        }
+        if index_changed {
+            log::debug!("Index file changed, reopening");
+            // Re-init index and seek to previous position
+            let (new_path, new_meta) = index::init_index(index_dir)?;
+            metadata = new_meta;
+            reader = IndexReader::open(&new_path, metadata)?;
+            if let Err(e) = reader.seek_to(current_line) {
+                log::warn!("Failed to seek to previous position: {}", e);
+                // If seek fails, just start from the beginning of valid lines
+                let _ = reader.seek_to(metadata.start_line);
             }
         }
 

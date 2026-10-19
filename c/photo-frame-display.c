@@ -449,6 +449,25 @@ static void handle_socket_data(void)
     }
 }
 
+/* Reset playback state for a fresh manager session. A pause or overlay set by a
+ * previous manager (e.g. the config-mode QR screen) must not survive a manager
+ * restart, or the display would stay stuck on it. */
+static void reset_for_new_session(void)
+{
+    g.paused = 0;
+    g.show_image = 0;
+    g.socket_paused = 0;
+    if (g.slots[0].occupied) g.slots[0].occupied = 0;
+    if (g.slots[1].occupied) g.slots[1].occupied = 0;
+    if (g.pending_pixels) {
+        stbi_image_free(g.pending_pixels);
+        g.pending_pixels = NULL;
+    }
+    g.fading = 0;
+    g.phase = PHASE_WAITING;
+    printf("New manager session; reset display state.\n");
+}
+
 /* -------------------------------------------------------------------------- */
 /* Fade / render                                                              */
 /* -------------------------------------------------------------------------- */
@@ -927,6 +946,12 @@ int main(void)
                     ev.data.fd = g.conn_fd;
                     epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.conn_fd, &ev);
                     printf("Manager connected\n");
+                    // Only clear state if a previous manager left the display
+                    // paused or showing an overlay (e.g. the config-mode QR). A
+                    // plain reconnect should not disturb an in-progress slideshow.
+                    if (g.paused || g.show_image) {
+                        reset_for_new_session();
+                    }
                 }
             } else if (fd == g.control_listen_fd) {
                 int cc = accept4(g.control_listen_fd, NULL, NULL, SOCK_CLOEXEC);
