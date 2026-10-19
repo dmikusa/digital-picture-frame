@@ -13,7 +13,7 @@
             <h2>{{ source.name }}</h2>
             <p class="muted">Type: {{ source.source_type }}</p>
         </div>
-        <form method="post" action="/api/sources/{{ source.name|urlencode }}" style="margin:0">
+        <form method="post" action="/api/sources/{{ source.name|urlencode_strict }}" style="margin:0">
             <button class="danger">Delete</button>
         </form>
     </div>

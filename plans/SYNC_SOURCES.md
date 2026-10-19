@@ -320,11 +320,11 @@ check_interval_seconds = 86400
 | Route | Method | Auth | Description |
 |-------|--------|------|-------------|
 | `/api/sources` | GET | Yes | List all staged sources as JSON |
-| `/api/sources/dropbox` | POST | Yes | Save Dropbox config to staging. Returns JSON. |
-| `/api/sources/google-drive` | POST | Yes | Save Google Drive config to staging. Returns JSON. |
-| `/api/sources/<name>` | DELETE | Yes | Remove a source from staging. Returns JSON. |
+| `/api/sources/dropbox` | POST | Yes | Save Dropbox config to staging. JSON request returns JSON; form request returns a 303 redirect. |
+| `/api/sources/google-drive` | POST | Yes | Save Google Drive config to staging. JSON request returns JSON; form request returns a 303 redirect. |
+| `/api/sources/<name>` | DELETE / POST | Yes | Remove a source from staging. DELETE returns JSON; form POST returns a 303 redirect. |
 | `/api/status` | GET | Yes | Current sync state, last sync times. Returns JSON. |
-| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. Returns JSON. |
+| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. JSON request returns JSON; form request returns an HTML success page. |
 
 ### Task 7.3: HTML Pages (HTMX)
 
@@ -333,8 +333,8 @@ check_interval_seconds = 86400
 | `/` | GET | Yes | Dashboard: menu bar + HTMX-loaded status card from `/api/status` |
 | `/sources` | GET | Yes | Source list: menu bar + HTMX-loaded source table from `/api/sources` |
 | `/sources/add` | GET | Yes | Menu bar + source type picker (links to `/sources/dropbox` and `/sources/google-drive`) |
-| `/sources/dropbox` | GET | Yes | Menu bar + form (submits via `hx-post` to `/api/sources/dropbox`) |
-| `/sources/google-drive` | GET | Yes | Menu bar + form (submits via `hx-post` to `/api/sources/google-drive`) |
+| `/sources/dropbox` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/dropbox`) |
+| `/sources/google-drive` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/google-drive`) |
 | `/sources/google-drive-oauth` | GET | Yes | Menu bar + OAuth setup form (Phase 8) |
 | `/oauth/google/callback` | GET | **No** | Handles Google OAuth redirect (Phase 8) |
 
@@ -354,24 +354,20 @@ Every HTML page shares the same structure:
 
 - Menu bar across the top: `Home` (dashboard), `Sources` (list), `Add` (add new).
 - Active page highlighted in the menu bar.
-- Content area below loads data via HTMX from `/api/*` endpoints.
-- Forms use `hx-post` to `/api/*` endpoints; success responses include
-  `HX-Redirect` header to navigate to the next page.
+- Source cards are rendered server-side; no client-side JavaScript is required.
+- Forms use plain HTML `method="post"` to `/api/*` endpoints. Browser form
+  submissions receive a `303 See Other` redirect to the next page.
 - Phone-friendly: viewport meta tag, no horizontal scroll, stacked layout.
-- No external CDN dependency for HTMX — the script is either inlined or
-  served as a static asset from the server itself (~14KB minified).
+- No external CDN dependency and no JavaScript.
 
-**HTMX flow example — adding a Dropbox source:**
+**Add a Dropbox source flow:**
 
 1. User navigates to `/sources/dropbox` → server returns menu bar + form HTML.
 2. User fills in access token, folder, interval.
-3. User clicks "Save" → HTMX sends `hx-post` to `/api/sources/dropbox` with
-   form data.
-4. Server validates, saves to staging, responds `200` with
-   `HX-Redirect: /sources` header.
-5. Browser loads `/sources`, which HTMX-populates the source list from
-   `/api/sources`. A "Finish" button at the bottom triggers
-   `hx-post` to `/api/finish` to deploy the config.
+3. User clicks "Save" → browser POSTs form data to `/api/sources/dropbox`.
+4. Server validates, saves to staging, responds `303` with `Location: /sources`.
+5. Browser loads `/sources`, which lists the staged sources. A "Finish" button
+   at the bottom POSTs to `/api/finish` to deploy the config.
 
 ---
 

@@ -70,6 +70,10 @@ struct OauthErrorTemplate {
     message: String,
 }
 
+#[derive(Template)]
+#[template(path = "finish.html")]
+struct FinishTemplate;
+
 pub struct AdminServer {
     port: u16,
     password: String,
@@ -146,6 +150,13 @@ impl AdminServer {
         if !path.starts_with("/oauth/") && !self.check_auth(request) {
             return Response::from_string("Unauthorized")
                 .with_status_code(StatusCode::from(401))
+                .with_header(
+                    Header::from_bytes(
+                        &b"WWW-Authenticate"[..],
+                        &b"Basic realm=\"Photo Frame Setup\""[..],
+                    )
+                    .unwrap(),
+                )
                 .boxed();
         }
 
@@ -157,11 +168,28 @@ impl AdminServer {
                 self.api_save_source(request, "google_drive")
             }
             (Method::Delete, p) if p.starts_with("/api/sources/") => {
-                let name = &p["/api/sources/".len()..];
-                self.api_delete_source(name)
+                let name = decode_path_segment(&p["/api/sources/".len()..]);
+                self.api_delete_source(&name)
+            }
+            // HTML forms cannot send DELETE, so allow POST for browser deletes.
+            (Method::Post, p) if p.starts_with("/api/sources/") => {
+                let name = decode_path_segment(&p["/api/sources/".len()..]);
+                let response = self.api_delete_source(&name);
+                if is_form_request(request) {
+                    redirect_response("/sources")
+                } else {
+                    response
+                }
             }
             (Method::Get, "/api/status") => self.api_status(),
-            (Method::Post, "/api/finish") => self.api_finish(),
+            (Method::Post, "/api/finish") => {
+                let response = self.api_finish();
+                if wants_html(request) {
+                    serve_template(&FinishTemplate)
+                } else {
+                    response
+                }
+            }
 
             // ---- HTML pages ---------------------------------------------------
             (Method::Get, "/") => {
@@ -219,13 +247,20 @@ impl AdminServer {
         request: &mut Request,
         source_type: &str,
     ) -> Response<Box<dyn std::io::Read + Send>> {
-        let body = read_body(request);
-        let params: HashMap<String, String> = match serde_json::from_str(&body) {
+        let form = is_form_request(request);
+        let params = match parse_params(request) {
             Ok(p) => p,
-            Err(e) => return json_response(400, &format!(r#"{{"error":"{e}"}}"#)),
+            Err(e) => {
+                return if form {
+                    html_error(400, &format!("Invalid form data: {e}"))
+                } else {
+                    json_response(400, &format!(r#"{{"error":"{e}"}}"#))
+                };
+            }
         };
         let name = params
             .get("name")
+            .filter(|n| !n.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| source_type.to_string());
         let check_interval: u64 = params
@@ -250,7 +285,12 @@ impl AdminServer {
         } else {
             sources.push(config);
         }
-        json_response(201, r#"{"ok":true}"#)
+
+        if form {
+            redirect_response("/sources")
+        } else {
+            json_response(201, r#"{"ok":true}"#)
+        }
     }
 
     fn api_delete_source(&self, name: &str) -> Response<Box<dyn std::io::Read + Send>> {
@@ -363,6 +403,88 @@ fn json_response(code: u16, body: &str) -> Response<Box<dyn std::io::Read + Send
         .with_status_code(StatusCode(code))
         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
         .boxed()
+}
+
+/// A 303 redirect. Browsers switch to a GET request for the target page, which
+/// avoids resubmitting the form on refresh.
+fn redirect_response(location: &str) -> Response<Box<dyn std::io::Read + Send>> {
+    Response::from_string("")
+        .with_status_code(StatusCode(303))
+        .with_header(Header::from_bytes(&b"Location"[..], location.as_bytes()).unwrap())
+        .boxed()
+}
+
+fn html_error(code: u16, message: &str) -> Response<Box<dyn std::io::Read + Send>> {
+    let body = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Error</title></head>\
+         <body><h1>Error</h1><p>{}</p><a href=\"/sources\">Back to Sources</a></body></html>",
+        escape_html(message)
+    );
+    Response::from_string(body)
+        .with_status_code(StatusCode(code))
+        .with_header(
+            Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
+        )
+        .boxed()
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Look up a request header (case-insensitive field name).
+fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str())
+}
+
+fn is_form_request(request: &Request) -> bool {
+    header_value(request, "Content-Type")
+        .map(|ct| {
+            ct.to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the client is a browser looking for an HTML response. Form posts
+/// always qualify; plain GET/POST clients can opt in with an Accept header.
+fn wants_html(request: &Request) -> bool {
+    is_form_request(request)
+        || header_value(request, "Accept")
+            .map(|accept| accept.contains("text/html"))
+            .unwrap_or(false)
+}
+
+/// Parse a request body as JSON or `application/x-www-form-urlencoded`.
+fn parse_params(request: &mut Request) -> Result<HashMap<String, String>, String> {
+    let content_type = header_value(request, "Content-Type")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let body = read_body(request);
+
+    if content_type.contains("json")
+        || (content_type.is_empty() && body.trim_start().starts_with('{'))
+    {
+        serde_json::from_str(&body).map_err(|e| e.to_string())
+    } else {
+        serde_urlencoded::from_str(&body).map_err(|e| e.to_string())
+    }
+}
+
+/// Percent-decode a path segment produced by the `urlencode` template filter.
+fn decode_path_segment(segment: &str) -> String {
+    form_urlencoded::parse(segment.as_bytes())
+        .next()
+        .map(|(name, _)| name.into_owned())
+        .unwrap_or_else(|| segment.to_string())
 }
 
 fn serve_html(body: String) -> Response<Box<dyn std::io::Read + Send>> {

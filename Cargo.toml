@@ -28,6 +28,8 @@ fontdue = "0.9"
 tiny_http_fork = "=0.12.8"
 oauth2 = "5"
 askama = "0.12"
+serde_urlencoded = "0.7"
+form_urlencoded = "1"
 
 [package.metadata.deb]
 maintainer = "Daniel Mikusa <dan@mikusa.com>"
