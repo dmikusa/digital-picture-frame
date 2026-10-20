@@ -346,10 +346,17 @@ fn download_and_import(
     let mut failed: Vec<String> = Vec::new();
 
     for (index, photo) in photos.iter().enumerate() {
-        let dest = tmp_dir.join(safe_filename(&photo.filename, index));
+        // The importer derives `original_name` from the file name, so the
+        // staged file keeps the remote name. The per-item directory avoids
+        // collisions instead of renaming the file.
+        let dest = temp_path(&tmp_dir, &photo.filename, index);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         if let Err(e) = src.download(&photo.remote_id, &dest) {
             log::warn!(r#"Download failed for "{}": {}"#, photo.filename, e);
-            let _ = std::fs::remove_file(&dest);
+            cleanup_temp_file(&dest);
             failed.push(format!("{}: {}", photo.filename, e));
             continue;
         }
@@ -372,7 +379,7 @@ fn download_and_import(
             }
         }
 
-        let _ = std::fs::remove_file(&dest);
+        cleanup_temp_file(&dest);
     }
 
     if failed.is_empty() {
@@ -395,28 +402,48 @@ fn sync_tmp_dir(config: &Config) -> PathBuf {
 }
 
 /// Create the temp directory and clear anything left behind by a crash or an
-/// interrupted sync.
+/// interrupted sync, including the per-item subdirectories.
 fn prepare_tmp_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let _ = std::fs::remove_file(entry.path());
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
         }
     }
     Ok(())
 }
 
 /// Reduce a remote filename to a single path component so a hostile or unusual
-/// name cannot escape the temp directory, and prefix the batch index so two
-/// photos with the same name cannot collide.
-fn safe_filename(filename: &str, index: usize) -> String {
-    let base = Path::new(filename)
+/// name cannot escape the temp directory.
+fn safe_filename(filename: &str) -> String {
+    Path::new(filename)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "photo".to_string());
-    format!("{index}-{base}")
+        .unwrap_or_else(|| "photo".to_string())
+}
+
+/// Staging path for one photo: `tmp_dir/{index}/{safe_name}`.
+///
+/// The subdirectory keeps two photos with the same name from colliding while
+/// the file itself keeps the remote name, because `import_single_photo` stores
+/// `file_name()` as the index's `original_name`.
+fn temp_path(tmp_dir: &Path, filename: &str, index: usize) -> PathBuf {
+    tmp_dir
+        .join(index.to_string())
+        .join(safe_filename(filename))
+}
+
+/// Remove a staged file and its now-empty per-item directory.
+fn cleanup_temp_file(dest: &Path) {
+    let _ = std::fs::remove_file(dest);
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,14 +655,29 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_filename_blocks_traversal_and_collisions() {
-        assert_eq!(safe_filename("../../etc/passwd", 0), "0-passwd");
-        assert_eq!(safe_filename("/abs/photo.jpg", 1), "1-photo.jpg");
-        assert_eq!(safe_filename("dup.jpg", 0), "0-dup.jpg");
-        assert_ne!(safe_filename("dup.jpg", 0), safe_filename("dup.jpg", 1));
+    fn test_safe_filename_blocks_traversal() {
+        assert_eq!(safe_filename("../../etc/passwd"), "passwd");
+        assert_eq!(safe_filename("/abs/photo.jpg"), "photo.jpg");
+        assert_eq!(safe_filename("dup.jpg"), "dup.jpg");
         // Names with no usable component fall back to a fixed stem.
-        assert_eq!(safe_filename("", 2), "2-photo");
-        assert_eq!(safe_filename("..", 3), "3-photo");
+        assert_eq!(safe_filename(""), "photo");
+        assert_eq!(safe_filename(".."), "photo");
+    }
+
+    #[test]
+    fn test_temp_path_preserves_name_and_avoids_collisions() {
+        let tmp = Path::new("/photos/.sync-tmp");
+        assert_eq!(
+            temp_path(tmp, "foo.jpg", 0),
+            PathBuf::from("/photos/.sync-tmp/0/foo.jpg")
+        );
+        assert_eq!(
+            temp_path(tmp, "../../etc/passwd", 1),
+            PathBuf::from("/photos/.sync-tmp/1/passwd")
+        );
+        // Same name, different items: separate directories, same file name.
+        assert_ne!(temp_path(tmp, "dup.jpg", 0), temp_path(tmp, "dup.jpg", 1));
+        assert_eq!(temp_path(tmp, "dup.jpg", 1).file_name().unwrap(), "dup.jpg");
     }
 
     use std::collections::HashMap;
@@ -666,6 +708,55 @@ mod tests {
             }
             std::fs::write(dest, b"fake image bytes")
         }
+    }
+
+    /// Records the file name the importer would see for each download.
+    struct RecordingSource {
+        seen: Vec<String>,
+    }
+
+    impl RemotePhotoSource for RecordingSource {
+        fn connect(_config: &HashMap<String, String>) -> io::Result<Self> {
+            Ok(RecordingSource { seen: Vec::new() })
+        }
+
+        fn list_changes(
+            &mut self,
+            _cursor: Option<&str>,
+        ) -> io::Result<(Vec<RemotePhoto>, String)> {
+            Ok((Vec::new(), "1".to_string()))
+        }
+
+        fn download(&mut self, _remote_id: &str, dest: &Path) -> io::Result<()> {
+            self.seen.push(
+                dest.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            std::fs::write(dest, b"fake image bytes")
+        }
+    }
+
+    #[test]
+    fn test_download_preserves_original_filename_for_same_named_photos() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = RecordingSource { seen: Vec::new() };
+        let photos = vec![photo("foo.jpg"), photo("foo.jpg")];
+
+        download_and_import(&mut source, &photos, &config, &dedup_set).unwrap();
+
+        // Both are staged separately but keep the remote name, so the index
+        // records "foo.jpg" rather than a prefixed temp name.
+        assert_eq!(source.seen, vec!["foo.jpg", "foo.jpg"]);
+        let tmp = dir.path().join(".sync-tmp");
+        assert_eq!(
+            std::fs::read_dir(&tmp).unwrap().count(),
+            0,
+            "per-item directories should be cleaned up"
+        );
     }
 
     fn test_config(photos_dir: &Path) -> Config {
@@ -858,13 +949,18 @@ mod tests {
     fn test_prepare_tmp_dir_clears_stale_files() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join(".sync-tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(tmp.join("0")).unwrap();
         std::fs::write(tmp.join("0-stale.jpg"), b"leftover").unwrap();
+        std::fs::write(tmp.join("0/foo.jpg"), b"leftover").unwrap();
 
         prepare_tmp_dir(&tmp).unwrap();
 
         assert!(tmp.is_dir());
-        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(&tmp).unwrap().count(),
+            0,
+            "stale files and per-item directories should be removed"
+        );
     }
 
     fn write_config(path: &Path, photos_dir: &Path, source_names: &[&str]) {
