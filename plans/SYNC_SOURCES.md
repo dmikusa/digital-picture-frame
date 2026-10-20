@@ -41,29 +41,37 @@ the slideshow to show a QR code on screen.
 ### Config Mode Flow
 
 ```
-NORMAL ──USB insert──▶ IMPORT ──import done──▶ CONFIG_MODE
-                                                        │
-                           ┌────────────────────────────┘
-                           │
-                    ┌──────┴──────┐
-                    │             │
-              user finishes    USB removed
-              (POST /finish)   OR 10-min idle timeout
-                    │             │
-                    ▼             ▼
-              apply config   discard staged
-              resume show    resume show
-              save to disk   stop server
+startup ──photos exist──────────────────────────────▶ NORMAL (slideshow)
+        ──no photos + remote sources───────────────▶ FIRST_SYNC
+        ──no photos + no remote sources────────────▶ CONFIG_MODE
+
+NORMAL ──USB insert──▶ IMPORTING ──import done──▶ CONFIG_MODE
+                          │
+                          └──USB removed──▶ NORMAL or FIRST_SYNC
+
+CONFIG_MODE ──user finishes (POST /finish)──▶ validate, save, resume show
+            ──USB removed / 10-min timeout──▶ discard staged, resume show
+            ──USB insert (re-entry)─────────▶ stop old server, IMPORTING
 ```
 
-- **First boot** (no photos AND no `[[remote_sources]]` in config): skip IMPORT
-  state, go directly to CONFIG_MODE.
+- **First boot** (no photos AND no `[[remote_sources]]` in config): enter
+  CONFIG_MODE directly so the frame can show its setup QR.
+- **No photos but remote sources configured**: show the "first remote sync in
+  progress" status screen instead of the QR. Poll the index and resume the
+  slideshow as soon as photos appear.
+- **USB insert while already in config mode**: stop the existing admin server
+  before running the import and starting a new one. A new session gets a new
+  password and port; the old listener must not leak.
+- **Display app not ready**: config-mode entry is retried after a short delay
+  (`PendingConfigMode`) instead of terminating the config-mode thread.
 - **10-minute timeout** resets on every HTTP request (not from server start).
 - **USB removal** instantly stops the server and discards staged config. No grace
   period.
 - **Config changes are staged** in memory until the user clicks "Finish", at
   which point they are validated and atomically written to `config.toml` (write
   temp file + `rename()`). This prevents partial config on USB removal.
+- **Existing sources are seeded into staging**, so they can be edited or
+  removed. Saving an empty list is allowed and removes every remote source.
 
 ---
 
@@ -116,13 +124,17 @@ NORMAL ──USB insert──▶ IMPORT ──import done──▶ CONFIG_MODE
 
 ### Task 2.2: Config Mode Screen Renderer
 - New `src/config_mode.rs` module.
-- `pub fn render_config_screen(config: &Config, admin_url: &str) -> Result<PathBuf>`
-- Generates QR code JPEG with:
-  - QR code: `http://photo-frame.local:<port>` (basic auth embedded in URL)
-  - Below QR: mDNS hostname (`photo-frame.local`), fallback IP address,
-    8-char password
+- `pub fn render_config_screen(config, fallback_ip, mdns_host, port, password) -> Result<PathBuf>`
+- Generates a QR code JPEG with:
+  - QR code: `http://<lan-ip>:<port>` (basic auth embedded in URL), so setup
+    works without mDNS
+  - Below QR: LAN URL, 8-character password, and the optional
+    `http://photo-frame.local:<port>` URL
   - Footer: "Insert USB to configure (or remove to cancel)"
-- Writes to `/tmp/photo-frame-qr.jpg`, returns path.
+- Also provides `render_status_screen(config, title, lines)` for the importing
+  and first-sync screens (written to a distinct path).
+- Writes to `/tmp/photo-frame-qr.jpg` (or `/tmp/photo-frame-status.jpg`),
+  returns the path.
 - Uses `ControlClient` to send `CLR` + `SHOW`.
 
 ### Task 2.3: Password Generation
@@ -137,28 +149,58 @@ NORMAL ──USB insert──▶ IMPORT ──import done──▶ CONFIG_MODE
 
 ### Task 3.1: State Machine
 - New `src/config_mode.rs` (extends Phase 2).
-- States and transitions as described in the architecture section above.
-- IMPORT state: runs existing USB import, shows "Importing..." on screen.
-- CONFIG_MODE state: renders QR, starts admin HTTP server, starts 10-minute
-  idle timer (reset on each HTTP request).
-- Timer is checked in the main loop or via a separate thread with a
-  `Receiver::recv_timeout`.
+- States: `Normal`, `FirstSync`, `Importing { pending }`, `PendingConfigMode`,
+  and `ConfigMode`. Transitions as described in the architecture section above.
+- `initial_state(valid_count, has_remote_sources)` is a pure helper (unit
+  tested) that chooses the startup screen.
+- IMPORTING state: runs the existing USB import and shows an "Importing
+  photos..." status screen.
+- FIRST_SYNC state: shows the first-sync status screen and polls the index every
+  couple of seconds; when photos appear it resumes the slideshow. A USB insert
+  switches to IMPORTING.
+- CONFIG_MODE state: renders the QR, starts the admin HTTP server, and starts
+  the 10-minute idle timer (reset on each HTTP request).
+- `PendingConfigMode` retries entry when the display app's control socket is not
+  ready yet. The config-mode thread survives these failures.
+- Entering config mode always stops any running admin server first, including
+  when a USB is inserted during an existing session.
+- Recovery after an import is cancelled: no photos and no remote sources go
+  back to setup; no photos with remote sources show the first-sync screen;
+  photos mean the slideshow. Leaving config mode (finish, USB removal, or
+  timeout) never reopens setup automatically, but uses the first-sync screen
+  when remote sources are configured.
+- The timer is checked in the main loop with `Receiver::recv_timeout`.
 
 ### Task 3.2: Staged Config
-- Admin UI writes changes into an in-memory `Config` clone.
+- The admin server is seeded with the current `config.remote_sources`, so
+  existing entries can be edited and deleted. An empty list is a valid result.
+- Admin UI writes changes into the in-memory staged list.
 - On `POST /finish`:
-  - Validate staged config (all sources have required fields).
-  - Atomically write to real `config.toml`: write to `config.toml.tmp`, then
-    `fs::rename()`.
-  - If new `[[remote_sources]]` added, trigger immediate first sync.
+  - Validate staged sources:
+    - every name is non-empty and unique;
+    - Dropbox requires `access_token`;
+    - Google Drive requires `folder_id` plus exactly one of: `api_key`, a
+      complete `refresh_token` + `client_id` + `client_secret` set, or a
+      `service_account_json` key containing `client_email` and `private_key`;
+    - malformed service-account JSON and mixed auth methods are rejected;
+    - `check_interval_seconds` must be greater than 0.
+  - Return an HTML error page for browser/form clients and a JSON error object
+    for API clients. A validation failure keeps the server running.
+  - Atomically write to the real `config.toml`: write to `config.toml.tmp`,
+    then `fs::rename()`.
+  - Update the in-memory config so a later config-mode session sees the new
+    sources.
+- The scheduler hot-reloads `config.toml`, so sources added, edited, or removed
+  in config mode take effect on its next pass. No restart is required.
 - On USB removal or idle timeout: discard staged config, stop server. No disk
   writes.
 
 ### Task 3.3: First Sync Status Screen
 - If photos exist: background sync — no screen interruption.
-- If no photos exist (first sync / first boot): show "Your first remote sync
-  is in progress, this may take some time." on screen via control socket.
-  Resume normal display when sync completes. Progress bar deferred to later.
+- If no photos exist and remote sources are configured: show "First remote sync
+  in progress" on screen via the control socket. Resume the normal display when
+  photos appear in the index. Progress reporting is deferred (see
+  `/api/status`).
 
 ---
 
@@ -229,14 +271,12 @@ api_key = "AIza..."
 folder_id = "1abc123..."
 check_interval_seconds = 86400
 
-# OAuth fields for private folders (Phase 8):
+# Private folder read by a Google service account (Phase 8):
 # [[remote_sources]]
 # type = "google_drive"
 # name = "Private Drive"
-# client_id = "..."
-# client_secret = "..."
-# refresh_token = "1//xxxx"
 # folder_id = "1abc123..."
+# service_account_json = '''{"type":"service_account", ...}'''
 ```
 - `type` dispatches to the appropriate source implementation.
 - `name` used in cursor file and admin UI.
@@ -283,15 +323,13 @@ check_interval_seconds = 86400
 - Config fields: `api_key`, `folder_id`.
 
 ### Task 6.2: Setup Documentation
-- New `docs/google-drive-setup.md`:
-  - Step-by-step: create Google Cloud project, enable Drive API, create API key
-    (restrict to Drive API), share a Drive folder as "Anyone with the link can
-    view", copy folder ID, enter both in admin UI.
-  - Screenshots at key steps.
+- `docs/google-drive-setup.md` covers the public API-key steps (Google Cloud
+  project, Drive API, restricted API key, shared folder) and, from Phase 8, the
+  private service-account flow.
 
 ---
 
-## Phase 7: Admin UI (DIY HTTP Server)
+## Phase 7: Admin UI (tiny_http_fork)
 
 ### Task 7.1: HTTP Server
 - New `src/admin_server.rs` module.
@@ -308,10 +346,16 @@ check_interval_seconds = 86400
   - **Dependency tree:** `ascii`, `chunked_transfer`, `httpdate`, `log` (4
     deps, matching the original `tiny_http` footprint).
 - Starts on a random port in range 8100–8199 during CONFIG_MODE state.
+- `AdminServer::new(password, staged_sources)` seeds staging from
+  `config.remote_sources`; `.with_status_path(...)` points the status endpoint at
+  `<photos_dir>/sync-status.json`.
+- The setup QR and primary URL use the detected LAN IP, so phones on the same
+  network do not need mDNS. `photo-frame.local:<port>` is shown as an optional
+  alternative.
 - Stops on: `POST /finish`, USB removal, 10-minute idle timeout (reset on
-  each request).
-- All routes except `/oauth/google/callback` behind HTTP Basic Auth with the
-  rotating 8-char password.
+  each request). Re-entering config mode stops any previous server first.
+- All routes behind HTTP Basic Auth with the rotating 8-char password. There
+  are no unauthenticated callback routes.
 - Basic auth guard: pre-compute the expected `Basic <base64>` string once at
   server start, then string-compare on each request. No `base64` crate needed.
 
@@ -323,20 +367,19 @@ check_interval_seconds = 86400
 | `/api/sources/dropbox` | POST | Yes | Save Dropbox config to staging. JSON request returns JSON; form request returns a 303 redirect. |
 | `/api/sources/google-drive` | POST | Yes | Save Google Drive config to staging. JSON request returns JSON; form request returns a 303 redirect. |
 | `/api/sources/<name>` | DELETE / POST | Yes | Remove a source from staging. DELETE returns JSON; form POST returns a 303 redirect. |
-| `/api/status` | GET | Yes | Current sync state, last sync times. Returns JSON. |
-| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. JSON request returns JSON; form request returns an HTML success page. |
+| `/api/status` | GET | Yes | Staged sources plus the parsed contents of `<photos_dir>/sync-status.json` under `sync` (empty object if missing/unreadable). Returns JSON. |
+| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. JSON request returns JSON; form request returns an HTML success page. Invalid sources return an HTML error page for browsers or a JSON error object for API clients (400). |
 
-### Task 7.3: HTML Pages (HTMX)
+### Task 7.3: HTML Pages (Plain Forms)
 
 | Route | Method | Auth | Description |
 |-------|--------|------|-------------|
-| `/` | GET | Yes | Dashboard: menu bar + HTMX-loaded status card from `/api/status` |
-| `/sources` | GET | Yes | Source list: menu bar + HTMX-loaded source table from `/api/sources` |
+| `/` | GET | Yes | Dashboard: menu bar + server-rendered source cards and count |
+| `/sources` | GET | Yes | Source list: menu bar + server-rendered source cards with delete forms |
 | `/sources/add` | GET | Yes | Menu bar + source type picker (links to `/sources/dropbox` and `/sources/google-drive`) |
 | `/sources/dropbox` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/dropbox`) |
 | `/sources/google-drive` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/google-drive`) |
-| `/sources/google-drive-oauth` | GET | Yes | Menu bar + OAuth setup form (Phase 8) |
-| `/oauth/google/callback` | GET | **No** | Handles Google OAuth redirect (Phase 8) |
+| `/sources/google-drive-service-account` | GET | Yes | Menu bar + service-account setup form and instructions (Phase 8) |
 
 ### Task 7.4: Page Layout
 
@@ -347,7 +390,7 @@ Every HTML page shares the same structure:
 │  Home │ Sources │ Add   │  ← menu bar, active page highlighted
 ├─────────────────────────┤
 │                         │
-│  [page content here]    │  ← HTMX-loaded or server-rendered
+│  [page content here]    │  ← server-rendered HTML
 │                         │
 └─────────────────────────┘
 ```
@@ -371,22 +414,73 @@ Every HTML page shares the same structure:
 
 ---
 
-## Phase 8: Google Drive OAuth (Private Folders — Deferred)
+## Phase 8: Google Drive Private Folders (Service Account)
 
-### Task 8.1: OAuth Flow
-- Extends Google Drive source to support `refresh_token` + `client_id` +
-  `client_secret` in addition to `api_key`.
-- Admin UI: `/sources/google-drive-oauth` with OAuth setup form and
-  "Connect Google Drive" button.
-- User must create their own Google Cloud project (documented in
-  `docs/google-drive-setup.md`).
-- Button redirects user's browser to Google's OAuth consent screen.
-- Callback: `/oauth/google/callback?code=...` (no basic auth on this route).
-- Server exchanges code for refresh token, stores in staging config.
-- Dependencies added: `oauth2` crate.
+Google OAuth redirects cannot be used for the frame: the admin UI is plain HTTP
+on a LAN address and Google requires HTTPS for non-localhost redirect URIs. The
+device flow was also evaluated and rejected: Google restricts it to
+`drive.appdata` and `drive.file`, neither of which can read an existing folder
+of photos.
 
-**Deferred:** This is the most complex phase. The API key path (Phase 6)
-handles the common case (public folders) with zero OAuth complexity.
+A **service account** solves both problems. The user creates it in their
+existing Google Cloud project, shares a normal Drive folder with its synthetic
+email as Viewer, and pastes the JSON key into the admin UI. The frame signs a
+JWT with the key to obtain a `drive.readonly` access token.
+
+### Task 8.1: Service-account authentication
+- Add `AuthMode::ServiceAccount` to `src/import/gdrive.rs`, driven by the
+  `service_account_json` source param.
+- Parse the JSON key, requiring `client_email` and `private_key`; fall back to
+  `https://oauth2.googleapis.com/token` when `token_uri` is absent.
+- Build an RS256 JWT (`iss`, `scope=drive.readonly`, `aud=token_uri`, `iat`,
+  `exp` ≈ 1 hour) and sign it with the key's PEM using `openssl` (already in the
+  tree via native-tls).
+- POST to `token_uri` with
+  `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and the assertion.
+- Cache the access token and refresh it shortly before expiry.
+- Generalize request auth: Bearer header for service accounts and refresh-token
+  sources, `?key=` for API-key sources.
+- `connect()` fetches the first token and validates the folder before returning.
+- Tests use a local mock token endpoint plus a mock Drive API, and verify the
+  JWT signature with the matching public key.
+
+### Task 8.2: Admin UI
+- New page `GET /sources/google-drive-service-account` with the setup
+  instructions and a form (name, folder ID, interval, JSON key textarea) that
+  posts to the existing `/api/sources/google-drive` endpoint.
+- Link from `/sources/add`: "Google Drive (Private, Service Account)".
+- `validate_sources` requires `folder_id`, exactly one auth method, and a
+  parseable service-account key with `client_email` and `private_key`.
+- The old `/oauth/google/callback` route, its handler, and the OAuth
+  form/success/error templates are removed. Every admin route now requires basic
+  auth.
+- The unused `oauth2` dependency is removed.
+
+### Task 8.3: Setup documentation
+- Rewrite `docs/google-drive-setup.md` for the service-account flow: Google
+  Cloud project, Drive API, service account and JSON key, folder sharing as
+  Viewer, folder ID, admin UI. Document that the service account cannot own
+  files, so the folder is user-owned, and warn that the key is sensitive.
+
+---
+
+## Future Work (not part of this phase)
+
+These are backlog items, deliberately out of scope for the service-account PR.
+
+1. **HTTPS for the admin UI (advanced setup).** Serve config mode over HTTPS
+   with a real certificate, for example Let's Encrypt DNS-01 validation for a
+   user-owned hostname, or a tunnel that terminates TLS in front of the frame.
+   This is an advanced option: it needs a DNS provider, a stable hostname, and
+   certificate renewal on a Pi that is often offline. Document it as an
+   alternative, not the default LAN flow.
+2. **Revisit a normal Google web OAuth callback.** Once the admin UI has HTTPS,
+   a standard web OAuth client with a redirect URI becomes possible. Re-evaluate
+   it then, including whether it is meaningfully better than a service account.
+3. **Device flow remains rejected.** Google limits device-flow scopes to
+   `drive.appdata`/`drive.file`, which cannot read an existing user folder. Do
+   not implement it unless Google changes that restriction.
+
 
 ---
 
@@ -400,7 +494,8 @@ handles the common case (public folders) with zero OAuth complexity.
 | `reqwest` (blocking) | 5, 6 | HTTP client for Dropbox, Google Drive |
 | `httparse` | — (replaced by tiny_http_fork) | — |
 | `tiny_http_fork` | 7 | HTTP server (CVE-fixed fork of tiny_http) |
-| `oauth2` | 8 (deferred) | Google Drive OAuth client/refresh flow |
+| `openssl` | 8 | RS256 JWT signing for service accounts (already in the Linux tree via native-tls) |
+| `base64` | 8 | JWT segment encoding (already present via reqwest) |
 
 ---
 
@@ -414,9 +509,9 @@ handles the common case (public folders) with zero OAuth complexity.
 | 2.1 | QR code JPEG generation + tests | Small |
 | 2.2 | Config mode screen render | Small |
 | 2.3 | Password generation + basic auth | Small |
-| 3.1 | State machine (NORMAL/IMPORT/CONFIG) | Medium |
-| 3.2 | Staged config + atomic deploy | Small |
-| 3.3 | First sync status screen | Small |
+| 3.1 | State machine (NORMAL/FIRST_SYNC/IMPORT/CONFIG + retry) | Medium |
+| 3.2 | Staged config (seeded), validation, atomic deploy | Small |
+| 3.3 | First sync status screen + index polling | Small |
 | 4.1 | Module reorg (`src/import/`) | Small |
 | 4.2 | `RemotePhotoSource` trait | Small |
 | 4.3 | Scheduler + cursor persistence | Medium |
@@ -424,12 +519,14 @@ handles the common case (public folders) with zero OAuth complexity.
 | 5.1 | Dropbox source + tests | Medium |
 | 6.1 | Google Drive source (API key) + tests | Medium |
 | 6.2 | Google Drive setup docs | Small |
-| 7.1 | DIY HTTP server (TcpListener + httparse) | Medium |
+| 7.1 | HTTP server (tiny_http_fork) | Medium |
 | 7.2 | API routes (JSON, REST) | Medium |
-| 7.3 | HTML pages (HTMX, menu bar layout) | Medium |
-| 7.4 | Page layout + HTMX wiring | Small |
-| 8.1 | Google Drive OAuth (deferred) | Large |
-| 8.2 | OAuth setup documentation | Small |
+| 7.3 | HTML pages (plain forms, menu bar layout) | Medium |
+| 7.4 | Page layout + 303 redirect flow | Small |
+| 8.1 | Google Drive service-account auth (JWT bearer) + tests | Medium |
+| 8.2 | Service-account admin form, validation, OAuth route removal | Medium |
+| 8.3 | Service-account setup documentation | Small |
+| — | Future: HTTPS for the admin UI, then revisit web OAuth (backlog) | Large |
 
 ---
 

@@ -153,8 +153,8 @@ fn test_display_loop_streams_to_mock_server() {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let received_clone = received.clone();
 
-    let server_handle = thread::spawn(move || match listener.accept() {
-        Ok((stream, _)) => {
+    let server_handle = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
             let reader = BufReader::new(stream);
             for line in reader.lines() {
                 match line {
@@ -163,7 +163,6 @@ fn test_display_loop_streams_to_mock_server() {
                 }
             }
         }
-        Err(_) => {}
     });
 
     // Give the server a moment to be ready
@@ -251,8 +250,8 @@ fn test_display_loop_wraps_at_eof() {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let received_clone = received.clone();
 
-    let server_handle = thread::spawn(move || match listener.accept() {
-        Ok((stream, _)) => {
+    let server_handle = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
             let reader = BufReader::new(stream);
             for line in reader.lines() {
                 match line {
@@ -261,7 +260,6 @@ fn test_display_loop_wraps_at_eof() {
                 }
             }
         }
-        Err(_) => {}
     });
 
     thread::sleep(Duration::from_millis(50));
@@ -537,8 +535,8 @@ fn test_full_pipeline_import_then_display() {
     let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let received_clone = received.clone();
 
-    let server_handle = thread::spawn(move || match listener.accept() {
-        Ok((stream, _)) => {
+    let server_handle = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
             let reader = BufReader::new(stream);
             for line in reader.lines() {
                 match line {
@@ -547,7 +545,6 @@ fn test_full_pipeline_import_then_display() {
                 }
             }
         }
-        Err(_) => {}
     });
 
     thread::sleep(Duration::from_millis(50));

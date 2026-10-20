@@ -7,7 +7,9 @@ make              # C display app + Rust manager (native)
 make c            # C app only
 make rust         # Rust manager only
 make deb          # Build Debian package (requires cargo-deb)
-make test         # Run Rust tests
+make test         # Rust tests + C build/lint in a container
+make test-rust    # Rust tests only
+make test-c       # C build + lint in a container
 make clean        # Clean everything
 make run-display  # Runs the C display app
 make run-manager  # Runs the Rust manager app

@@ -22,8 +22,11 @@
 //! is stopped with its `Arc<AtomicBool>` shutdown flag.
 
 use photo_frame_manager::admin_server::AdminServer;
+use photo_frame_manager::config::RemoteSourceConfig;
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -44,10 +47,35 @@ struct TestServer {
     _lock: MutexGuard<'static, ()>,
 }
 
+fn staged_source(source_type: &str, name: &str, params: &[(&str, &str)]) -> RemoteSourceConfig {
+    RemoteSourceConfig {
+        source_type: source_type.to_string(),
+        name: name.to_string(),
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<HashMap<_, _>>(),
+        check_interval_seconds: 3600,
+    }
+}
+
 impl TestServer {
     fn start() -> Self {
+        Self::start_with(Vec::new())
+    }
+
+    fn start_with(sources: Vec<RemoteSourceConfig>) -> Self {
+        Self::start_with_status(sources, None)
+    }
+
+    fn start_with_status(sources: Vec<RemoteSourceConfig>, status_path: Option<PathBuf>) -> Self {
         let lock = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let server = Arc::new(AdminServer::new(PASSWORD.to_string()).expect("create admin server"));
+        let mut server =
+            AdminServer::new(PASSWORD.to_string(), sources).expect("create admin server");
+        if let Some(path) = status_path {
+            server = server.with_status_path(path);
+        }
+        let server = Arc::new(server);
         let port = server.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let client = Client::builder()
@@ -277,6 +305,357 @@ fn finish_via_json_returns_json() {
     let body = response.text().expect("read finish JSON");
     assert!(body.contains(r#""ok":true"#), "finish body: {body}");
     assert!(s.server.finished());
+}
+
+#[test]
+fn preloaded_sources_appear_in_pages_and_api() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Existing Dropbox",
+        &[("access_token", "sl.preseeded")],
+    )]);
+
+    let page = s.get("/sources").text().expect("read sources page");
+    assert!(page.contains("Existing Dropbox"), "sources page: {page}");
+
+    let dashboard = s.get("/").text().expect("read dashboard");
+    assert!(
+        dashboard.contains("Existing Dropbox"),
+        "dashboard: {dashboard}"
+    );
+
+    let response = s.get("/api/sources");
+    assert_eq!(response.status(), 200);
+    let body = response.text().expect("read sources JSON");
+    assert!(body.contains("Existing Dropbox"), "sources JSON: {body}");
+
+    // An existing source can be removed, not just newly added ones.
+    let delete = s.post_empty_form("/api/sources/Existing%20Dropbox");
+    assert_eq!(delete.status(), 303);
+    assert!(s.server.take_sources().is_empty());
+}
+
+#[test]
+fn finish_form_with_incomplete_google_drive_returns_html_error() {
+    let s = TestServer::start_with(vec![staged_source(
+        "google_drive",
+        "Broken Drive",
+        &[("api_key", "AIza-but-no-folder")],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 400);
+    assert!(
+        content_type(&response).starts_with("text/html"),
+        "browser form errors must be HTML, got {}",
+        content_type(&response)
+    );
+    let body = response.text().expect("read error page");
+    assert!(body.contains("folder ID"), "error page: {body}");
+    assert!(
+        !s.server.finished(),
+        "a failed validation must not stop the server"
+    );
+}
+
+#[test]
+fn finish_json_with_incomplete_source_returns_json_error() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "No Token",
+        &[("folder", "/Photos")],
+    )]);
+
+    let response = s.post_json("/api/finish", "{}");
+
+    assert_eq!(response.status(), 400);
+    assert!(
+        content_type(&response).starts_with("application/json"),
+        "API errors must be JSON, got {}",
+        content_type(&response)
+    );
+    let body = response.text().expect("read error JSON");
+    assert!(body.contains("access token"), "error JSON: {body}");
+    assert!(!s.server.finished());
+
+    // The invalid source is still staged so the user can fix it.
+    assert_eq!(s.server.take_sources().len(), 1);
+}
+
+#[test]
+fn finish_with_duplicate_names_returns_error() {
+    let s = TestServer::start_with(vec![
+        staged_source("dropbox", "Dupe", &[("access_token", "sl.a")]),
+        staged_source("dropbox", " Dupe ", &[("access_token", "sl.b")]),
+    ]);
+
+    let response = s.post_json("/api/finish", "{}");
+    assert_eq!(response.status(), 400);
+    let body = response.text().unwrap();
+    assert!(body.contains("more than once"), "error JSON: {body}");
+    assert!(!s.server.finished());
+}
+
+#[test]
+fn finish_with_valid_preloaded_source_succeeds() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Valid Dropbox",
+        &[("access_token", "sl.good")],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("text/html"));
+    assert!(s.server.finished());
+    let sources = s.server.take_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].name, "Valid Dropbox");
+}
+
+#[test]
+fn status_includes_staged_sources_and_sync_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let status_path = dir.path().join("sync-status.json");
+    std::fs::write(
+        &status_path,
+        r#"{"sources":{"My Dropbox":{"last_sync":123,"last_attempt":120,"state":"ok","error":null}}}"#,
+    )
+    .unwrap();
+
+    let s = TestServer::start_with_status(
+        vec![staged_source(
+            "dropbox",
+            "My Dropbox",
+            &[("access_token", "sl.x")],
+        )],
+        Some(status_path),
+    );
+
+    let response = s.get("/api/status");
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("application/json"));
+
+    let body: serde_json::Value =
+        serde_json::from_str(&response.text().expect("read status")).expect("valid status JSON");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["sources"][0]["name"], "My Dropbox");
+    assert_eq!(body["sync"]["sources"]["My Dropbox"]["last_sync"], 123);
+    assert_eq!(body["sync"]["sources"]["My Dropbox"]["state"], "ok");
+}
+
+#[test]
+fn status_without_sync_file_returns_empty_sync_object() {
+    let s = TestServer::start();
+
+    let body: serde_json::Value =
+        serde_json::from_str(&s.get("/api/status").text().expect("read status"))
+            .expect("valid status JSON");
+    assert_eq!(body["sync"], serde_json::json!({}));
+    assert_eq!(body["count"], 0);
+}
+
+/// Shape-only service-account key used by the admin tests. The private key is
+/// not a real PEM because saving a source never signs anything.
+fn service_account_json() -> String {
+    r#"{"type":"service_account","project_id":"test-project","private_key_id":"key-id","private_key":"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----","client_email":"frame@test-project.iam.gserviceaccount.com","token_uri":"https://oauth2.googleapis.com/token"}"#.to_string()
+}
+
+#[test]
+fn add_source_page_links_the_service_account_form() {
+    let s = TestServer::start();
+
+    let page = s.get("/sources/add").text().expect("read add page");
+    assert!(
+        page.contains("Google Drive (Private, Service Account)"),
+        "add page: {page}"
+    );
+    assert!(
+        page.contains("/sources/google-drive-service-account"),
+        "add page must link the service-account form: {page}"
+    );
+    assert!(
+        !page.contains("/sources/google-drive-oauth"),
+        "the old OAuth link must be gone: {page}"
+    );
+}
+
+#[test]
+fn service_account_form_renders_setup_instructions() {
+    let s = TestServer::start();
+
+    let response = s.get("/sources/google-drive-service-account");
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("text/html"));
+    let page = response.text().expect("read service-account form");
+
+    assert!(page.contains("Service Account"), "form page: {page}");
+    assert!(
+        page.contains("name=\"service_account_json\""),
+        "form must have a JSON textarea: {page}"
+    );
+    assert!(
+        page.contains("name=\"folder_id\""),
+        "form must ask for a folder ID: {page}"
+    );
+    assert!(
+        page.contains("Enable the <b>Google Drive API</b>"),
+        "form must explain enabling the Drive API: {page}"
+    );
+    assert!(
+        page.contains("Viewer"),
+        "form must explain sharing the folder as Viewer: {page}"
+    );
+    assert!(
+        page.contains("cannot own"),
+        "form must note that a service account cannot own files: {page}"
+    );
+}
+
+#[test]
+fn form_service_account_save_redirects_and_stages_source() {
+    let s = TestServer::start();
+    let key = service_account_json();
+
+    let response = s.post_form(
+        "/api/sources/google-drive",
+        &[
+            ("name", "Family Drive"),
+            ("folder_id", "folder-123"),
+            ("check_interval_seconds", "7200"),
+            ("service_account_json", &key),
+        ],
+    );
+
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), "/sources");
+
+    let sources = s.server.take_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].name, "Family Drive");
+    assert_eq!(sources[0].source_type, "google_drive");
+    assert_eq!(sources[0].check_interval_seconds, 7200);
+    assert_eq!(
+        sources[0].params.get("service_account_json"),
+        Some(&key),
+        "the full JSON key must be staged for the scheduler"
+    );
+    assert_eq!(
+        sources[0].params.get("folder_id"),
+        Some(&"folder-123".to_string())
+    );
+
+    let page = s.get("/sources").text().expect("read sources page");
+    assert!(page.contains("Family Drive"), "sources page: {page}");
+}
+
+#[test]
+fn form_service_account_save_rejects_malformed_json_with_html_error() {
+    let s = TestServer::start();
+
+    let response = s.post_form(
+        "/api/sources/google-drive",
+        &[
+            ("name", "Broken Drive"),
+            ("folder_id", "folder-123"),
+            ("service_account_json", "{not json"),
+        ],
+    );
+
+    assert_eq!(response.status(), 400);
+    assert!(
+        content_type(&response).starts_with("text/html"),
+        "browser form errors must be HTML, got {}",
+        content_type(&response)
+    );
+    let body = response.text().expect("read error page");
+    assert!(body.contains("not valid JSON"), "error page: {body}");
+    assert!(
+        s.server.take_sources().is_empty(),
+        "a malformed key must not be staged"
+    );
+}
+
+#[test]
+fn form_service_account_save_rejects_missing_fields_with_html_error() {
+    let s = TestServer::start();
+
+    let missing_email =
+        r#"{"private_key":"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----"}"#;
+    let response = s.post_form(
+        "/api/sources/google-drive",
+        &[
+            ("name", "No Email"),
+            ("folder_id", "folder-123"),
+            ("service_account_json", missing_email),
+        ],
+    );
+
+    assert_eq!(response.status(), 400);
+    assert!(content_type(&response).starts_with("text/html"));
+    let body = response.text().expect("read error page");
+    assert!(body.contains("client_email"), "error page: {body}");
+    assert!(
+        !body.contains("BEGIN PRIVATE KEY"),
+        "error page leaks the key: {body}"
+    );
+    assert!(s.server.take_sources().is_empty());
+}
+
+#[test]
+fn finish_succeeds_with_a_valid_service_account_source() {
+    let s = TestServer::start_with(vec![staged_source(
+        "google_drive",
+        "Family Drive",
+        &[
+            ("folder_id", "folder-123"),
+            ("service_account_json", &service_account_json()),
+        ],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("text/html"));
+    let body = response.text().expect("read finish page");
+    assert!(body.contains("Setup Complete"), "finish page: {body}");
+    assert!(s.server.finished());
+    assert_eq!(s.server.take_sources().len(), 1);
+}
+
+#[test]
+fn finish_rejects_a_malformed_service_account_key_with_html_error() {
+    let s = TestServer::start_with(vec![staged_source(
+        "google_drive",
+        "Broken Drive",
+        &[("folder_id", "folder-123"), ("service_account_json", "{}")],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 400);
+    assert!(content_type(&response).starts_with("text/html"));
+    let body = response.text().expect("read error page");
+    assert!(body.contains("client_email"), "error page: {body}");
+    assert!(!s.server.finished());
+}
+
+#[test]
+fn oauth_callback_route_is_gone_and_requires_auth() {
+    let s = TestServer::start();
+
+    // The callback used to be the one unauthenticated route.
+    let anonymous = s
+        .client
+        .get(s.url("/oauth/google/callback?code=abc"))
+        .send()
+        .expect("unauthenticated OAuth GET");
+    assert_eq!(anonymous.status(), 401);
+
+    let authenticated = s.get("/oauth/google/callback?code=abc");
+    assert_eq!(authenticated.status(), 404);
 }
 
 #[test]
