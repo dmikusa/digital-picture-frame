@@ -28,6 +28,24 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Serializes photo imports across the whole process. USB mounts spawn import
+/// threads while the remote sync scheduler imports on its own thread; both
+/// mutate the same index and dedup set. `IndexWriter` captures metadata when it
+/// is opened and `sync_metadata` renames the file based on that snapshot, so two
+/// concurrent imports can rename over each other and lose entries. The
+/// check-then-insert on the dedup set is racy for the same reason.
+static IMPORT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the process-wide import lock.
+///
+/// A panic in an earlier import must not wedge imports forever, so a poisoned
+/// lock is recovered instead of propagating the panic.
+fn lock_imports() -> std::sync::MutexGuard<'static, ()> {
+    IMPORT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Events emitted by the USB watcher for the config mode state machine.
 #[derive(Debug, Clone)]
 pub enum MountEvent {
@@ -401,6 +419,11 @@ pub(crate) fn import_single_photo(
     dedup_set: &Arc<Mutex<HashSet<u64>>>,
     config: &Config,
 ) -> io::Result<bool> {
+    // Hold the import lock for the whole operation: dedup check, conversion,
+    // rotation, index append, and dedup insert. Scanning happens before this is
+    // called, so the lock is only held per photo.
+    let _import_guard = lock_imports();
+
     // Compute hash
     let hash = compute_file_hash(src_path)?;
 
@@ -413,42 +436,30 @@ pub(crate) fn import_single_photo(
         }
     }
 
-    // Determine destination path based on file mtime
+    // Determine destination path based on file mtime. The sequence number is the
+    // CSV line index this photo will occupy, so same-named photos imported close
+    // together cannot overwrite each other.
     let mtime = fs::metadata(src_path)?
         .modified()
         .unwrap_or(SystemTime::now());
-    let dest_path = build_dest_path(src_path, photos_dir, mtime);
+    let (_index_path, meta) = index::init_index(index_dir)?;
+    let dest_path = build_dest_path(src_path, photos_dir, mtime, meta.total_lines());
 
     // Ensure parent directory exists
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Convert and copy
+    // Convert and copy. If the photos partition is full, delete the oldest
+    // photos and retry until the conversion succeeds or there is nothing left
+    // to delete.
     let (width, height) = config.resolution();
     let mode = &config.aspect_ratio_mode;
-    match convert_image(src_path, &dest_path, width, height, mode) {
-        Ok(()) => {}
-        Err(e) => {
-            // If ENOSPC, try to free space and retry once
-            if e.kind() == io::ErrorKind::WriteZero {
-                log::warn!("Disk full, attempting rotation");
-                let (_index_path, meta) = index::init_index(index_dir)?;
-                let (_new_meta, deleted) =
-                    index::delete_oldest(index_dir, &meta, config.batch_delete_size)?;
-                log::info!("Deleted {} old photos to free space", deleted);
-                // Retry the conversion
-                if let Err(e2) = convert_image(src_path, &dest_path, width, height, mode) {
-                    return Err(io::Error::other(format!(
-                        "Conversion failed after rotation: {}",
-                        e2
-                    )));
-                }
-            } else {
-                return Err(e);
-            }
-        }
-    }
+    convert_with_rotation(
+        || convert_image(src_path, &dest_path, width, height, mode),
+        index_dir,
+        config.batch_delete_size,
+    )?;
 
     // Append to index
     let original_name = src_path
@@ -456,6 +467,9 @@ pub(crate) fn import_single_photo(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    // Re-read the index metadata before opening the writer: rotation deletes
+    // photos and renames the index (changing `start_line`), so the snapshot taken
+    // before the conversion may be stale even though `total_lines` is stable.
     let (_index_path, meta) = index::init_index(index_dir)?;
     let mut writer = IndexWriter::open(index_dir, meta)?;
     let line_number = writer.append(&dest_path.to_string_lossy(), &original_name, hash)?;
@@ -494,7 +508,9 @@ fn compute_file_hash(path: &Path) -> io::Result<u64> {
 }
 
 /// Build the destination path: photos_dir/YYYY/MM/DD/DDDDD_original_name.jpg
-fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime) -> PathBuf {
+///
+/// `seq` is the CSV line index the photo will be appended at.
+fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime, seq: usize) -> PathBuf {
     let duration = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
     let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
         .unwrap_or_else(chrono::Utc::now);
@@ -509,19 +525,11 @@ fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime) -> Pat
         .to_string_lossy()
         .to_string();
 
-    // For now, use a timestamp-based sequence number since we don't know the CSV line yet
-    // The actual sequence number will be assigned after CSV append
-    let seq = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let seq_str = format!("{:05}", seq % 100000);
-
     let mut dest = photos_dir
         .join(year)
         .join(month)
         .join(day)
-        .join(format!("{}_{}", seq_str, original_name));
+        .join(format!("{:05}_{}", seq, original_name));
 
     // ImageMagick picks the output format from the destination extension, so a
     // HEIC/HEIF source would otherwise be re-encoded as HEIC. The display app's
@@ -574,10 +582,79 @@ fn convert_image(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let lower = stderr.to_lowercase();
+        // ImageMagick reports write failures on stdout/stderr with a human
+        // readable errno string, not a Rust io::Error, so translate it here.
+        if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
+            log::warn!(
+                "ImageMagick could not write {}: {}",
+                dest.display(),
+                stderr.trim()
+            );
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
         return Err(io::Error::other(format!("ImageMagick failed: {}", stderr)));
     }
 
     Ok(())
+}
+
+/// True when an error means the photos partition is out of space.
+fn is_enospc(e: &io::Error) -> bool {
+    if e.raw_os_error() == Some(libc::ENOSPC) {
+        return true;
+    }
+
+    // Some failure paths only preserve the message (for example a shelled-out
+    // tool wrapped with `io::Error::other`), so check that too.
+    let message = e.to_string().to_lowercase();
+    message.contains("no space left on device") || message.contains("disk quota exceeded")
+}
+
+/// Run `convert`, rotating out the oldest photos whenever it fails with ENOSPC.
+///
+/// Returns the number of photos deleted. Rotation always makes progress or
+/// errors out, so this cannot loop forever: each pass consumes valid index
+/// entries, and we stop as soon as the index or the filesystem is empty.
+fn convert_with_rotation<F>(
+    mut convert: F,
+    index_dir: &Path,
+    batch_delete_size: usize,
+) -> io::Result<usize>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    let mut deleted_total = 0;
+
+    loop {
+        match convert() {
+            Ok(()) => return Ok(deleted_total),
+            Err(e) if !is_enospc(&e) => return Err(e),
+            Err(e) => {
+                log::warn!("Disk full while converting ({}), attempting rotation", e);
+
+                let (_index_path, meta) = index::init_index(index_dir)?;
+                if meta.valid_count == 0 {
+                    return Err(io::Error::other(format!(
+                        "Conversion failed and there are no photos left to delete: {}",
+                        e
+                    )));
+                }
+
+                let (_new_meta, deleted) =
+                    index::delete_oldest(index_dir, &meta, batch_delete_size)?;
+                log::info!("Deleted {} old photos to free space", deleted);
+                if deleted == 0 {
+                    return Err(io::Error::other(format!(
+                        "Conversion failed and rotation freed no space: {}",
+                        e
+                    )));
+                }
+
+                deleted_total += deleted;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -656,14 +733,180 @@ mod tests {
     }
 
     #[test]
+    fn test_is_enospc_recognizes_raw_os_error_and_message() {
+        assert!(is_enospc(&io::Error::from_raw_os_error(libc::ENOSPC)));
+        assert!(is_enospc(&io::Error::other(
+            "ImageMagick failed: unable to write image: No space left on device"
+        )));
+        assert!(is_enospc(&io::Error::other(
+            "write failed: Disk quota exceeded"
+        )));
+        assert!(!is_enospc(&io::Error::other(
+            "ImageMagick failed: corrupt image"
+        )));
+        assert!(!is_enospc(&io::Error::from_raw_os_error(libc::EACCES)));
+    }
+
+    /// Create `count` placeholder photos plus an index that references them.
+    fn create_index_with_photos(dir: &Path, count: usize) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for i in 0..count {
+            let path = dir.join(format!("{i:05}_photo.jpg"));
+            File::create(&path).unwrap();
+            paths.push(path);
+        }
+
+        let meta = index::IndexMetadata {
+            start_line: 0,
+            valid_count: count,
+        };
+        let mut file = File::create(dir.join(index::build_index_filename(&meta))).unwrap();
+        for (i, path) in paths.iter().enumerate() {
+            writeln!(file, "{},photo{}.jpg,{}", path.display(), i, i + 1).unwrap();
+        }
+        file.flush().unwrap();
+
+        paths
+    }
+
+    #[test]
+    fn test_convert_with_rotation_deletes_oldest_and_retries() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 5);
+        let mut calls = 0;
+
+        let deleted = convert_with_rotation(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                } else {
+                    Ok(())
+                }
+            },
+            tmpdir.path(),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(calls, 2, "conversion should be retried after rotation");
+        assert_eq!(deleted, 2);
+        assert!(!photos[0].exists(), "oldest photo should be deleted");
+        assert!(!photos[1].exists(), "second oldest photo should be deleted");
+        for photo in &photos[2..] {
+            assert!(photo.exists(), "newer photo should be kept: {photo:?}");
+        }
+
+        let (_path, meta) = index::init_index(tmpdir.path()).unwrap();
+        assert_eq!(meta.start_line, 2);
+        assert_eq!(meta.valid_count, 3);
+    }
+
+    #[test]
+    fn test_convert_with_rotation_errors_when_no_photos_remain() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 2);
+
+        let result = convert_with_rotation(
+            || Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+            tmpdir.path(),
+            5,
+        );
+
+        assert!(result.is_err(), "should give up when nothing is left");
+        assert!(photos.iter().all(|photo| !photo.exists()));
+
+        let (_path, meta) = index::init_index(tmpdir.path()).unwrap();
+        assert_eq!(meta.valid_count, 0);
+    }
+
+    #[test]
+    fn test_convert_with_rotation_errors_with_empty_index() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        index::init_index(tmpdir.path()).unwrap();
+
+        let result = convert_with_rotation(
+            || Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+            tmpdir.path(),
+            20,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_with_rotation_propagates_non_enospc_errors() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 2);
+        let mut calls = 0;
+
+        let result = convert_with_rotation(
+            || {
+                calls += 1;
+                Err(io::Error::other("ImageMagick failed: corrupt image"))
+            },
+            tmpdir.path(),
+            1,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "non-ENOSPC errors must not trigger rotation");
+        assert!(photos.iter().all(|photo| photo.exists()));
+    }
+
+    #[test]
     fn test_build_dest_path() {
         let photos_dir = PathBuf::from("/photos");
         let src = PathBuf::from("/usb/myphoto.jpg");
         let mtime = UNIX_EPOCH + Duration::from_secs(1609459200); // 2021-01-01
-        let dest = build_dest_path(&src, &photos_dir, mtime);
+        let dest = build_dest_path(&src, &photos_dir, mtime, 42);
         let dest_str = dest.to_string_lossy();
         assert!(dest_str.contains("/photos/2021/01/01/"));
-        assert!(dest_str.contains("myphoto.jpg"));
+        assert_eq!(
+            dest.file_name().unwrap().to_string_lossy(),
+            "00042_myphoto.jpg",
+            "filename should use the zero-padded CSV line number"
+        );
+    }
+
+    #[test]
+    fn test_build_dest_path_pads_small_sequence_numbers() {
+        let photos_dir = PathBuf::from("/photos");
+        let src = PathBuf::from("/usb/myphoto.jpg");
+        let mtime = UNIX_EPOCH + Duration::from_secs(1609459200);
+
+        let dest = build_dest_path(&src, &photos_dir, mtime, 7);
+        assert_eq!(
+            dest.file_name().unwrap().to_string_lossy(),
+            "00007_myphoto.jpg"
+        );
+
+        // Numbers wider than five digits are not truncated.
+        let dest = build_dest_path(&src, &photos_dir, mtime, 123456);
+        assert_eq!(
+            dest.file_name().unwrap().to_string_lossy(),
+            "123456_myphoto.jpg"
+        );
+    }
+
+    #[test]
+    fn test_build_dest_path_same_name_different_sequence_does_not_collide() {
+        let photos_dir = PathBuf::from("/photos");
+        let src = PathBuf::from("/usb/IMG_0001.jpg");
+        let mtime = UNIX_EPOCH + Duration::from_secs(1609459200);
+
+        let first = build_dest_path(&src, &photos_dir, mtime, 10);
+        let second = build_dest_path(&src, &photos_dir, mtime, 11);
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.file_name().unwrap().to_string_lossy(),
+            "00010_IMG_0001.jpg"
+        );
+        assert_eq!(
+            second.file_name().unwrap().to_string_lossy(),
+            "00011_IMG_0001.jpg"
+        );
     }
 
     #[test]
@@ -677,7 +920,7 @@ mod tests {
             "/usb/photo.png",
             "/usb/photo",
         ] {
-            let dest = build_dest_path(Path::new(src), &photos_dir, mtime);
+            let dest = build_dest_path(Path::new(src), &photos_dir, mtime, 0);
             assert_eq!(
                 dest.extension().and_then(|ext| ext.to_str()),
                 Some("jpg"),

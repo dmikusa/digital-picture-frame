@@ -61,6 +61,15 @@ fn normalized_stored_name(original_name: &str) -> String {
     format!("{}.jpg", original_stem(original_name))
 }
 
+/// Full stored-name suffix, including the zero-padded CSV line number.
+fn expected_stored_suffix(original_name: &str, line_number: usize) -> String {
+    format!(
+        "{:05}_{}",
+        line_number,
+        normalized_stored_name(original_name)
+    )
+}
+
 fn make_config(photos_dir: PathBuf, display_socket_path: PathBuf) -> Config {
     Config {
         photos_dir,
@@ -339,13 +348,16 @@ fn test_import_pipeline() {
         rec1.original_name
     );
     // Imports are always stored as JPEG, so the stored path keeps the original
-    // file stem but normalizes the extension to .jpg.
+    // file stem but normalizes the extension to .jpg. The sequence prefix is the
+    // CSV line number.
     assert!(
-        rec1.path
-            .ends_with(&normalized_stored_name(&rec1.original_name)),
-        "Stored path '{}' should end with '{}.jpg'",
+        rec1.path.ends_with(&expected_stored_suffix(
+            &rec1.original_name,
+            rec1.line_number
+        )),
+        "Stored path '{}' should end with '{}'",
         rec1.path,
-        original_stem(&rec1.original_name)
+        expected_stored_suffix(&rec1.original_name, rec1.line_number)
     );
 
     let rec2 = reader.next_record().unwrap().expect("second record");
@@ -355,11 +367,13 @@ fn test_import_pipeline() {
         rec2.original_name
     );
     assert!(
-        rec2.path
-            .ends_with(&normalized_stored_name(&rec2.original_name)),
-        "Stored path '{}' should end with '{}.jpg'",
+        rec2.path.ends_with(&expected_stored_suffix(
+            &rec2.original_name,
+            rec2.line_number
+        )),
+        "Stored path '{}' should end with '{}'",
         rec2.path,
-        original_stem(&rec2.original_name)
+        expected_stored_suffix(&rec2.original_name, rec2.line_number)
     );
     assert_ne!(rec1.original_name, rec2.original_name);
 
@@ -376,6 +390,110 @@ fn test_import_pipeline() {
         "Converted file should exist: {}",
         rec2.path
     );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent imports must leave a single, consistent index
+// ---------------------------------------------------------------------------
+#[test]
+fn test_concurrent_imports_keep_single_index() {
+    if !has_imagemagick() {
+        eprintln!("Skipping test_concurrent_imports_keep_single_index: ImageMagick not available");
+        return;
+    }
+
+    const PHOTO_COUNT: usize = 8;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let photos_dir = tmpdir.path().join("photos");
+    let socket_path = tmpdir.path().join("unused.sock");
+    fs::create_dir_all(&photos_dir).unwrap();
+
+    let config = make_config(photos_dir.clone(), socket_path);
+    let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+
+    // Each thread simulates a separate mount/remote batch importing one photo
+    // into the same photos directory at the same time.
+    let mut handles = Vec::new();
+    for i in 0..PHOTO_COUNT {
+        let src_dir = tmpdir.path().join(format!("src-{i}"));
+        fs::create_dir_all(&src_dir).unwrap();
+        let mut jpeg = minimal_jpeg_bytes();
+        // Distinct size (and therefore hash) per photo.
+        jpeg.resize(jpeg.len() + i + 1, 0);
+        fs::write(src_dir.join(format!("photo{i}.jpg")), &jpeg).unwrap();
+
+        let thread_config = config.clone();
+        let thread_dedup = dedup_set.clone();
+        let thread_photos = photos_dir.clone();
+        handles.push(thread::spawn(move || {
+            import::import_from_directory(
+                &src_dir.canonicalize().unwrap(),
+                &thread_photos,
+                &thread_photos,
+                &thread_dedup,
+                &thread_config,
+            )
+            .unwrap();
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Exactly one index file should remain.
+    let index_files: Vec<PathBuf> = fs::read_dir(&photos_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|name| index::parse_index_filename(&name.to_string_lossy()).is_some())
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        index_files.len(),
+        1,
+        "concurrent imports left multiple index files: {:?}",
+        index_files
+    );
+
+    let (index_path, meta) = index::init_index(&photos_dir).unwrap();
+    assert_eq!(
+        meta.valid_count, PHOTO_COUNT,
+        "index metadata lost entries during concurrent imports"
+    );
+
+    // The CSV itself must contain one parseable line per imported photo.
+    let contents = fs::read_to_string(&index_path).unwrap();
+    assert_eq!(
+        contents.lines().count(),
+        PHOTO_COUNT,
+        "index CSV has the wrong number of lines:\n{contents}"
+    );
+
+    let mut reader = index::IndexReader::open(&index_path, meta).unwrap();
+    let mut imported_names = HashSet::new();
+    let mut parsed = 0;
+    while let Some(record) = reader.next_record().unwrap() {
+        assert!(
+            Path::new(&record.path).exists(),
+            "index references missing file: {}",
+            record.path
+        );
+        imported_names.insert(record.original_name);
+        parsed += 1;
+    }
+    assert_eq!(parsed, PHOTO_COUNT, "not every CSV line was parseable");
+
+    for i in 0..PHOTO_COUNT {
+        let expected = format!("photo{i}.jpg");
+        assert!(
+            imported_names.contains(&expected),
+            "missing {expected} from index; found {imported_names:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

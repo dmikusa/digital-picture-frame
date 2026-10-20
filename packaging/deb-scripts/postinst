@@ -19,14 +19,35 @@ set -e
 
 case "$1" in
   configure)
+    # Create the service group explicitly. useradd normally creates a matching
+    # private group when USERGROUPS_ENAB is enabled, but that is not guaranteed
+    # on every system, and the chown calls below need the group to exist.
+    if ! getent group photo-frame >/dev/null 2>&1; then
+      groupadd --system photo-frame
+    fi
+
     # Create dedicated user if it doesn't exist
     if ! id -u photo-frame &>/dev/null; then
-      useradd -r -s /bin/false -G video photo-frame
+      useradd --system --gid photo-frame --groups video \
+        --shell /bin/false photo-frame
     fi
 
     # Ensure photos directory exists with correct ownership
     mkdir -p /var/lib/photo-frame/photos
     chown photo-frame:photo-frame /var/lib/photo-frame/photos
+
+    # Config mode rewrites config.toml by creating a temp file in this directory
+    # and renaming it over the destination. The service user must own both the
+    # directory and the file for that to work, and config.toml may contain
+    # remote-source credentials, so keep it private.
+    mkdir -p /etc/photo-frame
+    chown photo-frame:photo-frame /etc/photo-frame
+    chmod 0750 /etc/photo-frame
+
+    if [ -f /etc/photo-frame/config.toml ]; then
+      chown photo-frame:photo-frame /etc/photo-frame/config.toml
+      chmod 0600 /etc/photo-frame/config.toml
+    fi
 
     # Reload systemd to pick up new units
     systemctl daemon-reload

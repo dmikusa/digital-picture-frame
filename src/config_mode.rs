@@ -21,8 +21,9 @@ use crate::import::MountEvent;
 use crate::qr;
 use std::collections::HashSet;
 use std::io;
+use std::io::Write;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -37,6 +38,60 @@ enum ConfigState {
     Importing { pending: HashSet<PathBuf> },
     /// Showing config-QR on screen, admin server running (Phase 7).
     ConfigMode { entered: Instant },
+}
+
+/// Serialize `config` to TOML and atomically replace `path`.
+///
+/// The temporary file is created in the same directory so the final rename is
+/// atomic. It is created with mode 0600 (config may contain credentials) and
+/// removed if any step fails, leaving the original file untouched.
+pub(crate) fn save_config_atomic(path: &Path, config: &Config) -> io::Result<()> {
+    let toml_str = toml::to_string_pretty(config).map_err(io::Error::other)?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("config path has no file name: {}", path.display()),
+        )
+    })?;
+    let tmp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    let result =
+        write_config_tmp(&tmp_path, &toml_str).and_then(|()| std::fs::rename(&tmp_path, path));
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    result
+}
+
+/// Write `contents` to `path`, creating it with mode 0600.
+fn write_config_tmp(path: &Path, contents: &str) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+
+    // Explicitly set the mode as well: the open mode is filtered through the
+    // process umask, and we always want config.toml to end up as 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }
 
 /// Owns the config-mode state machine.  Communicates with the USB-watcher via
@@ -116,10 +171,7 @@ impl ConfigEnvironment {
                 if !sources.is_empty() {
                     let mut config = self.config.clone();
                     config.remote_sources = sources;
-                    let toml_str = toml::to_string_pretty(&config).map_err(io::Error::other)?;
-                    let tmp = self.config_path.with_extension("toml.tmp");
-                    std::fs::write(&tmp, toml_str)?;
-                    std::fs::rename(&tmp, &self.config_path)?;
+                    save_config_atomic(&self.config_path, &config)?;
                     log::info!("Config saved to {}", self.config_path.display());
                 }
             }
@@ -276,4 +328,103 @@ pub fn run_config_mode_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AspectRatioMode, RemoteSourceConfig};
+    use std::collections::HashMap;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn sample_config(photos_dir: PathBuf) -> Config {
+        let mut params = HashMap::new();
+        params.insert("url".to_string(), "https://example.test".to_string());
+
+        Config {
+            photos_dir,
+            display_socket_path: PathBuf::from("/run/photo-frame/photo-frame.sock"),
+            control_socket_path: PathBuf::from("/run/photo-frame/control.sock"),
+            native_resolution: "1024x768".to_string(),
+            aspect_ratio_mode: AspectRatioMode::Fill,
+            batch_delete_size: 10,
+            log_max_size: 2048,
+            log_max_files: 3,
+            remote_sources: vec![RemoteSourceConfig {
+                source_type: "immich".to_string(),
+                name: "test-source".to_string(),
+                params,
+                check_interval_seconds: 3600,
+            }],
+        }
+    }
+
+    #[test]
+    fn save_config_atomic_round_trips_and_sets_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let photos_dir = dir.path().join("photos");
+        fs::create_dir(&photos_dir).unwrap();
+        let config = sample_config(photos_dir);
+
+        save_config_atomic(&path, &config).unwrap();
+
+        let loaded = Config::from_file(&path).unwrap();
+        assert_eq!(loaded.photos_dir, config.photos_dir.canonicalize().unwrap());
+        assert_eq!(loaded.native_resolution, "1024x768");
+        assert_eq!(loaded.batch_delete_size, 10);
+        assert_eq!(loaded.remote_sources.len(), 1);
+        assert_eq!(loaded.remote_sources[0].source_type, "immich");
+        assert_eq!(loaded.remote_sources[0].name, "test-source");
+        assert_eq!(
+            loaded.remote_sources[0].params.get("url").unwrap(),
+            "https://example.test"
+        );
+
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // The temporary file must not be left behind after a successful save.
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names
+            .iter()
+            .all(|name| !name.to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_config_atomic_preserves_original_on_failure() {
+        // Root bypasses directory permissions, so this failure mode cannot be
+        // triggered when tests run as root (e.g. in some containers).
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "original config").unwrap();
+        let config = sample_config(dir.path().to_path_buf());
+
+        let mut perms = fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(dir.path(), perms).unwrap();
+
+        let result = save_config_atomic(&path, &config);
+
+        let mut perms = fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(dir.path(), perms).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original config");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

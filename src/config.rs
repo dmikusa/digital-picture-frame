@@ -136,6 +136,15 @@ impl Config {
             return Err("batch_delete_size must be greater than 0".to_string());
         }
 
+        for source in &self.remote_sources {
+            if source.check_interval_seconds == 0 {
+                return Err(format!(
+                    "check_interval_seconds must be greater than 0 for remote source \"{}\"",
+                    source.name
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -234,6 +243,51 @@ native_resolution = "abcxdef"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_remote_check_interval() {
+        let photos_dir = tempfile::tempdir().unwrap();
+        let toml_str = format!(
+            r#"
+photos_dir = "{}"
+display_socket_path = "/tmp/sock"
+native_resolution = "1024x768"
+
+[[remote_sources]]
+type = "dropbox"
+name = "Test Dropbox"
+access_token = "token"
+check_interval_seconds = 0
+"#,
+            photos_dir.path().display()
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.remote_sources.len(), 1);
+        assert_eq!(config.remote_sources[0].check_interval_seconds, 0);
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("check_interval_seconds"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_remote_check_interval_default() {
+        let photos_dir = tempfile::tempdir().unwrap();
+        let toml_str = format!(
+            r#"
+photos_dir = "{}"
+display_socket_path = "/tmp/sock"
+native_resolution = "1024x768"
+
+[[remote_sources]]
+type = "dropbox"
+name = "Test Dropbox"
+access_token = "token"
+"#,
+            photos_dir.path().display()
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.remote_sources[0].check_interval_seconds, 86_400);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

@@ -123,6 +123,15 @@ Edit `/etc/photo-frame/config.toml` to change manager settings (photos directory
 Edit `/etc/photo-frame/display.env` to change display settings (fade duration, frame skip).
 Both files are marked as `conffiles`, so `dpkg` will preserve your changes on package upgrades.
 
+`/etc/photo-frame` is owned by `photo-frame:photo-frame` with mode `0750`, and
+`config.toml` is owned by the service user with mode `0600`. Config mode rewrites
+`config.toml` atomically (write a temp file in the same directory, then rename),
+so the service user must be able to write both the directory and the file. The
+config may contain credentials for remote photo sources, so keep it private. Edit
+it as root, for example with `sudoedit /etc/photo-frame/config.toml`.
+`display.env` remains root-owned with mode `0644`, and the `photo-frame` user can
+still read it through the directory.
+
 ### Building the Package Locally
 
 If you have `cargo-deb` installed:
