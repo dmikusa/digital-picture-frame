@@ -58,22 +58,8 @@ struct DropboxFormTemplate;
 struct GdriveFormTemplate;
 
 #[derive(Template)]
-#[template(path = "gdrive_oauth_form.html")]
-struct GdriveOauthFormTemplate {
-    redirect_uri: String,
-}
-
-#[derive(Template)]
-#[template(path = "oauth_success.html")]
-struct OauthSuccessTemplate {
-    name: String,
-}
-
-#[derive(Template)]
-#[template(path = "oauth_error.html")]
-struct OauthErrorTemplate {
-    message: String,
-}
+#[template(path = "gdrive_service_account_form.html")]
+struct GdriveServiceAccountFormTemplate;
 
 #[derive(Template)]
 #[template(path = "finish.html")]
@@ -163,8 +149,9 @@ impl AdminServer {
         let path = request.url().to_string();
         let method = request.method();
 
-        // Skip auth for OAuth callbacks
-        if !path.starts_with("/oauth/") && !self.check_auth(request) {
+        // Every route, including form pages, is behind basic auth. Config mode
+        // is only reachable from the LAN and the password rotates per session.
+        if !self.check_auth(request) {
             return Response::from_string("Unauthorized")
                 .with_status_code(StatusCode::from(401))
                 .with_header(
@@ -213,15 +200,8 @@ impl AdminServer {
             (Method::Get, "/sources/add") => serve_template(&AddSourceTemplate),
             (Method::Get, "/sources/dropbox") => serve_template(&DropboxFormTemplate),
             (Method::Get, "/sources/google-drive") => serve_template(&GdriveFormTemplate),
-            (Method::Get, "/sources/google-drive-oauth") => {
-                let redirect_uri = format!(
-                    "http://photo-frame.local:{}/oauth/google/callback",
-                    self.port
-                );
-                serve_template(&GdriveOauthFormTemplate { redirect_uri })
-            }
-            (Method::Get, p) if p.starts_with("/oauth/google/callback") => {
-                self.handle_oauth_callback(request)
+            (Method::Get, "/sources/google-drive-service-account") => {
+                serve_template(&GdriveServiceAccountFormTemplate)
             }
 
             _ => Response::from_string("Not Found")
@@ -282,6 +262,18 @@ impl AdminServer {
             .into_iter()
             .filter(|(k, _)| k != "name" && k != "check_interval_seconds")
             .collect();
+
+        // Catch a truncated or malformed service-account key at save time so
+        // the user sees the problem on the form instead of at Finish.
+        if source_type == "google_drive" {
+            if let Err(message) = validate_gdrive_params(&clean_params) {
+                return if form {
+                    html_error(400, &message)
+                } else {
+                    json_error(400, &message)
+                };
+            }
+        }
 
         let config = RemoteSourceConfig {
             source_type: source_type.to_string(),
@@ -379,82 +371,6 @@ impl AdminServer {
             )
         }
     }
-
-    fn handle_oauth_callback(&self, request: &Request) -> Response<Box<dyn std::io::Read + Send>> {
-        let url = request.url();
-        let code = url
-            .split("?code=")
-            .nth(1)
-            .and_then(|s| s.split('&').next())
-            .unwrap_or("");
-
-        if code.is_empty() {
-            return serve_template(&OauthErrorTemplate {
-                message: "No authorization code received".into(),
-            });
-        }
-
-        // We need the client_id and client_secret from the form submission.
-        // They are stored in the most recent OAuth source entry.
-        let oauth_params = {
-            let sources = self.staged_sources.lock().unwrap();
-            sources
-                .iter()
-                .find(|s| s.source_type == "google_drive" && s.params.contains_key("oauth_pending"))
-                .map(|s| (s.params.clone(), s.name.clone()))
-        };
-
-        let (params, name) = match oauth_params {
-            Some(p) => p,
-            None => {
-                return serve_template(&OauthErrorTemplate {
-                    message: "No OAuth setup found. Start from /sources/google-drive-oauth first."
-                        .into(),
-                });
-            }
-        };
-
-        let client_id = params.get("client_id").cloned().unwrap_or_default();
-        let client_secret = params.get("client_secret").cloned().unwrap_or_default();
-        let redirect_uri = format!(
-            "http://photo-frame.local:{}/oauth/google/callback",
-            self.port
-        );
-
-        match crate::import::gdrive::exchange_code(code, &client_id, &client_secret, &redirect_uri)
-        {
-            Ok(refresh_token) => {
-                // Replace the OAuth-pending entry with the real config
-                let mut clean = params.clone();
-                clean.remove("oauth_pending");
-                clean.insert("refresh_token".into(), refresh_token);
-
-                let interval = clean
-                    .get("check_interval_seconds")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(86400);
-
-                let config = RemoteSourceConfig {
-                    source_type: "google_drive".into(),
-                    name: name.clone(),
-                    params: clean,
-                    check_interval_seconds: interval,
-                };
-
-                let mut sources = self.staged_sources.lock().unwrap();
-                if let Some(pos) = sources.iter().position(|s| s.name == name) {
-                    sources[pos] = config;
-                } else {
-                    sources.push(config);
-                }
-
-                serve_template(&OauthSuccessTemplate { name: name.clone() })
-            }
-            Err(e) => serve_template(&OauthErrorTemplate {
-                message: format!("Failed to exchange code: {e}"),
-            }),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,29 +449,61 @@ fn validate_sources(sources: &[RemoteSourceConfig]) -> Result<(), String> {
                 }
             }
             "google_drive" => {
-                if source.params.contains_key("oauth_pending") {
-                    return Err(format!(
-                        "\"{name}\": Google Drive authorization is not finished. \
-                         Use the OAuth setup page to authorize it first."
-                    ));
-                }
-                if param(&source.params, "folder_id").is_none() {
-                    return Err(format!("\"{name}\": Google Drive folder ID is required."));
-                }
-
-                let has_api_key = param(&source.params, "api_key").is_some();
-                let has_oauth = param(&source.params, "refresh_token").is_some()
-                    && param(&source.params, "client_id").is_some()
-                    && param(&source.params, "client_secret").is_some();
-                if !has_api_key && !has_oauth {
-                    return Err(format!(
-                        "\"{name}\": provide a Google Drive API key or a complete \
-                         refresh token, client ID, and client secret."
-                    ));
-                }
+                validate_gdrive_params(&source.params)
+                    .map_err(|message| format!("\"{name}\": {message}"))?;
             }
             _ => {}
         }
+    }
+
+    Ok(())
+}
+
+/// Validate the Google Drive portion of a source: it needs a folder and
+/// exactly one authentication method. The service-account JSON is checked for
+/// shape only; the key signature is verified when the source connects.
+fn validate_gdrive_params(params: &HashMap<String, String>) -> Result<(), String> {
+    if param(params, "folder_id").is_none() {
+        return Err("Google Drive folder ID is required.".into());
+    }
+
+    let has_api_key = param(params, "api_key").is_some();
+    let oauth_fields = ["refresh_token", "client_id", "client_secret"];
+    let present_oauth: Vec<&str> = oauth_fields
+        .iter()
+        .copied()
+        .filter(|field| param(params, field).is_some())
+        .collect();
+    if !present_oauth.is_empty() && present_oauth.len() != oauth_fields.len() {
+        return Err(
+            "Google Drive OAuth credentials are incomplete: refresh token, client ID, \
+             and client secret are all required."
+                .into(),
+        );
+    }
+    let has_oauth = present_oauth.len() == oauth_fields.len();
+    let service_account_json = param(params, "service_account_json");
+
+    let methods =
+        u8::from(has_api_key) + u8::from(has_oauth) + u8::from(service_account_json.is_some());
+    if methods == 0 {
+        return Err(
+            "Google Drive requires one authentication method: an API key, a service \
+             account JSON key, or a complete OAuth refresh token, client ID, and client \
+             secret."
+                .into(),
+        );
+    }
+    if methods > 1 {
+        return Err(
+            "Google Drive accepts exactly one authentication method: API key, service \
+             account key, or OAuth refresh token."
+                .into(),
+        );
+    }
+
+    if let Some(json) = service_account_json {
+        crate::import::gdrive::ServiceAccountKey::parse(json)?;
     }
 
     Ok(())
@@ -702,6 +650,12 @@ mod tests {
         }
     }
 
+    /// Shape-only service-account key for validation tests. The private key is
+    /// not a real PEM because `validate_sources` never signs anything.
+    fn test_service_account_json() -> &'static str {
+        r#"{"type":"service_account","client_email":"frame@example.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----","token_uri":"https://oauth2.googleapis.com/token"}"#
+    }
+
     #[test]
     fn test_base64_encode() {
         assert_eq!(
@@ -756,7 +710,7 @@ mod tests {
 
         let no_auth = source("google_drive", "GD", &[("folder_id", "f1")], 3600);
         let err = validate_sources(&[no_auth]).unwrap_err();
-        assert!(err.contains("API key"), "got: {err}");
+        assert!(err.contains("authentication method"), "got: {err}");
 
         let api_key = source(
             "google_drive",
@@ -790,16 +744,77 @@ mod tests {
             3600,
         );
         let err = validate_sources(&[incomplete_oauth]).unwrap_err();
-        assert!(err.contains("refresh token"), "got: {err}");
+        assert!(err.contains("incomplete"), "got: {err}");
+    }
 
-        let pending = source(
+    #[test]
+    fn test_validate_google_drive_service_account() {
+        let valid = source(
             "google_drive",
             "GD",
-            &[("folder_id", "f1"), ("oauth_pending", "1")],
+            &[
+                ("folder_id", "f1"),
+                ("service_account_json", test_service_account_json()),
+            ],
             3600,
         );
-        let err = validate_sources(&[pending]).unwrap_err();
-        assert!(err.contains("not finished"), "got: {err}");
+        assert!(validate_sources(&[valid]).is_ok());
+
+        let malformed = source(
+            "google_drive",
+            "GD",
+            &[("folder_id", "f1"), ("service_account_json", "{oops")],
+            3600,
+        );
+        let err = validate_sources(&[malformed]).unwrap_err();
+        assert!(err.contains("not valid JSON"), "got: {err}");
+
+        let missing_email = source(
+            "google_drive",
+            "GD",
+            &[
+                ("folder_id", "f1"),
+                (
+                    "service_account_json",
+                    r#"{"private_key":"-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----"}"#,
+                ),
+            ],
+            3600,
+        );
+        let err = validate_sources(&[missing_email]).unwrap_err();
+        assert!(err.contains("client_email"), "got: {err}");
+
+        let missing_key = source(
+            "google_drive",
+            "GD",
+            &[
+                ("folder_id", "f1"),
+                (
+                    "service_account_json",
+                    r#"{"client_email":"frame@example.iam.gserviceaccount.com"}"#,
+                ),
+            ],
+            3600,
+        );
+        let err = validate_sources(&[missing_key]).unwrap_err();
+        assert!(err.contains("private_key"), "got: {err}");
+        assert!(
+            !err.contains("BEGIN PRIVATE KEY"),
+            "the error must not echo key material: {err}"
+        );
+
+        let two_methods = source(
+            "google_drive",
+            "GD",
+            &[
+                ("folder_id", "f1"),
+                ("api_key", "AIza"),
+                ("service_account_json", test_service_account_json()),
+            ],
+            3600,
+        );
+        let err = validate_sources(&[two_methods]).unwrap_err();
+        assert!(err.contains("exactly one"), "got: {err}");
     }
 
     #[test]

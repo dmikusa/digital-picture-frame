@@ -26,7 +26,10 @@ qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 fontdue = "0.9"
 tiny_http_fork = "=0.12.8"
-oauth2 = "5"
+# RS256 JWT signing for Google service accounts. `openssl` is already in the
+# dependency tree on Linux via native-tls, so this adds no new build stack.
+openssl = "0.10"
+base64 = "0.22"
 askama = "0.12"
 serde_urlencoded = "0.7"
 form_urlencoded = "1"

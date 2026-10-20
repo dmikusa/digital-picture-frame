@@ -32,6 +32,19 @@ pub struct RecordedRequest {
     pub method: String,
     pub url: String,
     pub body: String,
+    /// Every request header as `(name, value)`. Header names keep the case the
+    /// client sent; look them up with [`RecordedRequest::header`].
+    pub headers: Vec<(String, String)>,
+}
+
+impl RecordedRequest {
+    /// Case-insensitive header lookup.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 /// The response a test handler wants to send.
@@ -101,6 +114,16 @@ impl TestServer {
                             method: request.method().as_str().to_string(),
                             url: request.url().to_string(),
                             body,
+                            headers: request
+                                .headers()
+                                .iter()
+                                .map(|h| {
+                                    (
+                                        h.field.as_str().as_str().to_string(),
+                                        h.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect(),
                         };
                         let index = {
                             let mut list = thread_requests.lock().unwrap();
