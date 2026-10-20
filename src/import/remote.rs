@@ -306,6 +306,14 @@ fn sync_source(
     Ok(())
 }
 
+/// Download and import a batch of photos.
+///
+/// Returns an error if any download failed so the caller does not advance the
+/// cursor: a cursor is a promise that everything up to that point was handled,
+/// and advancing it after a failed download would skip those photos forever.
+/// Import or conversion failures *after* a successful download are logged and
+/// skipped instead — one corrupt image would otherwise pin the cursor and
+/// block every future sync.
 fn download_and_import(
     src: &mut dyn RemotePhotoSource,
     photos: &[RemotePhoto],
@@ -315,11 +323,14 @@ fn download_and_import(
     let tmp_dir = sync_tmp_dir(config);
     prepare_tmp_dir(&tmp_dir)?;
 
+    let mut failed: Vec<String> = Vec::new();
+
     for (index, photo) in photos.iter().enumerate() {
         let dest = tmp_dir.join(safe_filename(&photo.filename, index));
         if let Err(e) = src.download(&photo.remote_id, &dest) {
             log::warn!(r#"Download failed for "{}": {}"#, photo.filename, e);
             let _ = std::fs::remove_file(&dest);
+            failed.push(format!("{}: {}", photo.filename, e));
             continue;
         }
 
@@ -344,7 +355,16 @@ fn download_and_import(
         let _ = std::fs::remove_file(&dest);
     }
 
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} of {} download(s) failed: {}",
+            failed.len(),
+            photos.len(),
+            failed.join("; ")
+        )))
+    }
 }
 
 /// In-flight downloads live under the photos partition instead of tmpfs so a
@@ -497,6 +517,100 @@ mod tests {
         // Names with no usable component fall back to a fixed stem.
         assert_eq!(safe_filename("", 2), "2-photo");
         assert_eq!(safe_filename("..", 3), "3-photo");
+    }
+
+    use std::collections::HashMap;
+
+    struct FakeSource {
+        fail_downloads: bool,
+        list: Vec<RemotePhoto>,
+    }
+
+    impl RemotePhotoSource for FakeSource {
+        fn connect(_config: &HashMap<String, String>) -> io::Result<Self> {
+            Ok(FakeSource {
+                fail_downloads: false,
+                list: Vec::new(),
+            })
+        }
+
+        fn list_changes(
+            &mut self,
+            _cursor: Option<&str>,
+        ) -> io::Result<(Vec<RemotePhoto>, String)> {
+            Ok((std::mem::take(&mut self.list), "1".to_string()))
+        }
+
+        fn download(&mut self, _remote_id: &str, dest: &Path) -> io::Result<()> {
+            if self.fail_downloads {
+                return Err(io::Error::other("simulated download failure"));
+            }
+            std::fs::write(dest, b"fake image bytes")
+        }
+    }
+
+    fn test_config(photos_dir: &Path) -> Config {
+        Config {
+            photos_dir: photos_dir.to_path_buf(),
+            display_socket_path: PathBuf::from("/tmp/display.sock"),
+            control_socket_path: PathBuf::from("/tmp/control.sock"),
+            native_resolution: "32x32".to_string(),
+            aspect_ratio_mode: Default::default(),
+            batch_delete_size: 20,
+            log_max_size: 262_144,
+            log_max_files: 2,
+            remote_sources: Vec::new(),
+        }
+    }
+
+    fn photo(name: &str) -> RemotePhoto {
+        RemotePhoto {
+            remote_id: format!("/photos/{name}"),
+            filename: name.to_string(),
+            size_bytes: None,
+        }
+    }
+
+    #[test]
+    fn test_download_failure_returns_error_so_cursor_does_not_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = FakeSource {
+            fail_downloads: true,
+            list: Vec::new(),
+        };
+        let photos = vec![photo("a.jpg"), photo("b.jpg")];
+
+        let err = download_and_import(&mut source, &photos, &config, &dedup_set)
+            .expect_err("a failed download must be reported");
+        assert!(
+            err.to_string().contains("2 of 2 download(s) failed"),
+            "{err}"
+        );
+
+        // No partial files are left behind.
+        let tmp = dir.path().join(".sync-tmp");
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_successful_downloads_leave_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = FakeSource {
+            fail_downloads: false,
+            list: Vec::new(),
+        };
+        let photos = vec![photo("a.jpg")];
+
+        // Import failures are tolerated (ImageMagick may not be installed and
+        // this payload is not a real image); only downloads decide the result.
+        download_and_import(&mut source, &photos, &config, &dedup_set).unwrap();
+
+        let tmp = dir.path().join(".sync-tmp");
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
     }
 
     #[test]
