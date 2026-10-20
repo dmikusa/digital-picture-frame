@@ -179,9 +179,10 @@ CONFIG_MODE ──user finishes (POST /finish)──▶ validate, save, resume s
   - Validate staged sources:
     - every name is non-empty and unique;
     - Dropbox requires `access_token`;
-    - Google Drive requires `folder_id` plus either `api_key` or a complete
-      `refresh_token` + `client_id` + `client_secret` set;
-    - an unfinished `oauth_pending` entry is rejected;
+    - Google Drive requires `folder_id` plus exactly one of: `api_key`, a
+      complete `refresh_token` + `client_id` + `client_secret` set, or a
+      `service_account_json` key containing `client_email` and `private_key`;
+    - malformed service-account JSON and mixed auth methods are rejected;
     - `check_interval_seconds` must be greater than 0.
   - Return an HTML error page for browser/form clients and a JSON error object
     for API clients. A validation failure keeps the server running.
@@ -270,14 +271,12 @@ api_key = "AIza..."
 folder_id = "1abc123..."
 check_interval_seconds = 86400
 
-# OAuth fields for private folders (Phase 8):
+# Private folder read by a Google service account (Phase 8):
 # [[remote_sources]]
 # type = "google_drive"
 # name = "Private Drive"
-# client_id = "..."
-# client_secret = "..."
-# refresh_token = "1//xxxx"
 # folder_id = "1abc123..."
+# service_account_json = '''{"type":"service_account", ...}'''
 ```
 - `type` dispatches to the appropriate source implementation.
 - `name` used in cursor file and admin UI.
@@ -324,11 +323,9 @@ check_interval_seconds = 86400
 - Config fields: `api_key`, `folder_id`.
 
 ### Task 6.2: Setup Documentation
-- New `docs/google-drive-setup.md`:
-  - Step-by-step: create Google Cloud project, enable Drive API, create API key
-    (restrict to Drive API), share a Drive folder as "Anyone with the link can
-    view", copy folder ID, enter both in admin UI.
-  - Screenshots at key steps.
+- `docs/google-drive-setup.md` covers the public API-key steps (Google Cloud
+  project, Drive API, restricted API key, shared folder) and, from Phase 8, the
+  private service-account flow.
 
 ---
 
@@ -357,8 +354,8 @@ check_interval_seconds = 86400
   alternative.
 - Stops on: `POST /finish`, USB removal, 10-minute idle timeout (reset on
   each request). Re-entering config mode stops any previous server first.
-- All routes except `/oauth/google/callback` behind HTTP Basic Auth with the
-  rotating 8-char password.
+- All routes behind HTTP Basic Auth with the rotating 8-char password. There
+  are no unauthenticated callback routes.
 - Basic auth guard: pre-compute the expected `Basic <base64>` string once at
   server start, then string-compare on each request. No `base64` crate needed.
 
@@ -382,8 +379,7 @@ check_interval_seconds = 86400
 | `/sources/add` | GET | Yes | Menu bar + source type picker (links to `/sources/dropbox` and `/sources/google-drive`) |
 | `/sources/dropbox` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/dropbox`) |
 | `/sources/google-drive` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/google-drive`) |
-| `/sources/google-drive-oauth` | GET | Yes | Menu bar + OAuth setup form (Phase 8) |
-| `/oauth/google/callback` | GET | **No** | Handles Google OAuth redirect (Phase 8) |
+| `/sources/google-drive-service-account` | GET | Yes | Menu bar + service-account setup form and instructions (Phase 8) |
 
 ### Task 7.4: Page Layout
 
@@ -418,22 +414,73 @@ Every HTML page shares the same structure:
 
 ---
 
-## Phase 8: Google Drive OAuth (Private Folders — Deferred)
+## Phase 8: Google Drive Private Folders (Service Account)
 
-### Task 8.1: OAuth Flow
-- Extends Google Drive source to support `refresh_token` + `client_id` +
-  `client_secret` in addition to `api_key`.
-- Admin UI: `/sources/google-drive-oauth` with OAuth setup form and
-  "Connect Google Drive" button.
-- User must create their own Google Cloud project (documented in
-  `docs/google-drive-setup.md`).
-- Button redirects user's browser to Google's OAuth consent screen.
-- Callback: `/oauth/google/callback?code=...` (no basic auth on this route).
-- Server exchanges code for refresh token, stores in staging config.
-- Dependencies added: `oauth2` crate.
+Google OAuth redirects cannot be used for the frame: the admin UI is plain HTTP
+on a LAN address and Google requires HTTPS for non-localhost redirect URIs. The
+device flow was also evaluated and rejected: Google restricts it to
+`drive.appdata` and `drive.file`, neither of which can read an existing folder
+of photos.
 
-**Deferred:** This is the most complex phase. The API key path (Phase 6)
-handles the common case (public folders) with zero OAuth complexity.
+A **service account** solves both problems. The user creates it in their
+existing Google Cloud project, shares a normal Drive folder with its synthetic
+email as Viewer, and pastes the JSON key into the admin UI. The frame signs a
+JWT with the key to obtain a `drive.readonly` access token.
+
+### Task 8.1: Service-account authentication
+- Add `AuthMode::ServiceAccount` to `src/import/gdrive.rs`, driven by the
+  `service_account_json` source param.
+- Parse the JSON key, requiring `client_email` and `private_key`; fall back to
+  `https://oauth2.googleapis.com/token` when `token_uri` is absent.
+- Build an RS256 JWT (`iss`, `scope=drive.readonly`, `aud=token_uri`, `iat`,
+  `exp` ≈ 1 hour) and sign it with the key's PEM using `openssl` (already in the
+  tree via native-tls).
+- POST to `token_uri` with
+  `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and the assertion.
+- Cache the access token and refresh it shortly before expiry.
+- Generalize request auth: Bearer header for service accounts and refresh-token
+  sources, `?key=` for API-key sources.
+- `connect()` fetches the first token and validates the folder before returning.
+- Tests use a local mock token endpoint plus a mock Drive API, and verify the
+  JWT signature with the matching public key.
+
+### Task 8.2: Admin UI
+- New page `GET /sources/google-drive-service-account` with the setup
+  instructions and a form (name, folder ID, interval, JSON key textarea) that
+  posts to the existing `/api/sources/google-drive` endpoint.
+- Link from `/sources/add`: "Google Drive (Private, Service Account)".
+- `validate_sources` requires `folder_id`, exactly one auth method, and a
+  parseable service-account key with `client_email` and `private_key`.
+- The old `/oauth/google/callback` route, its handler, and the OAuth
+  form/success/error templates are removed. Every admin route now requires basic
+  auth.
+- The unused `oauth2` dependency is removed.
+
+### Task 8.3: Setup documentation
+- Rewrite `docs/google-drive-setup.md` for the service-account flow: Google
+  Cloud project, Drive API, service account and JSON key, folder sharing as
+  Viewer, folder ID, admin UI. Document that the service account cannot own
+  files, so the folder is user-owned, and warn that the key is sensitive.
+
+---
+
+## Future Work (not part of this phase)
+
+These are backlog items, deliberately out of scope for the service-account PR.
+
+1. **HTTPS for the admin UI (advanced setup).** Serve config mode over HTTPS
+   with a real certificate, for example Let's Encrypt DNS-01 validation for a
+   user-owned hostname, or a tunnel that terminates TLS in front of the frame.
+   This is an advanced option: it needs a DNS provider, a stable hostname, and
+   certificate renewal on a Pi that is often offline. Document it as an
+   alternative, not the default LAN flow.
+2. **Revisit a normal Google web OAuth callback.** Once the admin UI has HTTPS,
+   a standard web OAuth client with a redirect URI becomes possible. Re-evaluate
+   it then, including whether it is meaningfully better than a service account.
+3. **Device flow remains rejected.** Google limits device-flow scopes to
+   `drive.appdata`/`drive.file`, which cannot read an existing user folder. Do
+   not implement it unless Google changes that restriction.
+
 
 ---
 
@@ -447,7 +494,8 @@ handles the common case (public folders) with zero OAuth complexity.
 | `reqwest` (blocking) | 5, 6 | HTTP client for Dropbox, Google Drive |
 | `httparse` | — (replaced by tiny_http_fork) | — |
 | `tiny_http_fork` | 7 | HTTP server (CVE-fixed fork of tiny_http) |
-| `oauth2` | 8 (deferred) | Google Drive OAuth client/refresh flow |
+| `openssl` | 8 | RS256 JWT signing for service accounts (already in the Linux tree via native-tls) |
+| `base64` | 8 | JWT segment encoding (already present via reqwest) |
 
 ---
 
@@ -475,8 +523,10 @@ handles the common case (public folders) with zero OAuth complexity.
 | 7.2 | API routes (JSON, REST) | Medium |
 | 7.3 | HTML pages (plain forms, menu bar layout) | Medium |
 | 7.4 | Page layout + 303 redirect flow | Small |
-| 8.1 | Google Drive OAuth (deferred) | Large |
-| 8.2 | OAuth setup documentation | Small |
+| 8.1 | Google Drive service-account auth (JWT bearer) + tests | Medium |
+| 8.2 | Service-account admin form, validation, OAuth route removal | Medium |
+| 8.3 | Service-account setup documentation | Small |
+| — | Future: HTTPS for the admin UI, then revisit web OAuth (backlog) | Large |
 
 ---
 

@@ -88,14 +88,14 @@ folder_id = "1abc123..."
 api_key = "AIza..."
 check_interval_seconds = 86400
 
-# Private Google Drive folder, authorized through the admin OAuth flow.
+# Private Google Drive folder, read with a service account.
+# See docs/google-drive-setup.md. The JSON key can be pasted into the admin UI;
+# this example shows the equivalent config file form.
 [[remote_sources]]
 type = "google_drive"
 name = "Private Drive"
 folder_id = "1abc123..."
-client_id = "xxx.apps.googleusercontent.com"
-client_secret = "GOCSPX-xxx"
-refresh_token = "1//xxxx"
+service_account_json = '''{"type":"service_account","client_email":"photo-frame@your-project.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n","token_uri":"https://oauth2.googleapis.com/token"}'''
 check_interval_seconds = 86400
 ```
 
@@ -108,7 +108,13 @@ check_interval_seconds = 86400
 | `folder` | No | Dropbox folder to scan. Default: `/Photos` |
 | `folder_id` | Google Drive | ID of the shared folder |
 | `api_key` | Google Drive | Key for a publicly shared folder |
-| `client_id`, `client_secret`, `refresh_token` | Google Drive (private) | Complete OAuth credential set, as an alternative to `api_key` |
+| `service_account_json` | Google Drive (private) | Full service-account JSON key, as a TOML literal string. See [google-drive-setup.md](google-drive-setup.md) |
+| `client_id`, `client_secret`, `refresh_token` | Google Drive (private) | Complete OAuth refresh-token credential set. There is no admin UI flow for creating these; the service-account method is recommended |
+
+A Google Drive source needs `folder_id` and exactly one authentication method:
+`api_key`, `service_account_json`, or the full `refresh_token` + `client_id` +
+`client_secret` triple. Mixing methods, a partial OAuth triple, or malformed
+service-account JSON is rejected.
 
 The admin UI validates these rules when the user clicks **Finish**. An empty
 `[[remote_sources]]` list is valid and removes all remote sources.
