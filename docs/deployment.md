@@ -48,6 +48,60 @@ The app watches `/media` for new directories, so any auto-mount solution that mo
 
 The Rust manager needs the C display app (`photo-frame-display.c`) running alongside it. See `c/photo-frame-display.c` in this repo.
 
+## Config mode
+
+The frame shows a setup QR code when it has no photos and no remote sources. The
+screen also lists the reachable LAN URL (`http://<ip>:<port>`), the rotating
+8-character password, and an optional `photo-frame.local` URL.
+
+1. Connect a phone or laptop to the same network as the frame.
+2. Scan the QR code, or open the LAN URL shown on screen.
+3. Sign in with the username `photo-frame` and the password shown under the QR.
+4. Add, edit, or remove remote sources and press **Finish**.
+
+The QR code itself embeds the LAN IP address and the password, so scanning it
+works on networks without mDNS. `photo-frame.local` is only an alternative.
+
+Flow details:
+
+- **USB import**: inserting a drive shows "Importing photos..." and starts the
+  import. When it finishes, the setup screen replaces it. Removing the drive
+  cancels config mode and discards unsaved changes.
+- **First remote sync**: if no photos exist but remote sources are configured,
+  the screen shows "First remote sync in progress" instead. It switches back to
+  the slideshow as soon as photos appear.
+- **Re-entry**: inserting a drive during an existing session stops the old admin
+  server first, then imports and starts a new session with a new port/password.
+- **Staging**: the source list starts with the sources already in
+  `config.toml`. Changes stay in memory until **Finish**. Finishing validates
+  every entry (names, required credentials, check interval) and atomically
+  rewrites `config.toml`. An empty list is allowed: it removes all remote
+  sources. Clearing the list or abandoning the session writes nothing.
+- **Status**: `GET /api/status` returns the staged sources plus the contents of
+  `<photos_dir>/sync-status.json` when the scheduler has written it. A missing
+  file yields an empty `sync` object.
+
+If the display app has not created its control socket yet, config mode retries
+instead of exiting. Check `/tmp/photo-frame.log` if the setup screen never
+appears.
+
+### Optional: mDNS hostname
+
+The IP-based URL works without any extra packages. To also use
+`http://photo-frame.local:<port>`, install and run `avahi-daemon` and give the
+frame a `photo-frame` hostname (or an alias):
+
+```bash
+sudo apt install -y avahi-daemon
+sudo hostnamectl set-hostname photo-frame
+# Some networks also need an /etc/hosts entry for the local address:
+echo "127.0.1.1 photo-frame.local photo-frame" | sudo tee -a /etc/hosts
+```
+
+The `.deb` lists `avahi-daemon` under `Recommends`, not `Depends`, so it is not
+required. If the optional URL does not resolve, use the numeric IP address
+shown on the setup screen.
+
 ## Storage rotation
 
 When the photos partition fills up (`ENOSPC`), the app deletes the oldest `batch_delete_size` photos. The CSV index keeps ghost entries until compaction, which happens on startup if ghosts exceed 50%.

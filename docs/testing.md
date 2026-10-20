@@ -4,7 +4,7 @@
 
 ```bash
 make test              # Run all tests (Rust + C in container)
-make test-rust         # Run Rust tests only (20 unit tests)
+make test-rust         # Run Rust tests only
 make test-c            # Run C build + lint in container
 make build-c-container # Build the container image for C testing
 ```
@@ -12,7 +12,7 @@ make build-c-container # Build the container image for C testing
 ### Rust tests
 
 ```bash
-cargo test        # 20 unit tests, all must pass
+cargo test        # all unit + integration tests must pass
 cargo clippy      # must be clean
 ```
 

@@ -41,29 +41,37 @@ the slideshow to show a QR code on screen.
 ### Config Mode Flow
 
 ```
-NORMAL ──USB insert──▶ IMPORT ──import done──▶ CONFIG_MODE
-                                                        │
-                           ┌────────────────────────────┘
-                           │
-                    ┌──────┴──────┐
-                    │             │
-              user finishes    USB removed
-              (POST /finish)   OR 10-min idle timeout
-                    │             │
-                    ▼             ▼
-              apply config   discard staged
-              resume show    resume show
-              save to disk   stop server
+startup ──photos exist──────────────────────────────▶ NORMAL (slideshow)
+        ──no photos + remote sources───────────────▶ FIRST_SYNC
+        ──no photos + no remote sources────────────▶ CONFIG_MODE
+
+NORMAL ──USB insert──▶ IMPORTING ──import done──▶ CONFIG_MODE
+                          │
+                          └──USB removed──▶ NORMAL or FIRST_SYNC
+
+CONFIG_MODE ──user finishes (POST /finish)──▶ validate, save, resume show
+            ──USB removed / 10-min timeout──▶ discard staged, resume show
+            ──USB insert (re-entry)─────────▶ stop old server, IMPORTING
 ```
 
-- **First boot** (no photos AND no `[[remote_sources]]` in config): skip IMPORT
-  state, go directly to CONFIG_MODE.
+- **First boot** (no photos AND no `[[remote_sources]]` in config): enter
+  CONFIG_MODE directly so the frame can show its setup QR.
+- **No photos but remote sources configured**: show the "first remote sync in
+  progress" status screen instead of the QR. Poll the index and resume the
+  slideshow as soon as photos appear.
+- **USB insert while already in config mode**: stop the existing admin server
+  before running the import and starting a new one. A new session gets a new
+  password and port; the old listener must not leak.
+- **Display app not ready**: config-mode entry is retried after a short delay
+  (`PendingConfigMode`) instead of terminating the config-mode thread.
 - **10-minute timeout** resets on every HTTP request (not from server start).
 - **USB removal** instantly stops the server and discards staged config. No grace
   period.
 - **Config changes are staged** in memory until the user clicks "Finish", at
   which point they are validated and atomically written to `config.toml` (write
   temp file + `rename()`). This prevents partial config on USB removal.
+- **Existing sources are seeded into staging**, so they can be edited or
+  removed. Saving an empty list is allowed and removes every remote source.
 
 ---
 
@@ -116,13 +124,17 @@ NORMAL ──USB insert──▶ IMPORT ──import done──▶ CONFIG_MODE
 
 ### Task 2.2: Config Mode Screen Renderer
 - New `src/config_mode.rs` module.
-- `pub fn render_config_screen(config: &Config, admin_url: &str) -> Result<PathBuf>`
-- Generates QR code JPEG with:
-  - QR code: `http://photo-frame.local:<port>` (basic auth embedded in URL)
-  - Below QR: mDNS hostname (`photo-frame.local`), fallback IP address,
-    8-char password
+- `pub fn render_config_screen(config, fallback_ip, mdns_host, port, password) -> Result<PathBuf>`
+- Generates a QR code JPEG with:
+  - QR code: `http://<lan-ip>:<port>` (basic auth embedded in URL), so setup
+    works without mDNS
+  - Below QR: LAN URL, 8-character password, and the optional
+    `http://photo-frame.local:<port>` URL
   - Footer: "Insert USB to configure (or remove to cancel)"
-- Writes to `/tmp/photo-frame-qr.jpg`, returns path.
+- Also provides `render_status_screen(config, title, lines)` for the importing
+  and first-sync screens (written to a distinct path).
+- Writes to `/tmp/photo-frame-qr.jpg` (or `/tmp/photo-frame-status.jpg`),
+  returns the path.
 - Uses `ControlClient` to send `CLR` + `SHOW`.
 
 ### Task 2.3: Password Generation
@@ -137,28 +149,53 @@ NORMAL ──USB insert──▶ IMPORT ──import done──▶ CONFIG_MODE
 
 ### Task 3.1: State Machine
 - New `src/config_mode.rs` (extends Phase 2).
-- States and transitions as described in the architecture section above.
-- IMPORT state: runs existing USB import, shows "Importing..." on screen.
-- CONFIG_MODE state: renders QR, starts admin HTTP server, starts 10-minute
-  idle timer (reset on each HTTP request).
-- Timer is checked in the main loop or via a separate thread with a
-  `Receiver::recv_timeout`.
+- States: `Normal`, `FirstSync`, `Importing { pending }`, `PendingConfigMode`,
+  and `ConfigMode`. Transitions as described in the architecture section above.
+- `initial_state(valid_count, has_remote_sources)` is a pure helper (unit
+  tested) that chooses the startup screen.
+- IMPORTING state: runs the existing USB import and shows an "Importing
+  photos..." status screen.
+- FIRST_SYNC state: shows the first-sync status screen and polls the index every
+  couple of seconds; when photos appear it resumes the slideshow. A USB insert
+  switches to IMPORTING.
+- CONFIG_MODE state: renders the QR, starts the admin HTTP server, and starts
+  the 10-minute idle timer (reset on each HTTP request).
+- `PendingConfigMode` retries entry when the display app's control socket is not
+  ready yet. The config-mode thread survives these failures.
+- Entering config mode always stops any running admin server first, including
+  when a USB is inserted during an existing session.
+- The timer is checked in the main loop with `Receiver::recv_timeout`.
 
 ### Task 3.2: Staged Config
-- Admin UI writes changes into an in-memory `Config` clone.
+- The admin server is seeded with the current `config.remote_sources`, so
+  existing entries can be edited and deleted. An empty list is a valid result.
+- Admin UI writes changes into the in-memory staged list.
 - On `POST /finish`:
-  - Validate staged config (all sources have required fields).
-  - Atomically write to real `config.toml`: write to `config.toml.tmp`, then
-    `fs::rename()`.
-  - If new `[[remote_sources]]` added, trigger immediate first sync.
+  - Validate staged sources:
+    - every name is non-empty and unique;
+    - Dropbox requires `access_token`;
+    - Google Drive requires `folder_id` plus either `api_key` or a complete
+      `refresh_token` + `client_id` + `client_secret` set;
+    - an unfinished `oauth_pending` entry is rejected;
+    - `check_interval_seconds` must be greater than 0.
+  - Return an HTML error page for browser/form clients and a JSON error object
+    for API clients. A validation failure keeps the server running.
+  - Atomically write to the real `config.toml`: write to `config.toml.tmp`,
+    then `fs::rename()`.
+  - Update the in-memory config so a later config-mode session sees the new
+    sources.
+- If new `[[remote_sources]]` are added, the first sync scheduler pass picks
+  them up. (The running scheduler is not hot-reloaded in Phase 3; a restart is
+  required for an already-running process.)
 - On USB removal or idle timeout: discard staged config, stop server. No disk
   writes.
 
 ### Task 3.3: First Sync Status Screen
 - If photos exist: background sync — no screen interruption.
-- If no photos exist (first sync / first boot): show "Your first remote sync
-  is in progress, this may take some time." on screen via control socket.
-  Resume normal display when sync completes. Progress bar deferred to later.
+- If no photos exist and remote sources are configured: show "First remote sync
+  in progress" on screen via the control socket. Resume the normal display when
+  photos appear in the index. Progress reporting is deferred (see
+  `/api/status`).
 
 ---
 
@@ -308,8 +345,14 @@ check_interval_seconds = 86400
   - **Dependency tree:** `ascii`, `chunked_transfer`, `httpdate`, `log` (4
     deps, matching the original `tiny_http` footprint).
 - Starts on a random port in range 8100–8199 during CONFIG_MODE state.
+- `AdminServer::new(password, staged_sources)` seeds staging from
+  `config.remote_sources`; `.with_status_path(...)` points the status endpoint at
+  `<photos_dir>/sync-status.json`.
+- The setup QR and primary URL use the detected LAN IP, so phones on the same
+  network do not need mDNS. `photo-frame.local:<port>` is shown as an optional
+  alternative.
 - Stops on: `POST /finish`, USB removal, 10-minute idle timeout (reset on
-  each request).
+  each request). Re-entering config mode stops any previous server first.
 - All routes except `/oauth/google/callback` behind HTTP Basic Auth with the
   rotating 8-char password.
 - Basic auth guard: pre-compute the expected `Basic <base64>` string once at
@@ -323,8 +366,8 @@ check_interval_seconds = 86400
 | `/api/sources/dropbox` | POST | Yes | Save Dropbox config to staging. JSON request returns JSON; form request returns a 303 redirect. |
 | `/api/sources/google-drive` | POST | Yes | Save Google Drive config to staging. JSON request returns JSON; form request returns a 303 redirect. |
 | `/api/sources/<name>` | DELETE / POST | Yes | Remove a source from staging. DELETE returns JSON; form POST returns a 303 redirect. |
-| `/api/status` | GET | Yes | Current sync state, last sync times. Returns JSON. |
-| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. JSON request returns JSON; form request returns an HTML success page. |
+| `/api/status` | GET | Yes | Staged sources plus the parsed contents of `<photos_dir>/sync-status.json` under `sync` (empty object if missing/unreadable). Returns JSON. |
+| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. JSON request returns JSON; form request returns an HTML success page. Invalid sources return an HTML error page for browsers or a JSON error object for API clients (400). |
 
 ### Task 7.3: HTML Pages (HTMX)
 
@@ -414,9 +457,9 @@ handles the common case (public folders) with zero OAuth complexity.
 | 2.1 | QR code JPEG generation + tests | Small |
 | 2.2 | Config mode screen render | Small |
 | 2.3 | Password generation + basic auth | Small |
-| 3.1 | State machine (NORMAL/IMPORT/CONFIG) | Medium |
-| 3.2 | Staged config + atomic deploy | Small |
-| 3.3 | First sync status screen | Small |
+| 3.1 | State machine (NORMAL/FIRST_SYNC/IMPORT/CONFIG + retry) | Medium |
+| 3.2 | Staged config (seeded), validation, atomic deploy | Small |
+| 3.3 | First sync status screen + index polling | Small |
 | 4.1 | Module reorg (`src/import/`) | Small |
 | 4.2 | `RemotePhotoSource` trait | Small |
 | 4.3 | Scheduler + cursor persistence | Medium |
