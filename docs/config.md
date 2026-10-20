@@ -113,6 +113,11 @@ check_interval_seconds = 86400
 The admin UI validates these rules when the user clicks **Finish**. An empty
 `[[remote_sources]]` list is valid and removes all remote sources.
 
+> **Dropbox tokens are static.** The Dropbox source requires a valid
+> `access_token` in the config file. Refresh-token support is not implemented,
+> so a short-lived token that expires will make sync fail until the config is
+> updated with a fresh token.
+
 ## Config mode
 
 Config mode runs when the frame needs setup. It starts automatically on a fresh
