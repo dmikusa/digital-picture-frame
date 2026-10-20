@@ -20,7 +20,6 @@
 //! pagination, retries, and downloads can be exercised without touching the
 //! real APIs.
 
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
