@@ -17,6 +17,8 @@
 pub mod dropbox;
 pub mod gdrive;
 pub mod remote;
+#[cfg(test)]
+pub mod test_http;
 pub mod usb;
 
 pub use usb::{import_from_directory, watch_usb_mounts, MountEvent};

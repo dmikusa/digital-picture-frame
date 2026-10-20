@@ -24,6 +24,13 @@ use std::path::Path;
 
 const API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Ask for the page token alongside the file fields; without it the caller
+/// cannot tell that more pages exist.
+const FIELDS: &str = "nextPageToken,files(id,name,size,mimeType,modifiedTime)";
+const PAGE_SIZE: usize = 1_000;
+/// Safety valve: the server controls `nextPageToken`, so cap the number of
+/// pages one sync check will follow.
+const MAX_PAGES: usize = 1_000;
 
 enum AuthMode {
     ApiKey(String),
@@ -42,9 +49,21 @@ pub struct GoogleDriveSource {
     client: Client,
     auth: AuthMode,
     folder_id: String,
+    api_base: String,
 }
 
 impl GoogleDriveSource {
+    /// Constructor with an injectable API root, used by unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_base_url(api_key: String, folder_id: String, api_base: String) -> Self {
+        GoogleDriveSource {
+            client: Client::new(),
+            auth: AuthMode::ApiKey(api_key),
+            folder_id,
+            api_base,
+        }
+    }
+
     fn make_get(&self, url: &str) -> io::Result<reqwest::blocking::Response> {
         let mut req = self.client.get(url);
         match &self.auth {
@@ -69,9 +88,9 @@ impl GoogleDriveSource {
 
 #[derive(Deserialize)]
 struct FileList {
-    #[allow(dead_code)]
     #[serde(rename = "nextPageToken")]
     next_page_token: Option<String>,
+    #[serde(default)]
     files: Vec<DriveFile>,
 }
 
@@ -123,11 +142,13 @@ impl RemotePhotoSource for GoogleDriveSource {
             client,
             auth,
             folder_id: folder_id.clone(),
+            api_base: API_BASE.to_string(),
         };
 
         // Validate connectivity
         let url = format!(
-            "{API_BASE}/files?q='{folder_id}'+in+parents&pageSize=1&{}",
+            "{}/files?q='{folder_id}'+in+parents&pageSize=1&{}",
+            source.api_base,
             source.auth_param()
         );
         let resp = source.make_get(&url)?;
@@ -148,54 +169,57 @@ impl RemotePhotoSource for GoogleDriveSource {
             "'{}' in parents and mimeType contains 'image/' and trashed = false",
             self.folder_id
         );
-        let url = format!(
-            "{API_BASE}/files?q={}&orderBy=modifiedTime&fields=files(id,name,size,mimeType,modifiedTime)&{}",
-            urlencoding(&query),
-            self.auth_param()
-        );
-
-        let resp = self.make_get(&url)?;
-
-        if !resp.status().is_success() {
-            return Err(io::Error::other(format!(
-                "Google Drive list failed: {}",
-                resp.status()
-            )));
-        }
-
-        let result: FileList = resp.json().map_err(io::Error::other)?;
 
         let mut latest = last_sync;
         let mut photos = Vec::new();
+        let mut page_token: Option<String> = None;
 
-        for file in &result.files {
-            let modified = file
-                .modified_time
-                .as_deref()
-                .and_then(crate::import::remote::parse_iso8601)
-                .unwrap_or(0);
-            if modified <= last_sync {
-                continue;
+        // `nextPageToken` pages through the listing; without this loop only
+        // the first page (default 100 files) is ever imported.
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            if pages > MAX_PAGES {
+                return Err(io::Error::other(format!(
+                    "Google Drive listing exceeded {MAX_PAGES} pages"
+                )));
             }
-            if modified > latest {
-                latest = modified;
+            let mut url = format!(
+                "{}/files?q={}&orderBy=modifiedTime&pageSize={}&fields={}&{}",
+                self.api_base,
+                urlencoding(&query),
+                PAGE_SIZE,
+                FIELDS,
+                self.auth_param()
+            );
+            if let Some(token) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(&urlencoding(token));
             }
 
-            let size_bytes = file.size.as_deref().and_then(|s| s.parse::<u64>().ok());
+            let resp = self.make_get(&url)?;
 
-            photos.push(RemotePhoto {
-                remote_id: file.id.clone(),
-                filename: file.name.clone(),
-                size_bytes,
-            });
+            if !resp.status().is_success() {
+                return Err(io::Error::other(format!(
+                    "Google Drive list failed: {}",
+                    resp.status()
+                )));
+            }
+
+            let result: FileList = resp.json().map_err(io::Error::other)?;
+            collect_photos(&result.files, last_sync, &mut latest, &mut photos);
+
+            match result.next_page_token {
+                Some(token) if !token.is_empty() => page_token = Some(token),
+                _ => return Ok((photos, latest.to_string())),
+            }
         }
-
-        Ok((photos, latest.to_string()))
     }
 
     fn download(&mut self, remote_id: &str, dest: &Path) -> io::Result<()> {
         let url = format!(
-            "{API_BASE}/files/{}?alt=media&{}",
+            "{}/files/{}?alt=media&{}",
+            self.api_base,
             remote_id,
             self.auth_param()
         );
@@ -212,6 +236,35 @@ impl RemotePhotoSource for GoogleDriveSource {
         let bytes = resp.bytes().map_err(io::Error::other)?;
         std::fs::write(dest, &bytes)?;
         Ok(())
+    }
+}
+
+fn collect_photos(
+    files: &[DriveFile],
+    last_sync: u64,
+    latest: &mut u64,
+    photos: &mut Vec<RemotePhoto>,
+) {
+    for file in files {
+        let modified = file
+            .modified_time
+            .as_deref()
+            .and_then(crate::import::remote::parse_iso8601)
+            .unwrap_or(0);
+        if modified <= last_sync {
+            continue;
+        }
+        if modified > *latest {
+            *latest = modified;
+        }
+
+        let size_bytes = file.size.as_deref().and_then(|s| s.parse::<u64>().ok());
+
+        photos.push(RemotePhoto {
+            remote_id: file.id.clone(),
+            filename: file.name.clone(),
+            size_bytes,
+        });
     }
 }
 
@@ -298,10 +351,101 @@ fn bearer(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::import::test_http::{TestReply, TestServer};
+
+    fn file(id: &str, name: &str, modified: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"{name}","size":"123","mimeType":"image/jpeg","modifiedTime":"{modified}"}}"#
+        )
+    }
+
+    fn test_source(server: &TestServer) -> GoogleDriveSource {
+        GoogleDriveSource::with_base_url(
+            "test-key".to_string(),
+            "folder-1".to_string(),
+            server.base_url.clone(),
+        )
+    }
 
     #[test]
     fn test_urlencoding() {
         assert_eq!(urlencoding("hello world"), "hello+world");
         assert_eq!(urlencoding("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn test_list_changes_follows_next_page_token() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("pageToken=page-2") {
+                TestReply::json(format!(
+                    r#"{{"files":[{}]}}"#,
+                    file("id-b", "b.jpg", "2024-01-02T00:00:00Z")
+                ))
+            } else if req.url.contains("/files?") {
+                TestReply::json(format!(
+                    r#"{{"nextPageToken":"page-2","files":[{}]}}"#,
+                    file("id-a", "a.jpg", "2024-01-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_source(&server);
+        let (photos, cursor) = source.list_changes(None).unwrap();
+
+        let names: Vec<&str> = photos.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(names, vec!["a.jpg", "b.jpg"]);
+        assert_eq!(cursor, "1704153600");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "expected two list requests");
+        assert!(
+            requests[0].url.contains("fields=nextPageToken"),
+            "fields must request nextPageToken, got: {}",
+            requests[0].url
+        );
+        assert!(
+            !requests[0].url.contains("pageToken="),
+            "first page must not send a page token"
+        );
+        assert!(
+            requests[1].url.contains("pageToken=page-2"),
+            "second page must send the token, got: {}",
+            requests[1].url
+        );
+    }
+
+    #[test]
+    fn test_list_changes_stops_without_next_page_token() {
+        let server = TestServer::start(|_req, _idx| {
+            TestReply::json(format!(
+                r#"{{"files":[{}]}}"#,
+                file("id-a", "a.jpg", "2024-02-01T00:00:00Z")
+            ))
+        });
+
+        let mut source = test_source(&server);
+        let (photos, _cursor) = source.list_changes(None).unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[test]
+    fn test_list_changes_skips_entries_at_or_before_cursor() {
+        let server = TestServer::start(|_req, _idx| {
+            TestReply::json(format!(
+                r#"{{"files":[{},{}]}}"#,
+                file("old", "old.jpg", "2024-01-01T00:00:00Z"),
+                file("new", "new.jpg", "2024-01-03T00:00:00Z")
+            ))
+        });
+
+        let mut source = test_source(&server);
+        let (photos, cursor) = source
+            .list_changes(Some("1704240000")) // 2024-01-03T00:00:00Z
+            .unwrap();
+        assert!(photos.is_empty(), "entries at the cursor must be skipped");
+        assert_eq!(cursor, "1704240000");
     }
 }
