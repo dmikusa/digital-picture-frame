@@ -85,9 +85,35 @@ where
 
     loop {
         attempts += 1;
-        let resp = attempt()?;
-        let status = resp.status();
+        let resp = match attempt() {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Connection resets, timeouts, and DNS blips are as transient
+                // as a 503; retry them with the same bounded backoff.
+                let wait = backoff.min(MAX_BACKOFF);
+                if attempts >= max_attempts {
+                    log::warn!(
+                        "Request failed (attempt {}/{}): {}",
+                        attempts,
+                        max_attempts,
+                        e
+                    );
+                    return Err(e);
+                }
+                log::warn!(
+                    "Request failed: {}; retrying in {:?} (attempt {}/{})",
+                    e,
+                    wait,
+                    attempts,
+                    max_attempts
+                );
+                std::thread::sleep(wait);
+                backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
 
+        let status = resp.status();
         if !is_transient(status) || attempts >= max_attempts {
             return Ok(resp);
         }
@@ -209,6 +235,53 @@ mod tests {
 
         assert_eq!(resp.status(), 401);
         assert_eq!(server.request_count(), 1);
+    }
+
+    #[test]
+    fn test_send_with_retry_retries_transport_errors() {
+        let server = TestServer::start(|_req, _index| TestReply::new(200, "ok"));
+        let client = build_client().unwrap();
+        let mut calls = 0;
+
+        let resp = send_with_retry_config(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    return Err(io::Error::other("connection reset"));
+                }
+                client
+                    .get(&server.base_url)
+                    .send()
+                    .map_err(io::Error::other)
+            },
+            4,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn test_send_with_retry_returns_last_transport_error() {
+        let mut calls = 0;
+
+        let err = send_with_retry_config(
+            || -> io::Result<Response> {
+                calls += 1;
+                Err(io::Error::other(format!("failure {calls}")))
+            },
+            3,
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(calls, 3, "should stop after max_attempts");
+        assert!(
+            err.to_string().contains("failure 3"),
+            "last error should be returned, got: {err}"
+        );
     }
 
     #[test]
