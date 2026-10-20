@@ -57,22 +57,52 @@ struct SourceState {
 }
 
 /// Runs the remote-source sync loop in a dedicated thread.
+///
+/// `config_path` is watched for changes so sources added through config mode
+/// are picked up without restarting the manager.
 pub fn run_sync_scheduler(
     config: Config,
+    config_path: PathBuf,
     dedup_set: Arc<Mutex<HashSet<u64>>>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let cursor_path = config.photos_dir.join("sync-cursors.json");
+    let mut config = config;
+    let mut cursor_path = config.photos_dir.join("sync-cursors.json");
     let mut cursors: HashMap<String, String> = load_cursors(&cursor_path);
     // Unix seconds of the last sync attempt per source. Kept in memory so a
     // failed attempt waits for the next interval instead of retrying every
     // second. The cursor file still only records successful syncs.
     let mut last_attempts: HashMap<String, u64> = HashMap::new();
+    let mut reloader = ConfigReloader::new(config_path);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             log::info!("Remote sync scheduler shutting down");
             break;
+        }
+
+        // Pick up config-mode changes before deciding what is due. A parse or
+        // validation error leaves the previous config in place so a partially
+        // written file cannot stop syncing.
+        if let Some(result) = reloader.poll() {
+            match result {
+                Ok(new_config) => {
+                    log::info!(
+                        "Reloaded config from {} ({} remote source(s))",
+                        reloader.path().display(),
+                        new_config.remote_sources.len()
+                    );
+                    if new_config.photos_dir != config.photos_dir {
+                        // Cursors live next to the photos they describe.
+                        cursor_path = new_config.photos_dir.join("sync-cursors.json");
+                        cursors = load_cursors(&cursor_path);
+                    }
+                    config = new_config;
+                }
+                Err(e) => {
+                    log::error!("Failed to reload config, keeping previous config: {}", e);
+                }
+            }
         }
 
         let sources: Vec<SourceState> = config
@@ -125,10 +155,74 @@ pub fn run_sync_scheduler(
                 break;
             }
             std::thread::sleep(Duration::from_millis(500));
+            // Wake immediately for a config change so newly added sources
+            // start syncing without waiting out the current interval.
+            if reloader.modified() {
+                break;
+            }
         }
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config reloading
+// ---------------------------------------------------------------------------
+
+/// Watches the config file so the scheduler can reload it without a restart.
+pub struct ConfigReloader {
+    path: PathBuf,
+    last_mtime: Option<SystemTime>,
+    last_len: Option<u64>,
+}
+
+impl ConfigReloader {
+    pub fn new(path: PathBuf) -> Self {
+        let (last_mtime, last_len) = file_signature(&path);
+        ConfigReloader {
+            path,
+            last_mtime,
+            last_len,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// True when the file's mtime or size differs from the last poll.
+    pub fn modified(&self) -> bool {
+        signature_changed((self.last_mtime, self.last_len), file_signature(&self.path))
+    }
+
+    /// Reload the config if the file changed. Returns `None` when unchanged.
+    /// On failure the caller keeps its previous config; the new signature is
+    /// still recorded so a broken file does not retry on every iteration.
+    pub fn poll(&mut self) -> Option<Result<Config, String>> {
+        if !self.modified() {
+            return None;
+        }
+        let (mtime, len) = file_signature(&self.path);
+        self.last_mtime = mtime;
+        self.last_len = len;
+        Some(Config::from_file(&self.path))
+    }
+}
+
+fn file_signature(path: &Path) -> (Option<SystemTime>, Option<u64>) {
+    match std::fs::metadata(path) {
+        Ok(meta) => (meta.modified().ok(), Some(meta.len())),
+        Err(_) => (None, None),
+    }
+}
+
+/// A change is only actionable when the file exists and its signature moved.
+fn signature_changed(
+    previous: (Option<SystemTime>, Option<u64>),
+    current: (Option<SystemTime>, Option<u64>),
+) -> bool {
+    current.0.is_some() && current != previous
 }
 
 fn unix_now() -> u64 {
@@ -359,5 +453,83 @@ mod tests {
     fn test_parse_cursor_time() {
         assert_eq!(parse_cursor_time("1609459200"), Some(1_609_459_200));
         assert_eq!(parse_cursor_time("2021-01-01T00:00:00Z"), None);
+    }
+
+    fn write_config(path: &Path, photos_dir: &Path, source_names: &[&str]) {
+        let mut toml = format!(
+            "photos_dir = {:?}\ndisplay_socket_path = \"/tmp/sock\"\nnative_resolution = \"32x32\"\n",
+            photos_dir
+        );
+        for name in source_names {
+            toml.push_str(&format!(
+                "\n[[remote_sources]]\ntype = \"dropbox\"\nname = \"{name}\"\naccess_token = \"token\"\n"
+            ));
+        }
+        std::fs::write(path, toml).unwrap();
+    }
+
+    #[test]
+    fn test_signature_changed() {
+        let time = SystemTime::UNIX_EPOCH;
+        assert!(!signature_changed((None, None), (None, None)));
+        // A missing file is never a change, even if a previous signature exists.
+        assert!(!signature_changed((Some(time), Some(10)), (None, None)));
+        assert!(signature_changed((None, None), (Some(time), Some(10))));
+        assert!(signature_changed(
+            (Some(time), Some(10)),
+            (Some(time), Some(11))
+        ));
+        assert!(!signature_changed(
+            (Some(time), Some(10)),
+            (Some(time), Some(10))
+        ));
+    }
+
+    #[test]
+    fn test_config_reloader_detects_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let photos = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, photos.path(), &[]);
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut reloader = ConfigReloader::new(path.clone());
+        assert!(!reloader.modified());
+        assert!(reloader.poll().is_none());
+
+        write_config(&path, photos.path(), &["One"]);
+        assert!(reloader.modified(), "rewritten config should be detected");
+        let reloaded = reloader
+            .poll()
+            .expect("change detected")
+            .expect("config should parse");
+        assert_eq!(reloaded.remote_sources.len(), 1);
+        assert_eq!(reloaded.remote_sources[0].name, "One");
+
+        // Polling again without touching the file is a no-op.
+        assert!(!reloader.modified());
+        assert!(reloader.poll().is_none());
+    }
+
+    #[test]
+    fn test_config_reloader_reports_parse_errors_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let photos = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, photos.path(), &[]);
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut reloader = ConfigReloader::new(path.clone());
+        std::fs::write(&path, "this is not = valid toml\n").unwrap();
+
+        let err = reloader
+            .poll()
+            .expect("change detected")
+            .expect_err("invalid config should be reported");
+        assert!(err.contains("Failed to parse config file"), "got: {err}");
+
+        // The broken signature is remembered so the scheduler does not spin
+        // re-parsing an unchanged file.
+        assert!(reloader.poll().is_none());
     }
 }
