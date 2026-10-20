@@ -16,7 +16,8 @@
 
 use crate::config::Config;
 use crate::import::usb::import_single_photo;
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,7 +53,6 @@ struct SourceState {
     name: String,
     source_type: String,
     interval_secs: u64,
-    #[allow(dead_code)]
     params: HashMap<String, String>,
 }
 
@@ -74,6 +74,10 @@ pub fn run_sync_scheduler(
     // second. The cursor file still only records successful syncs.
     let mut last_attempts: HashMap<String, u64> = HashMap::new();
     let mut reloader = ConfigReloader::new(config_path);
+    let mut status = SyncStatus::default();
+    status.retain_configured(&config);
+    status.refresh_last_sync(&cursors);
+    status.save(&status_path(&config));
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -98,6 +102,10 @@ pub fn run_sync_scheduler(
                         cursors = load_cursors(&cursor_path);
                     }
                     config = new_config;
+                    // Pick up added sources and drop removed ones right away.
+                    status.retain_configured(&config);
+                    status.refresh_last_sync(&cursors);
+                    status.save(&status_path(&config));
                 }
                 Err(e) => {
                     log::error!("Failed to reload config, keeping previous config: {}", e);
@@ -124,16 +132,28 @@ pub fn run_sync_scheduler(
                 continue;
             }
 
+            let attempt_at = unix_now();
             log::info!(
                 r#"Syncing remote source "{}" ({})"#,
                 source.name,
                 source.source_type
             );
-            last_attempts.insert(source.name.clone(), unix_now());
-            if let Err(e) = sync_source(source, &config, &dedup_set, &mut cursors) {
-                log::error!(r#"Sync failed for "{}": {}"#, source.name, e);
+            last_attempts.insert(source.name.clone(), attempt_at);
+            let result = sync_source(source, &config, &dedup_set, &mut cursors);
+            let error = match &result {
+                Ok(()) => None,
+                Err(e) => {
+                    log::error!(r#"Sync failed for "{}": {}"#, source.name, e);
+                    Some(e.to_string())
+                }
+            };
+            if result.is_ok() {
+                save_cursors(&cursor_path, &cursors);
             }
-            save_cursors(&cursor_path, &cursors);
+            // Publish the result for the admin UI after every attempt.
+            status.record_attempt(&source.name, attempt_at, error.as_deref());
+            status.refresh_last_sync(&cursors);
+            status.save(&status_path(&config));
         }
 
         // Sleep until the next source is due, or 60 seconds when idle.
@@ -400,6 +420,105 @@ fn safe_filename(filename: &str, index: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Sync status file
+// ---------------------------------------------------------------------------
+
+/// Outcome of the most recent attempt for a source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncState {
+    #[default]
+    Ok,
+    Error,
+}
+
+/// Per-source status published to `<photos_dir>/sync-status.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceStatus {
+    /// Unix seconds of the last successful cursor timestamp, or null.
+    pub last_sync: Option<u64>,
+    /// Unix seconds of the last attempt, or null if never attempted.
+    pub last_attempt: Option<u64>,
+    pub state: SyncState,
+    pub error: Option<String>,
+}
+
+/// The whole status document. Shapes the JSON as `{"sources": {name: {...}}}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub sources: BTreeMap<String, SourceStatus>,
+}
+
+fn status_path(config: &Config) -> PathBuf {
+    config.photos_dir.join("sync-status.json")
+}
+
+impl SyncStatus {
+    /// Keep only sources that are currently configured, adding an empty entry
+    /// for each new one so the admin UI sees it before its first attempt.
+    pub fn retain_configured(&mut self, config: &Config) {
+        let configured: HashSet<&str> = config
+            .remote_sources
+            .iter()
+            .map(|source| source.name.as_str())
+            .collect();
+        self.sources
+            .retain(|name, _| configured.contains(name.as_str()));
+        for source in &config.remote_sources {
+            self.sources.entry(source.name.clone()).or_default();
+        }
+    }
+
+    /// Pick up the last successful sync timestamp stored in the cursor file.
+    pub fn refresh_last_sync(&mut self, cursors: &HashMap<String, String>) {
+        for (name, status) in self.sources.iter_mut() {
+            if let Some(timestamp) = cursors
+                .get(name)
+                .and_then(|cursor| parse_cursor_time(cursor))
+            {
+                status.last_sync = Some(timestamp);
+            }
+        }
+    }
+
+    /// Record one attempt. `error` is `None` for a successful sync.
+    pub fn record_attempt(&mut self, name: &str, attempt_at: u64, error: Option<&str>) {
+        let status = self.sources.entry(name.to_string()).or_default();
+        status.last_attempt = Some(attempt_at);
+        match error {
+            Some(message) => {
+                status.state = SyncState::Error;
+                status.error = Some(message.to_string());
+            }
+            None => {
+                status.state = SyncState::Ok;
+                status.error = None;
+            }
+        }
+    }
+
+    /// Write the file atomically (temp file + rename) so the admin server never
+    /// reads a half-written document.
+    pub fn save(&self, path: &Path) {
+        let json = match serde_json::to_string(self) {
+            Ok(json) => json,
+            Err(e) => {
+                log::warn!("Failed to serialize sync status: {}", e);
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            log::warn!("Failed to write sync status {}: {}", tmp.display(), e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            log::warn!("Failed to publish sync status {}: {}", path.display(), e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cursor file helpers
 // ---------------------------------------------------------------------------
 
@@ -561,6 +680,128 @@ mod tests {
             log_max_files: 2,
             remote_sources: Vec::new(),
         }
+    }
+
+    fn test_config_with_sources(photos_dir: &Path, names: &[&str]) -> Config {
+        let mut config = test_config(photos_dir);
+        config.remote_sources = names
+            .iter()
+            .map(|name| crate::config::RemoteSourceConfig {
+                source_type: "dropbox".to_string(),
+                name: (*name).to_string(),
+                params: HashMap::new(),
+                check_interval_seconds: 86_400,
+            })
+            .collect();
+        config
+    }
+
+    fn read_status(path: &Path) -> SyncStatus {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_sync_status_round_trip_and_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-status.json");
+
+        let mut status = SyncStatus::default();
+        status.sources.insert(
+            "My Dropbox".to_string(),
+            SourceStatus {
+                last_sync: Some(100),
+                last_attempt: Some(200),
+                state: SyncState::Ok,
+                error: None,
+            },
+        );
+        status.sources.insert(
+            "Old Drive".to_string(),
+            SourceStatus {
+                last_sync: None,
+                last_attempt: Some(50),
+                state: SyncState::Error,
+                error: Some("boom".to_string()),
+            },
+        );
+        status.save(&path);
+
+        // The admin server depends on this exact shape.
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["sources"]["My Dropbox"]["last_sync"], 100);
+        assert_eq!(raw["sources"]["My Dropbox"]["last_attempt"], 200);
+        assert_eq!(raw["sources"]["My Dropbox"]["state"], "ok");
+        assert!(raw["sources"]["My Dropbox"]["error"].is_null());
+        assert_eq!(raw["sources"]["Old Drive"]["state"], "error");
+        assert_eq!(raw["sources"]["Old Drive"]["error"], "boom");
+        assert!(raw["sources"]["Old Drive"]["last_sync"].is_null());
+
+        // Sources removed from config disappear; new ones get a blank entry.
+        let config = test_config_with_sources(dir.path(), &["My Dropbox", "New Source"]);
+        let mut reloaded = read_status(&path);
+        reloaded.retain_configured(&config);
+        assert!(reloaded.sources.contains_key("My Dropbox"));
+        assert!(reloaded.sources.contains_key("New Source"));
+        assert!(!reloaded.sources.contains_key("Old Drive"));
+        assert_eq!(
+            reloaded.sources["New Source"],
+            SourceStatus::default(),
+            "a new source starts with no attempts"
+        );
+        assert_eq!(reloaded.sources["My Dropbox"].last_sync, Some(100));
+
+        reloaded.save(&path);
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "atomic save must not leave a temp file"
+        );
+        let final_status = read_status(&path);
+        assert_eq!(final_status.sources.len(), 2);
+    }
+
+    #[test]
+    fn test_sync_status_records_attempts_and_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-status.json");
+        let config = test_config_with_sources(dir.path(), &["My Dropbox"]);
+        let mut status = SyncStatus::default();
+        status.retain_configured(&config);
+        assert_eq!(status.sources["My Dropbox"].last_attempt, None);
+
+        status.record_attempt("My Dropbox", 1_000, Some("network down"));
+        assert_eq!(status.sources["My Dropbox"].state, SyncState::Error);
+        assert_eq!(
+            status.sources["My Dropbox"].error.as_deref(),
+            Some("network down")
+        );
+
+        let mut cursors = HashMap::new();
+        cursors.insert("My Dropbox".to_string(), "1609459200".to_string());
+        status.refresh_last_sync(&cursors);
+        assert_eq!(status.sources["My Dropbox"].last_sync, Some(1_609_459_200));
+
+        status.record_attempt("My Dropbox", 2_000, None);
+        status.refresh_last_sync(&cursors);
+        status.save(&path);
+
+        let saved = read_status(&path);
+        assert_eq!(saved.sources["My Dropbox"].last_attempt, Some(2_000));
+        assert_eq!(saved.sources["My Dropbox"].last_sync, Some(1_609_459_200));
+        assert_eq!(saved.sources["My Dropbox"].state, SyncState::Ok);
+        assert!(saved.sources["My Dropbox"].error.is_none());
+
+        // The cursor timestamp format is what the file is read back with.
+        cursors.insert("My Dropbox".to_string(), "not-a-timestamp".to_string());
+        status.refresh_last_sync(&cursors);
+        assert_eq!(status.sources["My Dropbox"].last_sync, Some(1_609_459_200));
+    }
+
+    #[test]
+    fn test_status_path_lives_in_photos_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        assert_eq!(status_path(&config), dir.path().join("sync-status.json"));
     }
 
     fn photo(name: &str) -> RemotePhoto {
