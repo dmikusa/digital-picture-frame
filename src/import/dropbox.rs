@@ -14,8 +14,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::import::http;
 use crate::import::remote::{RemotePhoto, RemotePhotoSource};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -76,7 +77,7 @@ impl DropboxSource {
         content_base: String,
     ) -> Self {
         DropboxSource {
-            client: Client::new(),
+            client: http::build_client().expect("test HTTP client"),
             access_token,
             folder,
             api_base,
@@ -85,31 +86,37 @@ impl DropboxSource {
     }
 
     fn list_folder(&self, args_json: &str) -> io::Result<ListFolderResult> {
-        let resp = self
+        let request = self
             .client
             .post(format!("{}/files/list_folder", self.api_base))
             .header(AUTHORIZATION, bearer(&self.access_token))
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(args_json.to_string())
-            .send()
-            .map_err(io::Error::other)?;
+            .body(args_json.to_string());
 
-        parse_list_result(resp, "list_folder")
+        parse_list_result(send_request(request)?, "list_folder")
     }
 
     fn list_folder_continue(&self, cursor: &str) -> io::Result<ListFolderResult> {
         let body = serde_json::json!({ "cursor": cursor }).to_string();
-        let resp = self
+        let request = self
             .client
             .post(format!("{}/files/list_folder/continue", self.api_base))
             .header(AUTHORIZATION, bearer(&self.access_token))
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(body)
-            .send()
-            .map_err(io::Error::other)?;
+            .body(body);
 
-        parse_list_result(resp, "list_folder/continue")
+        parse_list_result(send_request(request)?, "list_folder/continue")
     }
+}
+
+fn send_request(request: RequestBuilder) -> io::Result<reqwest::blocking::Response> {
+    http::send_with_retry(|| {
+        request
+            .try_clone()
+            .ok_or_else(|| io::Error::other("Dropbox request could not be cloned for retry"))?
+            .send()
+            .map_err(io::Error::other)
+    })
 }
 
 impl RemotePhotoSource for DropboxSource {
@@ -123,14 +130,13 @@ impl RemotePhotoSource for DropboxSource {
             .cloned()
             .unwrap_or_else(|| "/Photos".to_string());
 
-        let client = Client::new();
+        let client = http::build_client()?;
 
         // Validate the token
-        let resp = client
+        let request = client
             .post(format!("{API_BASE}/users/get_current_account"))
-            .header(AUTHORIZATION, bearer(&access_token))
-            .send()
-            .map_err(io::Error::other)?;
+            .header(AUTHORIZATION, bearer(&access_token));
+        let resp = send_request(request)?;
 
         if !resp.status().is_success() {
             return Err(io::Error::other(format!(
@@ -189,13 +195,12 @@ impl RemotePhotoSource for DropboxSource {
         };
         let args_json = serde_json::to_string(&args).map_err(io::Error::other)?;
 
-        let resp = self
+        let request = self
             .client
             .post(format!("{}/files/download", self.content_base))
             .header(AUTHORIZATION, bearer(&self.access_token))
-            .header("Dropbox-API-Arg", &args_json)
-            .send()
-            .map_err(io::Error::other)?;
+            .header("Dropbox-API-Arg", &args_json);
+        let resp = send_request(request)?;
 
         if !resp.status().is_success() {
             return Err(io::Error::other(format!(
@@ -204,9 +209,7 @@ impl RemotePhotoSource for DropboxSource {
             )));
         }
 
-        let bytes = resp.bytes().map_err(io::Error::other)?;
-        std::fs::write(dest, &bytes)?;
-        Ok(())
+        http::download_to_file(resp, dest)
     }
 }
 
@@ -358,6 +361,46 @@ mod tests {
         let (photos, _cursor) = source.list_changes(None).unwrap();
         assert_eq!(photos.len(), 1);
         assert_eq!(server.request_count(), 1);
+    }
+
+    #[test]
+    fn test_list_changes_retries_transient_errors() {
+        let server = TestServer::start(|req, index| {
+            if index == 0 {
+                // Retry-After avoids a real backoff sleep in the test.
+                TestReply::status(503).with_header("Retry-After", "0")
+            } else if req.url.ends_with("/files/list_folder") {
+                TestReply::json(format!(
+                    r#"{{"entries":[{}],"cursor":"c","has_more":false}}"#,
+                    entry("retried.jpg", "2024-01-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_source(&server);
+        let (photos, _cursor) = source.list_changes(None).unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[test]
+    fn test_download_streams_bytes_to_destination() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 97) as u8).collect();
+        let expected = payload.clone();
+        let server = TestServer::start(move |_req, _idx| TestReply::new(200, payload.clone()));
+
+        let mut source = test_source(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("photo.jpg");
+
+        source.download("/photos/a.jpg", &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), expected);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.ends_with("/files/download"));
     }
 
     #[test]

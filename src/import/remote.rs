@@ -312,13 +312,14 @@ fn download_and_import(
     config: &Config,
     dedup_set: &Arc<Mutex<HashSet<u64>>>,
 ) -> io::Result<()> {
-    let tmp_dir = PathBuf::from("/tmp/photo-frame-sync");
-    std::fs::create_dir_all(&tmp_dir)?;
+    let tmp_dir = sync_tmp_dir(config);
+    prepare_tmp_dir(&tmp_dir)?;
 
-    for photo in photos {
-        let dest = tmp_dir.join(&photo.filename);
+    for (index, photo) in photos.iter().enumerate() {
+        let dest = tmp_dir.join(safe_filename(&photo.filename, index));
         if let Err(e) = src.download(&photo.remote_id, &dest) {
             log::warn!(r#"Download failed for "{}": {}"#, photo.filename, e);
+            let _ = std::fs::remove_file(&dest);
             continue;
         }
 
@@ -344,6 +345,38 @@ fn download_and_import(
     }
 
     Ok(())
+}
+
+/// In-flight downloads live under the photos partition instead of tmpfs so a
+/// large batch does not consume RAM. The directory is hidden and outside the
+/// index, so the display loop never sees it.
+fn sync_tmp_dir(config: &Config) -> PathBuf {
+    config.photos_dir.join(".sync-tmp")
+}
+
+/// Create the temp directory and clear anything left behind by a crash or an
+/// interrupted sync.
+fn prepare_tmp_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Reduce a remote filename to a single path component so a hostile or unusual
+/// name cannot escape the temp directory, and prefix the batch index so two
+/// photos with the same name cannot collide.
+fn safe_filename(filename: &str, index: usize) -> String {
+    let base = Path::new(filename)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "photo".to_string());
+    format!("{index}-{base}")
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +486,30 @@ mod tests {
     fn test_parse_cursor_time() {
         assert_eq!(parse_cursor_time("1609459200"), Some(1_609_459_200));
         assert_eq!(parse_cursor_time("2021-01-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn test_safe_filename_blocks_traversal_and_collisions() {
+        assert_eq!(safe_filename("../../etc/passwd", 0), "0-passwd");
+        assert_eq!(safe_filename("/abs/photo.jpg", 1), "1-photo.jpg");
+        assert_eq!(safe_filename("dup.jpg", 0), "0-dup.jpg");
+        assert_ne!(safe_filename("dup.jpg", 0), safe_filename("dup.jpg", 1));
+        // Names with no usable component fall back to a fixed stem.
+        assert_eq!(safe_filename("", 2), "2-photo");
+        assert_eq!(safe_filename("..", 3), "3-photo");
+    }
+
+    #[test]
+    fn test_prepare_tmp_dir_clears_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".sync-tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("0-stale.jpg"), b"leftover").unwrap();
+
+        prepare_tmp_dir(&tmp).unwrap();
+
+        assert!(tmp.is_dir());
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
     }
 
     fn write_config(path: &Path, photos_dir: &Path, source_names: &[&str]) {

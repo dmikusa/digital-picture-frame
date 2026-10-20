@@ -14,8 +14,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::import::http;
 use crate::import::remote::{RemotePhoto, RemotePhotoSource};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -57,7 +58,7 @@ impl GoogleDriveSource {
     #[cfg(test)]
     pub(crate) fn with_base_url(api_key: String, folder_id: String, api_base: String) -> Self {
         GoogleDriveSource {
-            client: Client::new(),
+            client: http::build_client().expect("test HTTP client"),
             auth: AuthMode::ApiKey(api_key),
             folder_id,
             api_base,
@@ -66,16 +67,11 @@ impl GoogleDriveSource {
 
     fn make_get(&self, url: &str) -> io::Result<reqwest::blocking::Response> {
         let mut req = self.client.get(url);
-        match &self.auth {
-            AuthMode::ApiKey(key) => {
-                // key already in url via ?key= param
-                let _ = key;
-            }
-            AuthMode::OAuth { access_token, .. } => {
-                req = req.header(AUTHORIZATION, bearer(access_token));
-            }
+        // API-key auth is already in the URL via ?key=; OAuth uses a header.
+        if let AuthMode::OAuth { access_token, .. } = &self.auth {
+            req = req.header(AUTHORIZATION, bearer(access_token));
         }
-        req.send().map_err(io::Error::other)
+        send_request(req)
     }
 
     fn auth_param(&self) -> String {
@@ -137,7 +133,7 @@ impl RemotePhotoSource for GoogleDriveSource {
             ));
         };
 
-        let client = Client::new();
+        let client = http::build_client()?;
         let source = GoogleDriveSource {
             client,
             auth,
@@ -233,10 +229,18 @@ impl RemotePhotoSource for GoogleDriveSource {
             )));
         }
 
-        let bytes = resp.bytes().map_err(io::Error::other)?;
-        std::fs::write(dest, &bytes)?;
-        Ok(())
+        http::download_to_file(resp, dest)
     }
+}
+
+fn send_request(request: RequestBuilder) -> io::Result<reqwest::blocking::Response> {
+    http::send_with_retry(|| {
+        request
+            .try_clone()
+            .ok_or_else(|| io::Error::other("Google Drive request could not be cloned for retry"))?
+            .send()
+            .map_err(io::Error::other)
+    })
 }
 
 fn collect_photos(
@@ -429,6 +433,24 @@ mod tests {
         let (photos, _cursor) = source.list_changes(None).unwrap();
         assert_eq!(photos.len(), 1);
         assert_eq!(server.request_count(), 1);
+    }
+
+    #[test]
+    fn test_download_streams_bytes_to_destination() {
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i % 89) as u8).collect();
+        let expected = payload.clone();
+        let server = TestServer::start(move |_req, _idx| TestReply::new(200, payload.clone()));
+
+        let mut source = test_source(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("photo.jpg");
+
+        source.download("file-id", &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), expected);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.contains("/files/file-id?alt=media"));
     }
 
     #[test]

@@ -16,6 +16,7 @@
 
 pub mod dropbox;
 pub mod gdrive;
+pub mod http;
 pub mod remote;
 #[cfg(test)]
 pub mod test_http;
