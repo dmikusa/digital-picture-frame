@@ -164,6 +164,11 @@ CONFIG_MODE ──user finishes (POST /finish)──▶ validate, save, resume s
   ready yet. The config-mode thread survives these failures.
 - Entering config mode always stops any running admin server first, including
   when a USB is inserted during an existing session.
+- Recovery after an import is cancelled: no photos and no remote sources go
+  back to setup; no photos with remote sources show the first-sync screen;
+  photos mean the slideshow. Leaving config mode (finish, USB removal, or
+  timeout) never reopens setup automatically, but uses the first-sync screen
+  when remote sources are configured.
 - The timer is checked in the main loop with `Receiver::recv_timeout`.
 
 ### Task 3.2: Staged Config
@@ -184,9 +189,8 @@ CONFIG_MODE ──user finishes (POST /finish)──▶ validate, save, resume s
     then `fs::rename()`.
   - Update the in-memory config so a later config-mode session sees the new
     sources.
-- If new `[[remote_sources]]` are added, the first sync scheduler pass picks
-  them up. (The running scheduler is not hot-reloaded in Phase 3; a restart is
-  required for an already-running process.)
+- The scheduler hot-reloads `config.toml`, so sources added, edited, or removed
+  in config mode take effect on its next pass. No restart is required.
 - On USB removal or idle timeout: discard staged config, stop server. No disk
   writes.
 
@@ -328,7 +332,7 @@ check_interval_seconds = 86400
 
 ---
 
-## Phase 7: Admin UI (DIY HTTP Server)
+## Phase 7: Admin UI (tiny_http_fork)
 
 ### Task 7.1: HTTP Server
 - New `src/admin_server.rs` module.
@@ -369,12 +373,12 @@ check_interval_seconds = 86400
 | `/api/status` | GET | Yes | Staged sources plus the parsed contents of `<photos_dir>/sync-status.json` under `sync` (empty object if missing/unreadable). Returns JSON. |
 | `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. JSON request returns JSON; form request returns an HTML success page. Invalid sources return an HTML error page for browsers or a JSON error object for API clients (400). |
 
-### Task 7.3: HTML Pages (HTMX)
+### Task 7.3: HTML Pages (Plain Forms)
 
 | Route | Method | Auth | Description |
 |-------|--------|------|-------------|
-| `/` | GET | Yes | Dashboard: menu bar + HTMX-loaded status card from `/api/status` |
-| `/sources` | GET | Yes | Source list: menu bar + HTMX-loaded source table from `/api/sources` |
+| `/` | GET | Yes | Dashboard: menu bar + server-rendered source cards and count |
+| `/sources` | GET | Yes | Source list: menu bar + server-rendered source cards with delete forms |
 | `/sources/add` | GET | Yes | Menu bar + source type picker (links to `/sources/dropbox` and `/sources/google-drive`) |
 | `/sources/dropbox` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/dropbox`) |
 | `/sources/google-drive` | GET | Yes | Menu bar + form (submits via plain HTML POST to `/api/sources/google-drive`) |
@@ -390,7 +394,7 @@ Every HTML page shares the same structure:
 │  Home │ Sources │ Add   │  ← menu bar, active page highlighted
 ├─────────────────────────┤
 │                         │
-│  [page content here]    │  ← HTMX-loaded or server-rendered
+│  [page content here]    │  ← server-rendered HTML
 │                         │
 └─────────────────────────┘
 ```
@@ -467,10 +471,10 @@ handles the common case (public folders) with zero OAuth complexity.
 | 5.1 | Dropbox source + tests | Medium |
 | 6.1 | Google Drive source (API key) + tests | Medium |
 | 6.2 | Google Drive setup docs | Small |
-| 7.1 | DIY HTTP server (TcpListener + httparse) | Medium |
+| 7.1 | HTTP server (tiny_http_fork) | Medium |
 | 7.2 | API routes (JSON, REST) | Medium |
-| 7.3 | HTML pages (HTMX, menu bar layout) | Medium |
-| 7.4 | Page layout + HTMX wiring | Small |
+| 7.3 | HTML pages (plain forms, menu bar layout) | Medium |
+| 7.4 | Page layout + 303 redirect flow | Small |
 | 8.1 | Google Drive OAuth (deferred) | Large |
 | 8.2 | OAuth setup documentation | Small |
 

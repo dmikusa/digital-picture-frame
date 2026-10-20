@@ -48,6 +48,39 @@ enum StartupState {
     ConfigMode,
 }
 
+/// Where to return after an import ends or a config session closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryState {
+    Slideshow,
+    FirstSync,
+    ConfigMode,
+}
+
+/// Recovery after an import stops, for example because the USB was removed.
+///
+/// With nothing to display, a frame that has never been configured goes back
+/// to the setup screen so the user can recover.
+fn recovery_after_import(valid_count: usize, has_remote_sources: bool) -> RecoveryState {
+    match (valid_count > 0, has_remote_sources) {
+        (true, _) => RecoveryState::Slideshow,
+        (false, true) => RecoveryState::FirstSync,
+        (false, false) => RecoveryState::ConfigMode,
+    }
+}
+
+/// Recovery after config mode ends (finish, USB removal, or idle timeout).
+///
+/// Setup is deliberately not reopened: the user either saved a config or
+/// cancelled the session, so bouncing straight back into the QR screen would be
+/// surprising. Remote sources still get the first-sync screen.
+fn recovery_after_config(valid_count: usize, has_remote_sources: bool) -> RecoveryState {
+    match (valid_count > 0, has_remote_sources) {
+        (true, _) => RecoveryState::Slideshow,
+        (false, true) => RecoveryState::FirstSync,
+        (false, false) => RecoveryState::Slideshow,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ConfigState {
     /// Slideshow running normally.
@@ -73,11 +106,16 @@ fn initial_state(valid_count: usize, has_remote_sources: bool) -> StartupState {
     }
 }
 
+/// Number of valid photos currently in the index.
+fn photo_count(photos_dir: &Path) -> usize {
+    crate::index::init_index(photos_dir)
+        .map(|(_, meta)| meta.valid_count)
+        .unwrap_or(0)
+}
+
 /// Whether the index currently reports at least one photo.
 fn photos_available(photos_dir: &Path) -> bool {
-    crate::index::init_index(photos_dir)
-        .map(|(_, meta)| meta.valid_count > 0)
-        .unwrap_or(false)
+    photo_count(photos_dir) > 0
 }
 
 /// Serialize `config` to TOML and atomically replace `path`.
@@ -242,9 +280,10 @@ impl ConfigEnvironment {
         self.server = None;
     }
 
-    /// Leave config mode: stop the admin server and resume the slideshow.
-    /// If `save` is true, write the staged remote sources to config.toml.
-    fn leave_config_mode(&mut self, save: bool) {
+    /// Leave config mode: stop the admin server and recover to the right
+    /// screen. If `save` is true, write the staged remote sources to
+    /// config.toml first.
+    fn leave_config_mode(&mut self, save: bool, fallback_ip: &str) {
         log::info!("Leaving config mode (save={save})");
 
         let staged = self.server.as_ref().map(|server| server.take_sources());
@@ -258,8 +297,26 @@ impl ConfigEnvironment {
             }
         }
 
-        self.resume_slideshow();
-        self.state = ConfigState::Normal;
+        let recovery = recovery_after_config(
+            photo_count(&self.config.photos_dir),
+            !self.config.remote_sources.is_empty(),
+        );
+        self.recover_to(recovery, fallback_ip);
+    }
+
+    /// Apply a recovery decision, updating the display and the state.
+    fn recover_to(&mut self, recovery: RecoveryState, fallback_ip: &str) {
+        match recovery {
+            RecoveryState::Slideshow => {
+                self.state = ConfigState::Normal;
+                self.resume_slideshow();
+            }
+            RecoveryState::FirstSync => {
+                self.state = ConfigState::FirstSync;
+                self.show_first_sync_screen();
+            }
+            RecoveryState::ConfigMode => self.begin_config_mode(fallback_ip),
+        }
     }
 
     /// Persist `sources` and remember them so a later config session sees them.
@@ -360,15 +417,18 @@ impl ConfigEnvironment {
                         _ => false,
                     };
                     if empty {
-                        self.state = ConfigState::Normal;
-                        self.resume_slideshow();
+                        let recovery = recovery_after_import(
+                            photo_count(&self.config.photos_dir),
+                            !self.config.remote_sources.is_empty(),
+                        );
+                        self.recover_to(recovery, fallback_ip);
                     }
                 } else if matches!(
                     self.state,
                     ConfigState::ConfigMode | ConfigState::PendingConfigMode { .. }
                 ) {
                     log::info!("USB removed — leaving config mode ({})", path.display());
-                    self.leave_config_mode(false);
+                    self.leave_config_mode(false, fallback_ip);
                 } else {
                     log::info!("USB removed: {}", path.display());
                 }
@@ -436,7 +496,7 @@ pub fn run_config_mode_loop(
             log::info!("Config mode shutting down");
             if matches!(env.state, ConfigState::ConfigMode) {
                 let save = env.server.as_ref().map(|s| s.finished()).unwrap_or(false);
-                env.leave_config_mode(save);
+                env.leave_config_mode(save, &fallback_ip);
             } else {
                 env.stop_server();
             }
@@ -448,12 +508,12 @@ pub fn run_config_mode_loop(
             if let Some(ref server) = env.server {
                 if server.finished() {
                     log::info!("User finished setup — saving config");
-                    env.leave_config_mode(true);
+                    env.leave_config_mode(true, &fallback_ip);
                     continue;
                 }
                 if server.timed_out() {
                     log::info!("Config mode timed out");
-                    env.leave_config_mode(false);
+                    env.leave_config_mode(false, &fallback_ip);
                     continue;
                 }
             }
@@ -543,6 +603,27 @@ mod tests {
     #[test]
     fn initial_state_enters_config_mode_on_fresh_frame() {
         assert_eq!(initial_state(0, false), StartupState::ConfigMode);
+    }
+
+    #[test]
+    fn recovery_after_import_returns_to_setup_when_empty() {
+        // A cancelled import on an unconfigured frame should reopen setup
+        // rather than run a slideshow with nothing in it.
+        assert_eq!(recovery_after_import(0, false), RecoveryState::ConfigMode);
+        assert_eq!(recovery_after_import(0, true), RecoveryState::FirstSync);
+        assert_eq!(recovery_after_import(5, false), RecoveryState::Slideshow);
+        assert_eq!(recovery_after_import(5, true), RecoveryState::Slideshow);
+    }
+
+    #[test]
+    fn recovery_after_config_does_not_reopen_setup() {
+        // Cancelling or timing out config mode must not bounce the user
+        // straight back into the QR screen.
+        assert_eq!(recovery_after_config(0, false), RecoveryState::Slideshow);
+        // Remote sources still deserve the first-sync screen.
+        assert_eq!(recovery_after_config(0, true), RecoveryState::FirstSync);
+        assert_eq!(recovery_after_config(5, false), RecoveryState::Slideshow);
+        assert_eq!(recovery_after_config(5, true), RecoveryState::Slideshow);
     }
 
     #[test]

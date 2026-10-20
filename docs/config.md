@@ -105,7 +105,7 @@ check_interval_seconds = 86400
 | `name` | Yes | Unique, non-empty label used in the UI and cursor file |
 | `check_interval_seconds` | No | Seconds between sync checks. Default `86400`; must be greater than 0 |
 | `access_token` | Dropbox | Dropbox API access token |
-| `folder` | No | Dropbox folder to scan. Default: the account root |
+| `folder` | No | Dropbox folder to scan. Default: `/Photos` |
 | `folder_id` | Google Drive | ID of the shared folder |
 | `api_key` | Google Drive | Key for a publicly shared folder |
 | `client_id`, `client_secret`, `refresh_token` | Google Drive (private) | Complete OAuth credential set, as an alternative to `api_key` |
