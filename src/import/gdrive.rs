@@ -296,7 +296,7 @@ fn refresh_access_token(
     client_id: &str,
     client_secret: &str,
 ) -> io::Result<String> {
-    let client = Client::new();
+    let client = http::build_client()?;
     let params = [
         ("client_id", client_id),
         ("client_secret", client_secret),
@@ -325,7 +325,7 @@ pub fn exchange_code(
     client_secret: &str,
     redirect_uri: &str,
 ) -> io::Result<String> {
-    let client = Client::new();
+    let client = http::build_client()?;
     let params = [
         ("client_id", client_id),
         ("client_secret", client_secret),
