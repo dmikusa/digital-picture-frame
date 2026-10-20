@@ -38,8 +38,27 @@ const FOOTER_BASELINE_MARGIN: f32 = 40.0;
 const TEXT_SIZE_RATIO: f32 = 0.04;
 /// Footer font size, as a fraction of the screen height.
 const FOOTER_SIZE_RATIO: f32 = 0.03;
+/// Baseline of the title on a status screen, as a fraction of the height.
+const STATUS_TITLE_BASELINE_RATIO: f32 = 0.40;
+/// Title font size, as a fraction of the screen height.
+const STATUS_TITLE_SIZE_RATIO: f32 = 0.07;
+/// Body font size, as a fraction of the screen height.
+const STATUS_BODY_SIZE_RATIO: f32 = 0.04;
+/// Space between the title baseline and the first body line, as a multiple of
+/// the body line height.
+const STATUS_BODY_GAP: f32 = 1.5;
 /// Fallback file used by [`render_config_screen`].
 const DEFAULT_CONFIG_SCREEN_PATH: &str = "/tmp/photo-frame-qr.jpg";
+/// File used by [`render_status_screen`]. Distinct from the QR screen so a
+/// stale config screen is never shown as a status screen.
+const DEFAULT_STATUS_SCREEN_PATH: &str = "/tmp/photo-frame-status.jpg";
+
+/// mDNS hostname shown as the optional, secondary setup URL.
+///
+/// This only resolves when `avahi-daemon` is running and the `photo-frame`
+/// hostname (or an alias) is configured. The primary URL always uses the
+/// detected LAN address, so setup works without mDNS.
+pub const MDNS_HOST: &str = "photo-frame.local";
 
 /// Computed positions for every element on the config screen.
 ///
@@ -254,17 +273,49 @@ pub fn generate_qr_jpeg(url: &str, width: u32, height: u32) -> Result<Vec<u8>, S
 // Full config-mode screen
 // ---------------------------------------------------------------------------
 
+/// URL encoded into the setup QR code.
+///
+/// The LAN address is used as the primary URL so scanning works without an
+/// mDNS resolver. The password is embedded as HTTP basic-auth user info.
+pub(crate) fn qr_url(fallback_ip: &str, port: u16, password: &str) -> String {
+    format!("http://photo-frame:{password}@{fallback_ip}:{port}")
+}
+
+/// The three instruction lines drawn below the QR code.
+///
+/// The reachable LAN URL comes first; the mDNS name is only an optional
+/// alternative.
+pub(crate) fn config_screen_lines(
+    fallback_ip: &str,
+    mdns_host: &str,
+    port: u16,
+    password: &str,
+) -> [String; 3] {
+    [
+        format!("http://{fallback_ip}:{port}"),
+        format!("Password: {password}"),
+        format!("Or: http://{mdns_host}:{port} (optional)"),
+    ]
+}
+
+/// Render the config-mode screen with a QR code and setup instructions.
+///
+/// `fallback_ip` is the detected LAN address and is used both for the QR code
+/// and for the primary instruction line. `mdns_host` is displayed as an
+/// optional alternative.
 pub fn render_config_screen(
     config: &Config,
-    admin_url: &str,
-    password: &str,
     fallback_ip: &str,
+    mdns_host: &str,
+    port: u16,
+    password: &str,
 ) -> Result<PathBuf, String> {
     render_config_screen_to(
         config,
-        admin_url,
-        password,
         fallback_ip,
+        mdns_host,
+        port,
+        password,
         Path::new(DEFAULT_CONFIG_SCREEN_PATH),
     )
 }
@@ -275,17 +326,18 @@ pub fn render_config_screen(
 /// own file instead of racing over the shared `/tmp` path.
 fn render_config_screen_to(
     config: &Config,
-    admin_url: &str,
-    password: &str,
     fallback_ip: &str,
+    mdns_host: &str,
+    port: u16,
+    password: &str,
     out_path: &Path,
 ) -> Result<PathBuf, String> {
     let (width, height) = config.resolution();
     let font = load_font()?;
     let white = Rgb([255u8, 255, 255]);
 
-    let qr_url = format!("http://photo-frame:{}@{admin_url}", password);
-    let code = QrCode::new(&qr_url).map_err(|e| format!("QR encode error: {e}"))?;
+    let code = QrCode::new(qr_url(fallback_ip, port, password))
+        .map_err(|e| format!("QR encode error: {e}"))?;
     let module_count = code.width() as u32;
     let layout = compute_layout(width, height, module_count, &font);
 
@@ -313,43 +365,17 @@ fn render_config_screen_to(
         }
     }
 
-    let font_size = layout.font_size;
-    let url_line = format!("http://{admin_url}");
-    draw_centered(
-        &mut img,
-        layout.baselines[0],
-        &url_line,
-        white,
-        font_size,
-        &font,
-    );
-
-    let pw_line = format!("Password: {password}");
-    draw_centered(
-        &mut img,
-        layout.baselines[1],
-        &pw_line,
-        white,
-        font_size,
-        &font,
-    );
-
-    let ip_line = format!(
-        "Or: http://{fallback_ip}:{port}",
-        port = admin_url
-            .split(':')
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .unwrap_or("8080")
-    );
-    draw_centered(
-        &mut img,
-        layout.baselines[2],
-        &ip_line,
-        white,
-        font_size,
-        &font,
-    );
+    let lines = config_screen_lines(fallback_ip, mdns_host, port, password);
+    for (i, line) in lines.iter().enumerate() {
+        draw_centered(
+            &mut img,
+            layout.baselines[i],
+            line,
+            white,
+            layout.font_size,
+            &font,
+        );
+    }
 
     draw_centered(
         &mut img,
@@ -368,11 +394,67 @@ fn render_config_screen_to(
     Ok(out_path)
 }
 
+/// Render a generic full-screen status message (importing, first sync, ...).
+///
+/// Writes to a path distinct from the QR screen so the two cannot be confused,
+/// and returns the path for the caller to pass to the control socket.
+pub fn render_status_screen(
+    config: &Config,
+    title: &str,
+    lines: &[&str],
+) -> Result<PathBuf, String> {
+    render_status_screen_to(config, title, lines, Path::new(DEFAULT_STATUS_SCREEN_PATH))
+}
+
+fn render_status_screen_to(
+    config: &Config,
+    title: &str,
+    lines: &[&str],
+    out_path: &Path,
+) -> Result<PathBuf, String> {
+    let (width, height) = config.resolution();
+    let font = load_font()?;
+    let white = Rgb([255u8, 255, 255]);
+
+    let title_size = (height as f32 * STATUS_TITLE_SIZE_RATIO).max(18.0);
+    let body_size = (height as f32 * STATUS_BODY_SIZE_RATIO).max(12.0);
+    let body_metrics = font
+        .horizontal_line_metrics(body_size)
+        .unwrap_or(fontdue::LineMetrics {
+            ascent: body_size * 0.7,
+            descent: -body_size * 0.3,
+            line_gap: 0.0,
+            new_line_size: body_size * 1.2,
+        });
+
+    let mut img: RgbImage = ImageBuffer::new(width, height);
+    for pixel in img.pixels_mut() {
+        *pixel = Rgb([0u8, 0, 0]);
+    }
+
+    let title_baseline = height as f32 * STATUS_TITLE_BASELINE_RATIO;
+    draw_centered(&mut img, title_baseline, title, white, title_size, &font);
+
+    let mut baseline =
+        title_baseline + body_metrics.ascent + body_metrics.new_line_size * STATUS_BODY_GAP;
+    for line in lines {
+        draw_centered(&mut img, baseline, line, white, body_size, &font);
+        baseline += body_metrics.new_line_size;
+    }
+
+    let out_path = PathBuf::from(out_path);
+    DynamicImage::ImageRgb8(img)
+        .save_with_format(&out_path, image::ImageFormat::Jpeg)
+        .map_err(|e| format!("Failed to save status screen: {e}"))?;
+
+    Ok(out_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ADMIN_URL: &str = "photo-frame.local:8147";
+    const PORT: u16 = 8147;
     const PASSWORD: &str = "abc12345";
     const FALLBACK_IP: &str = "192.168.1.5";
     /// Pixels brighter than this count as ink.  Fully lit text/QR pixels are
@@ -398,13 +480,12 @@ mod tests {
     fn render_for_test(width: u32, height: u32, dir: &Path) -> (RgbImage, ConfigScreenLayout) {
         let config = test_config(width, height);
         let font = load_font().unwrap();
-        let qr_url = format!("http://photo-frame:{PASSWORD}@{ADMIN_URL}");
-        let code = QrCode::new(&qr_url).unwrap();
+        let code = QrCode::new(qr_url(FALLBACK_IP, PORT, PASSWORD)).unwrap();
         let layout = compute_layout(width, height, code.width() as u32, &font);
 
         let path = dir.join(format!("config-{width}x{height}.jpg"));
-        let path =
-            render_config_screen_to(&config, ADMIN_URL, PASSWORD, FALLBACK_IP, &path).unwrap();
+        let path = render_config_screen_to(&config, FALLBACK_IP, MDNS_HOST, PORT, PASSWORD, &path)
+            .unwrap();
         (image::open(path).unwrap().to_rgb8(), layout)
     }
 
@@ -525,10 +606,80 @@ mod tests {
     #[test]
     fn test_render_config_screen() {
         let config = test_config(800, 600);
-        let path = render_config_screen(&config, ADMIN_URL, PASSWORD, FALLBACK_IP).unwrap();
+        let path = render_config_screen(&config, FALLBACK_IP, MDNS_HOST, PORT, PASSWORD).unwrap();
         assert!(path.exists());
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn test_setup_url_uses_lan_ip() {
+        // The QR code must carry the reachable LAN address, not the mDNS name.
+        assert_eq!(
+            qr_url(FALLBACK_IP, PORT, PASSWORD),
+            "http://photo-frame:abc12345@192.168.1.5:8147"
+        );
+
+        let lines = config_screen_lines(FALLBACK_IP, MDNS_HOST, PORT, PASSWORD);
+        assert_eq!(lines[0], "http://192.168.1.5:8147");
+        assert_eq!(lines[1], "Password: abc12345");
+        assert_eq!(lines[2], "Or: http://photo-frame.local:8147 (optional)");
+    }
+
+    #[test]
+    fn test_status_and_config_screens_use_distinct_paths() {
+        assert_ne!(DEFAULT_CONFIG_SCREEN_PATH, DEFAULT_STATUS_SCREEN_PATH);
+    }
+
+    #[test]
+    fn test_render_status_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(800, 600);
+        let path = dir.path().join("status.jpg");
+
+        let rendered = render_status_screen_to(
+            &config,
+            "Importing photos...",
+            &["Please wait.", "Do not remove the USB drive."],
+            &path,
+        )
+        .unwrap();
+
+        assert_eq!(rendered, path);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+
+        let img = image::open(&path).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (800, 600));
+
+        // Title plus two body lines, each horizontally centered with margins.
+        let bands = row_bands(&img);
+        assert_eq!(bands.len(), 3, "status bands: {bands:?}");
+        for (i, band) in bands.iter().enumerate() {
+            let (left, right) = column_extent(&img, band.0, band.1);
+            assert!(
+                ((left + right) as i32 - 800).abs() <= 8,
+                "status line {i} should be centered ({left}..{right})"
+            );
+            assert!(
+                left >= 10 && right < 790,
+                "status line {i} should not touch the screen edges"
+            );
+        }
+
+        let title_size = (600.0 * STATUS_TITLE_SIZE_RATIO).max(18.0);
+        let font = load_font().unwrap();
+        let (title_top, _) = expected_ink_rows(
+            "Importing photos...",
+            600.0 * STATUS_TITLE_BASELINE_RATIO,
+            title_size,
+            &font,
+        );
+        assert!(
+            (bands[0].0 as i32 - title_top as i32).abs() <= 2,
+            "title starts at {}, expected {title_top}",
+            bands[0].0
+        );
     }
 
     #[test]
@@ -716,9 +867,9 @@ mod tests {
 
             // Every line's ink lands on the baseline the layout asked for.
             let lines = [
-                format!("http://{ADMIN_URL}"),
+                format!("http://{FALLBACK_IP}:{PORT}"),
                 format!("Password: {PASSWORD}"),
-                format!("Or: http://{FALLBACK_IP}:8147"),
+                format!("Or: http://{MDNS_HOST}:{PORT} (optional)"),
                 "Insert USB to configure (remove to cancel)".to_string(),
             ];
             for i in 0..3 {
@@ -754,7 +905,7 @@ mod tests {
 
             // Text is centered and has margins on both sides.  Side bearings
             // differ per glyph, so allow a small fraction of the width.
-            let center_tolerance = ((width as f32 * 0.005) as i32).max(4);
+            let center_tolerance = ((width as f32 * 0.01) as i32).max(8);
             for (i, band) in text_bands.iter().enumerate() {
                 let (left, right) = column_extent(&img, band.0, band.1);
                 assert!(

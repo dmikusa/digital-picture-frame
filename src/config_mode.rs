@@ -30,14 +30,54 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// How long to wait before retrying a config-mode entry that could not reach
+/// the display app (for example, because it has not created its socket yet).
+const CONFIG_MODE_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// How often the first-sync screen checks the index for newly synced photos.
+const FIRST_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// What to show when the manager starts, before any USB events arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupState {
+    /// Photos exist, so run the slideshow.
+    Slideshow,
+    /// No photos, but remote sources are configured: wait for the first sync.
+    FirstSync,
+    /// No photos and no remote sources: this is a fresh frame, so show setup.
+    ConfigMode,
+}
+
 #[derive(Debug, PartialEq)]
 enum ConfigState {
     /// Slideshow running normally.
     Normal,
+    /// No photos yet; waiting for the first remote sync to produce some.
+    FirstSync,
     /// USB insert detected; waiting for import threads to complete.
     Importing { pending: HashSet<PathBuf> },
+    /// Config-mode entry failed (display app not ready); retry shortly.
+    PendingConfigMode { retry_at: Instant },
     /// Showing config-QR on screen, admin server running (Phase 7).
-    ConfigMode { entered: Instant },
+    ConfigMode,
+}
+
+/// Pick the startup screen from the current photo count and config.
+fn initial_state(valid_count: usize, has_remote_sources: bool) -> StartupState {
+    if valid_count > 0 {
+        StartupState::Slideshow
+    } else if has_remote_sources {
+        StartupState::FirstSync
+    } else {
+        StartupState::ConfigMode
+    }
+}
+
+/// Whether the index currently reports at least one photo.
+fn photos_available(photos_dir: &Path) -> bool {
+    crate::index::init_index(photos_dir)
+        .map(|(_, meta)| meta.valid_count > 0)
+        .unwrap_or(false)
 }
 
 /// Serialize `config` to TOML and atomically replace `path`.
@@ -124,19 +164,29 @@ impl ConfigEnvironment {
     }
 
     /// Enter config mode: display the QR code and start the admin server.
+    ///
+    /// If the display app is not reachable yet, this returns an error without
+    /// leaving a listener behind. The caller retries through
+    /// [`ConfigState::PendingConfigMode`].
     fn enter_config_mode(&mut self, fallback_ip: &str) -> io::Result<()> {
         let password = qr::generate_password();
+        let staged_sources = self.config.remote_sources.clone();
+        let status_path = self
+            .config
+            .photos_dir
+            .join(crate::admin_server::SYNC_STATUS_FILE);
 
-        let server = Arc::new(AdminServer::new(password.clone())?);
+        let server = Arc::new(
+            AdminServer::new(password.clone(), staged_sources)?.with_status_path(status_path),
+        );
         let port = server.port();
-        let admin_host = format!("photo-frame.local:{port}");
 
-        let qr_path = qr::render_config_screen(&self.config, &admin_host, &password, fallback_ip)
-            .map_err(io::Error::other)?;
+        let qr_path =
+            qr::render_config_screen(&self.config, fallback_ip, qr::MDNS_HOST, port, &password)
+                .map_err(io::Error::other)?;
 
-        self.control.clear()?;
-        self.control.show(&qr_path)?;
-
+        // Start accepting requests before showing the QR so the URL is live as
+        // soon as someone scans it.
         self.server_shutdown.store(false, Ordering::Relaxed);
         let srv = server.clone();
         let srv_shutdown = self.server_shutdown.clone();
@@ -145,98 +195,185 @@ impl ConfigEnvironment {
                 log::error!("Admin server error: {e}");
             }
         }));
-
         self.server = Some(server);
 
-        log::info!("Config mode active: http://{admin_host}");
-        self.state = ConfigState::ConfigMode {
-            entered: Instant::now(),
-        };
+        if let Err(e) = self
+            .control
+            .clear()
+            .and_then(|()| self.control.show(&qr_path))
+        {
+            self.stop_server();
+            return Err(e);
+        }
+
+        log::info!(
+            "Config mode active: http://{fallback_ip}:{port} (or http://{}:{port})",
+            qr::MDNS_HOST
+        );
+        self.state = ConfigState::ConfigMode;
 
         Ok(())
     }
 
-    /// Leave config mode: stop the admin server and resume the slideshow.
-    /// If `save` is true, write the staged remote sources to config.toml.
-    fn leave_config_mode(&mut self, save: bool) -> io::Result<()> {
-        log::info!("Leaving config mode (save={save})");
+    /// Try to enter config mode, falling back to a retry when the display app
+    /// is not ready. Never leaves the state machine without a server retry.
+    fn begin_config_mode(&mut self, fallback_ip: &str) {
+        match self.enter_config_mode(fallback_ip) {
+            Ok(()) => {}
+            Err(e) => {
+                log::warn!(
+                    "Config mode not ready ({e}); retrying in {:?}",
+                    CONFIG_MODE_RETRY_DELAY
+                );
+                self.stop_server();
+                self.state = ConfigState::PendingConfigMode {
+                    retry_at: Instant::now() + CONFIG_MODE_RETRY_DELAY,
+                };
+            }
+        }
+    }
+
+    /// Stop the admin server, if one is running.
+    fn stop_server(&mut self) {
         self.server_shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.server_handle.take() {
             let _ = handle.join();
         }
+        self.server = None;
+    }
+
+    /// Leave config mode: stop the admin server and resume the slideshow.
+    /// If `save` is true, write the staged remote sources to config.toml.
+    fn leave_config_mode(&mut self, save: bool) {
+        log::info!("Leaving config mode (save={save})");
+
+        let staged = self.server.as_ref().map(|server| server.take_sources());
+        self.stop_server();
 
         if save {
-            if let Some(ref server) = self.server {
-                let sources = server.take_sources();
-                if !sources.is_empty() {
-                    let mut config = self.config.clone();
-                    config.remote_sources = sources;
-                    save_config_atomic(&self.config_path, &config)?;
-                    log::info!("Config saved to {}", self.config_path.display());
+            if let Some(sources) = staged {
+                if let Err(e) = self.save_staged_sources(sources) {
+                    log::error!("Failed to save config: {e}");
                 }
             }
         }
 
-        self.server = None;
-        self.control.resume()?;
+        self.resume_slideshow();
         self.state = ConfigState::Normal;
+    }
+
+    /// Persist `sources` and remember them so a later config session sees them.
+    fn save_staged_sources(
+        &mut self,
+        sources: Vec<crate::config::RemoteSourceConfig>,
+    ) -> io::Result<()> {
+        let mut config = self.config.clone();
+        config.remote_sources = sources;
+        save_config_atomic(&self.config_path, &config)?;
+        log::info!("Config saved to {}", self.config_path.display());
+        self.config = config;
         Ok(())
     }
 
-    /// Process a mount event, updating the state machine.
-    fn handle_event(&mut self, event: MountEvent, fallback_ip: &str) -> io::Result<()> {
-        // Handle Inserted events separately to avoid borrow conflicts when
-        // we need to read the old Importing { pending } set.
-        if let MountEvent::Inserted(path) = event {
-            let existing: Vec<_> = match &self.state {
-                ConfigState::Importing { pending } => pending.iter().cloned().collect(),
-                _ => vec![],
-            };
-            let mut pending: HashSet<_> = existing.into_iter().collect();
-            pending.insert(path);
-            self.state = ConfigState::Importing { pending };
-            return Ok(());
+    /// Best-effort `RESUME`; a missing display app must not stop the loop.
+    fn resume_slideshow(&mut self) {
+        if let Err(e) = self.control.resume() {
+            log::warn!("Could not resume slideshow: {e}");
         }
+    }
 
-        match (&mut self.state, event) {
+    /// Draw a simple status screen (importing, waiting for first sync, ...).
+    fn show_status_screen(&mut self, title: &str, lines: &[&str]) {
+        match qr::render_status_screen(&self.config, title, lines) {
+            Ok(path) => {
+                if let Err(e) = self.control.clear().and_then(|()| self.control.show(&path)) {
+                    log::warn!("Could not display status screen: {e}");
+                }
+            }
+            Err(e) => log::warn!("Could not render status screen: {e}"),
+        }
+    }
+
+    fn show_first_sync_screen(&mut self) {
+        self.show_status_screen(
+            "First remote sync in progress",
+            &[
+                "Your photos will appear here when the sync finishes.",
+                "This may take some time.",
+            ],
+        );
+    }
+
+    /// Process a mount event, updating the state machine.
+    fn handle_event(&mut self, event: MountEvent, fallback_ip: &str) {
+        match event {
+            MountEvent::Inserted(path) => {
+                log::info!("USB inserted: {}", path.display());
+
+                // A new USB drive invalidates any running config session. Stop
+                // the old listener before starting another so we do not leak a
+                // port, listener, and password.
+                self.stop_server();
+
+                let mut pending = match &self.state {
+                    ConfigState::Importing { pending } => pending.clone(),
+                    _ => HashSet::new(),
+                };
+                pending.insert(path);
+                self.state = ConfigState::Importing { pending };
+
+                self.show_status_screen(
+                    "Importing photos...",
+                    &[
+                        "Please wait, this can take a few minutes.",
+                        "Do not remove the USB drive.",
+                    ],
+                );
+            }
+
             // ---- Import finished (one mount) ----------------------------------
-            (ConfigState::Importing { ref mut pending }, MountEvent::ImportComplete(path)) => {
-                log::info!("Import complete: {}", path.display());
-                pending.remove(&path);
-                if pending.is_empty() {
+            MountEvent::ImportComplete(path) => {
+                let done = match &mut self.state {
+                    ConfigState::Importing { pending } => {
+                        log::info!("Import complete: {}", path.display());
+                        pending.remove(&path);
+                        pending.is_empty()
+                    }
+                    _ => false,
+                };
+
+                if done {
                     log::info!("All imports done — entering config mode");
-                    self.enter_config_mode(fallback_ip)?;
+                    self.begin_config_mode(fallback_ip);
                 }
             }
 
             // ---- USB removed --------------------------------------------------
-            (ConfigState::Importing { ref mut pending }, MountEvent::Removed(path)) => {
-                log::info!("USB removed during import: {}", path.display());
-                pending.remove(&path);
-                if pending.is_empty() {
-                    self.state = ConfigState::Normal;
+            MountEvent::Removed(path) => {
+                if matches!(self.state, ConfigState::Importing { .. }) {
+                    log::info!("USB removed during import: {}", path.display());
+                    let empty = match &mut self.state {
+                        ConfigState::Importing { pending } => {
+                            pending.remove(&path);
+                            pending.is_empty()
+                        }
+                        _ => false,
+                    };
+                    if empty {
+                        self.state = ConfigState::Normal;
+                        self.resume_slideshow();
+                    }
+                } else if matches!(
+                    self.state,
+                    ConfigState::ConfigMode | ConfigState::PendingConfigMode { .. }
+                ) {
+                    log::info!("USB removed — leaving config mode ({})", path.display());
+                    self.leave_config_mode(false);
+                } else {
+                    log::info!("USB removed: {}", path.display());
                 }
             }
-            (ConfigState::ConfigMode { .. }, MountEvent::Removed(path)) => {
-                log::info!(
-                    "USB removed — leaving config mode  ({path})",
-                    path = path.display()
-                );
-                self.leave_config_mode(false)?;
-            }
-            (ConfigState::Normal, MountEvent::Removed(path)) => {
-                log::info!("USB removed: {}", path.display());
-            }
-
-            // ---- Late import-complete after mode change (ignore) --------------
-            (ConfigState::Normal, MountEvent::ImportComplete(_))
-            | (ConfigState::ConfigMode { .. }, MountEvent::ImportComplete(_)) => {}
-
-            // USB inserted while already in config mode: restart.
-            _ => {}
         }
-
-        Ok(())
     }
 }
 
@@ -271,52 +408,81 @@ pub fn run_config_mode_loop(
 ) -> io::Result<()> {
     let fallback_ip = detect_fallback_ip();
 
-    // First-boot detection: no photos and no remote sources → enter config
-    // mode immediately.
-    let first_boot = {
-        let (_, meta) = crate::index::init_index(&config.photos_dir)?;
-        meta.valid_count == 0
-    };
+    // Decide what to show on startup from the photo index and the config.
+    let valid_count = crate::index::init_index(&config.photos_dir)?.1.valid_count;
+    let startup = initial_state(valid_count, !config.remote_sources.is_empty());
 
     let mut env = ConfigEnvironment::new(config, &control_socket_path, config_path);
 
-    if first_boot {
-        log::info!("First boot detected — entering config mode");
-        env.enter_config_mode(&fallback_ip)?;
+    match startup {
+        StartupState::Slideshow => {
+            log::info!("Photos available — starting in slideshow mode");
+        }
+        StartupState::FirstSync => {
+            log::info!("No photos yet and remote sources configured — waiting for first sync");
+            env.state = ConfigState::FirstSync;
+            env.show_first_sync_screen();
+        }
+        StartupState::ConfigMode => {
+            log::info!("First boot detected — entering config mode");
+            env.begin_config_mode(&fallback_ip);
+        }
     }
+
+    let mut next_first_sync_poll = Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             log::info!("Config mode shutting down");
-            if env.state != ConfigState::Normal {
+            if matches!(env.state, ConfigState::ConfigMode) {
                 let save = env.server.as_ref().map(|s| s.finished()).unwrap_or(false);
-                let _ = env.leave_config_mode(save);
+                env.leave_config_mode(save);
+            } else {
+                env.stop_server();
             }
             break;
         }
 
-        // Check if user finished setup
-        if let ConfigState::ConfigMode { .. } = env.state {
+        // Check if the user finished setup or the session timed out.
+        if matches!(env.state, ConfigState::ConfigMode) {
             if let Some(ref server) = env.server {
                 if server.finished() {
                     log::info!("User finished setup — saving config");
-                    env.leave_config_mode(true)?;
+                    env.leave_config_mode(true);
                     continue;
                 }
                 if server.timed_out() {
                     log::info!("Config mode timed out");
-                    env.leave_config_mode(false)?;
+                    env.leave_config_mode(false);
                     continue;
                 }
             }
         }
 
-        match event_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(event) => {
-                if let Err(e) = env.handle_event(event, &fallback_ip) {
-                    log::error!("Config mode event error: {e}");
-                }
+        // Retry config-mode entry after a transient display-app failure.
+        if let ConfigState::PendingConfigMode { retry_at } = env.state {
+            if Instant::now() >= retry_at {
+                log::info!("Retrying config mode entry");
+                env.begin_config_mode(&fallback_ip);
+                continue;
             }
+        }
+
+        // While waiting for the first remote sync, watch the index so the
+        // slideshow resumes as soon as photos show up.
+        if matches!(env.state, ConfigState::FirstSync)
+            && next_first_sync_poll.elapsed() >= FIRST_SYNC_POLL_INTERVAL
+        {
+            next_first_sync_poll = Instant::now();
+            if photos_available(&env.config.photos_dir) {
+                log::info!("First-sync photos available — resuming slideshow");
+                env.resume_slideshow();
+                env.state = ConfigState::Normal;
+            }
+        }
+
+        match event_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(event) => env.handle_event(event, &fallback_ip),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // No event — loop back to check timeout + shutdown.
             }
@@ -359,6 +525,82 @@ mod tests {
                 check_interval_seconds: 3600,
             }],
         }
+    }
+
+    #[test]
+    fn initial_state_prefers_existing_photos() {
+        assert_eq!(initial_state(3, false), StartupState::Slideshow);
+        assert_eq!(initial_state(3, true), StartupState::Slideshow);
+    }
+
+    #[test]
+    fn initial_state_waits_for_first_remote_sync() {
+        // No photos yet, but remote sources will produce some: do not show the
+        // QR screen, show the first-sync status instead.
+        assert_eq!(initial_state(0, true), StartupState::FirstSync);
+    }
+
+    #[test]
+    fn initial_state_enters_config_mode_on_fresh_frame() {
+        assert_eq!(initial_state(0, false), StartupState::ConfigMode);
+    }
+
+    #[test]
+    fn photos_available_reads_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!photos_available(dir.path()));
+
+        fs::write(dir.path().join("index-0-0.csv"), "").unwrap();
+        assert!(!photos_available(dir.path()));
+
+        fs::write(dir.path().join("index-0-2.csv"), "").unwrap();
+        fs::remove_file(dir.path().join("index-0-0.csv")).unwrap();
+        assert!(photos_available(dir.path()));
+    }
+
+    #[test]
+    fn saving_sources_updates_the_in_memory_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let photos_dir = dir.path().join("photos");
+        fs::create_dir(&photos_dir).unwrap();
+        let config = sample_config(photos_dir);
+        let mut env =
+            ConfigEnvironment::new(config, &dir.path().join("control.sock"), path.clone());
+
+        let staged = vec![RemoteSourceConfig {
+            source_type: "dropbox".to_string(),
+            name: "Saved Dropbox".to_string(),
+            params: HashMap::from([("access_token".to_string(), "sl.x".to_string())]),
+            check_interval_seconds: 600,
+        }];
+
+        env.save_staged_sources(staged).unwrap();
+
+        // Both the file and the live config now see the new source, so a
+        // second config-mode session starts with it staged.
+        let loaded = Config::from_file(&path).unwrap();
+        assert_eq!(loaded.remote_sources.len(), 1);
+        assert_eq!(loaded.remote_sources[0].name, "Saved Dropbox");
+        assert_eq!(env.config.remote_sources.len(), 1);
+        assert_eq!(env.config.remote_sources[0].name, "Saved Dropbox");
+    }
+
+    #[test]
+    fn saving_an_empty_source_list_removes_all_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let photos_dir = dir.path().join("photos");
+        fs::create_dir(&photos_dir).unwrap();
+        let config = sample_config(photos_dir);
+        let mut env =
+            ConfigEnvironment::new(config, &dir.path().join("control.sock"), path.clone());
+
+        env.save_staged_sources(Vec::new()).unwrap();
+
+        let loaded = Config::from_file(&path).unwrap();
+        assert!(loaded.remote_sources.is_empty());
+        assert!(env.config.remote_sources.is_empty());
     }
 
     #[test]

@@ -22,8 +22,11 @@
 //! is stopped with its `Arc<AtomicBool>` shutdown flag.
 
 use photo_frame_manager::admin_server::AdminServer;
+use photo_frame_manager::config::RemoteSourceConfig;
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -44,10 +47,35 @@ struct TestServer {
     _lock: MutexGuard<'static, ()>,
 }
 
+fn staged_source(source_type: &str, name: &str, params: &[(&str, &str)]) -> RemoteSourceConfig {
+    RemoteSourceConfig {
+        source_type: source_type.to_string(),
+        name: name.to_string(),
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<HashMap<_, _>>(),
+        check_interval_seconds: 3600,
+    }
+}
+
 impl TestServer {
     fn start() -> Self {
+        Self::start_with(Vec::new())
+    }
+
+    fn start_with(sources: Vec<RemoteSourceConfig>) -> Self {
+        Self::start_with_status(sources, None)
+    }
+
+    fn start_with_status(sources: Vec<RemoteSourceConfig>, status_path: Option<PathBuf>) -> Self {
         let lock = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let server = Arc::new(AdminServer::new(PASSWORD.to_string()).expect("create admin server"));
+        let mut server =
+            AdminServer::new(PASSWORD.to_string(), sources).expect("create admin server");
+        if let Some(path) = status_path {
+            server = server.with_status_path(path);
+        }
+        let server = Arc::new(server);
         let port = server.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let client = Client::builder()
@@ -277,6 +305,156 @@ fn finish_via_json_returns_json() {
     let body = response.text().expect("read finish JSON");
     assert!(body.contains(r#""ok":true"#), "finish body: {body}");
     assert!(s.server.finished());
+}
+
+#[test]
+fn preloaded_sources_appear_in_pages_and_api() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Existing Dropbox",
+        &[("access_token", "sl.preseeded")],
+    )]);
+
+    let page = s.get("/sources").text().expect("read sources page");
+    assert!(page.contains("Existing Dropbox"), "sources page: {page}");
+
+    let dashboard = s.get("/").text().expect("read dashboard");
+    assert!(
+        dashboard.contains("Existing Dropbox"),
+        "dashboard: {dashboard}"
+    );
+
+    let response = s.get("/api/sources");
+    assert_eq!(response.status(), 200);
+    let body = response.text().expect("read sources JSON");
+    assert!(body.contains("Existing Dropbox"), "sources JSON: {body}");
+
+    // An existing source can be removed, not just newly added ones.
+    let delete = s.post_empty_form("/api/sources/Existing%20Dropbox");
+    assert_eq!(delete.status(), 303);
+    assert!(s.server.take_sources().is_empty());
+}
+
+#[test]
+fn finish_form_with_incomplete_google_drive_returns_html_error() {
+    let s = TestServer::start_with(vec![staged_source(
+        "google_drive",
+        "Broken Drive",
+        &[("api_key", "AIza-but-no-folder")],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 400);
+    assert!(
+        content_type(&response).starts_with("text/html"),
+        "browser form errors must be HTML, got {}",
+        content_type(&response)
+    );
+    let body = response.text().expect("read error page");
+    assert!(body.contains("folder ID"), "error page: {body}");
+    assert!(
+        !s.server.finished(),
+        "a failed validation must not stop the server"
+    );
+}
+
+#[test]
+fn finish_json_with_incomplete_source_returns_json_error() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "No Token",
+        &[("folder", "/Photos")],
+    )]);
+
+    let response = s.post_json("/api/finish", "{}");
+
+    assert_eq!(response.status(), 400);
+    assert!(
+        content_type(&response).starts_with("application/json"),
+        "API errors must be JSON, got {}",
+        content_type(&response)
+    );
+    let body = response.text().expect("read error JSON");
+    assert!(body.contains("access token"), "error JSON: {body}");
+    assert!(!s.server.finished());
+
+    // The invalid source is still staged so the user can fix it.
+    assert_eq!(s.server.take_sources().len(), 1);
+}
+
+#[test]
+fn finish_with_duplicate_names_returns_error() {
+    let s = TestServer::start_with(vec![
+        staged_source("dropbox", "Dupe", &[("access_token", "sl.a")]),
+        staged_source("dropbox", " Dupe ", &[("access_token", "sl.b")]),
+    ]);
+
+    let response = s.post_json("/api/finish", "{}");
+    assert_eq!(response.status(), 400);
+    let body = response.text().unwrap();
+    assert!(body.contains("more than once"), "error JSON: {body}");
+    assert!(!s.server.finished());
+}
+
+#[test]
+fn finish_with_valid_preloaded_source_succeeds() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Valid Dropbox",
+        &[("access_token", "sl.good")],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("text/html"));
+    assert!(s.server.finished());
+    let sources = s.server.take_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].name, "Valid Dropbox");
+}
+
+#[test]
+fn status_includes_staged_sources_and_sync_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let status_path = dir.path().join("sync-status.json");
+    std::fs::write(
+        &status_path,
+        r#"{"sources":{"My Dropbox":{"last_sync":123,"last_attempt":120,"state":"ok","error":null}}}"#,
+    )
+    .unwrap();
+
+    let s = TestServer::start_with_status(
+        vec![staged_source(
+            "dropbox",
+            "My Dropbox",
+            &[("access_token", "sl.x")],
+        )],
+        Some(status_path),
+    );
+
+    let response = s.get("/api/status");
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("application/json"));
+
+    let body: serde_json::Value =
+        serde_json::from_str(&response.text().expect("read status")).expect("valid status JSON");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["sources"][0]["name"], "My Dropbox");
+    assert_eq!(body["sync"]["sources"]["My Dropbox"]["last_sync"], 123);
+    assert_eq!(body["sync"]["sources"]["My Dropbox"]["state"], "ok");
+}
+
+#[test]
+fn status_without_sync_file_returns_empty_sync_object() {
+    let s = TestServer::start();
+
+    let body: serde_json::Value =
+        serde_json::from_str(&s.get("/api/status").text().expect("read status"))
+            .expect("valid status JSON");
+    assert_eq!(body["sync"], serde_json::json!({}));
+    assert_eq!(body["count"], 0);
 }
 
 #[test]

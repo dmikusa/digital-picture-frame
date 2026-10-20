@@ -16,13 +16,18 @@
 
 use crate::config::RemoteSourceConfig;
 use askama::Template;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tiny_http_fork::{Header, Method, Request, Response, Server, StatusCode};
+
+/// File the remote-sync scheduler writes to report per-source status. It lives
+/// next to the photo index in `photos_dir`.
+pub const SYNC_STATUS_FILE: &str = "sync-status.json";
 
 // ---------------------------------------------------------------------------
 // Askama templates — compiled from templates/*.html at build time
@@ -80,19 +85,31 @@ pub struct AdminServer {
     staged_sources: Arc<Mutex<Vec<RemoteSourceConfig>>>,
     finished: Arc<AtomicBool>,
     last_request: Arc<Mutex<Instant>>,
+    status_path: Option<PathBuf>,
 }
 
 impl AdminServer {
-    pub fn new(password: String) -> io::Result<Self> {
+    /// Start a server that stages `staged_sources`. Config mode seeds this with
+    /// the sources already in `config.toml`, so existing entries can be edited
+    /// or removed and are not silently lost.
+    pub fn new(password: String, staged_sources: Vec<RemoteSourceConfig>) -> io::Result<Self> {
         let port = find_free_port()?;
 
         Ok(AdminServer {
             port,
             password,
-            staged_sources: Arc::new(Mutex::new(Vec::new())),
+            staged_sources: Arc::new(Mutex::new(staged_sources)),
             finished: Arc::new(AtomicBool::new(false)),
             last_request: Arc::new(Mutex::new(Instant::now())),
+            status_path: None,
         })
+    }
+
+    /// Point `/api/status` at the scheduler's `sync-status.json`. Without this,
+    /// the status endpoint reports an empty `sync` object.
+    pub fn with_status_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.status_path = Some(path.into());
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -182,14 +199,7 @@ impl AdminServer {
                 }
             }
             (Method::Get, "/api/status") => self.api_status(),
-            (Method::Post, "/api/finish") => {
-                let response = self.api_finish();
-                if wants_html(request) {
-                    serve_template(&FinishTemplate)
-                } else {
-                    response
-                }
-            }
+            (Method::Post, "/api/finish") => self.api_finish(request),
 
             // ---- HTML pages ---------------------------------------------------
             (Method::Get, "/") => {
@@ -251,10 +261,11 @@ impl AdminServer {
         let params = match parse_params(request) {
             Ok(p) => p,
             Err(e) => {
+                let message = format!("Invalid form data: {e}");
                 return if form {
-                    html_error(400, &format!("Invalid form data: {e}"))
+                    html_error(400, &message)
                 } else {
-                    json_response(400, &format!(r#"{{"error":"{e}"}}"#))
+                    json_error(400, &message)
                 };
             }
         };
@@ -302,19 +313,71 @@ impl AdminServer {
     fn api_status(&self) -> Response<Box<dyn std::io::Read + Send>> {
         let sources = self.staged_sources.lock().unwrap();
         let names: Vec<_> = sources.iter().map(|s| &s.name).collect();
+        let sync = self.read_sync_status();
         let json = serde_json::json!({
             "configured_sources": names,
             "count": sources.len(),
+            "sources": &*sources,
+            "sync": sync,
         });
         json_response(200, &json.to_string())
     }
 
-    fn api_finish(&self) -> Response<Box<dyn std::io::Read + Send>> {
+    /// Read `<photos_dir>/sync-status.json` if the scheduler has written one.
+    /// A missing or malformed file is reported as an empty object so the admin
+    /// UI keeps working before the first sync.
+    fn read_sync_status(&self) -> serde_json::Value {
+        let empty = serde_json::json!({});
+        let Some(path) = self.status_path.as_ref() else {
+            return empty;
+        };
+
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return empty,
+            Err(e) => {
+                log::warn!("Could not read sync status {}: {e}", path.display());
+                return empty;
+            }
+        };
+
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value @ serde_json::Value::Object(_)) => value,
+            Ok(_) => {
+                log::warn!(
+                    "Sync status {} is not a JSON object; ignoring it",
+                    path.display()
+                );
+                empty
+            }
+            Err(e) => {
+                log::warn!("Could not parse sync status {}: {e}", path.display());
+                empty
+            }
+        }
+    }
+
+    fn api_finish(&self, request: &Request) -> Response<Box<dyn std::io::Read + Send>> {
+        let html = wants_html(request);
+        let sources = self.staged_sources.lock().unwrap().clone();
+
+        if let Err(message) = validate_sources(&sources) {
+            return if html {
+                html_error(400, &message)
+            } else {
+                json_error(400, &message)
+            };
+        }
+
         self.finished.store(true, Ordering::Relaxed);
-        json_response(
-            200,
-            r#"{"ok":true,"message":"Config saved. Server shutting down."}"#,
-        )
+        if html {
+            serve_template(&FinishTemplate)
+        } else {
+            json_response(
+                200,
+                r#"{"ok":true,"message":"Config saved. Server shutting down."}"#,
+            )
+        }
     }
 
     fn handle_oauth_callback(&self, request: &Request) -> Response<Box<dyn std::io::Read + Send>> {
@@ -426,6 +489,76 @@ fn html_error(code: u16, message: &str) -> Response<Box<dyn std::io::Read + Send
             Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
         )
         .boxed()
+}
+
+fn json_error(code: u16, message: &str) -> Response<Box<dyn std::io::Read + Send>> {
+    let body = serde_json::json!({ "error": message }).to_string();
+    json_response(code, &body)
+}
+
+/// A non-empty, trimmed parameter value.
+fn param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    params
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+/// Validate the staged source list at "Finish" time.
+///
+/// An empty list is valid: it means the user removed every source. Sources of
+/// unknown types are accepted (other integrations may use the same schema),
+/// but Dropbox and Google Drive entries must be complete enough to sync.
+fn validate_sources(sources: &[RemoteSourceConfig]) -> Result<(), String> {
+    let mut names = HashSet::new();
+
+    for (index, source) in sources.iter().enumerate() {
+        let name = source.name.trim();
+        if name.is_empty() {
+            return Err(format!("Source {} has an empty name.", index + 1));
+        }
+        if !names.insert(name) {
+            return Err(format!("Source name \"{name}\" is used more than once."));
+        }
+        if source.check_interval_seconds == 0 {
+            return Err(format!(
+                "\"{name}\": check interval must be greater than 0 seconds."
+            ));
+        }
+
+        match source.source_type.as_str() {
+            "dropbox" => {
+                if param(&source.params, "access_token").is_none() {
+                    return Err(format!("\"{name}\": Dropbox access token is required."));
+                }
+            }
+            "google_drive" => {
+                if source.params.contains_key("oauth_pending") {
+                    return Err(format!(
+                        "\"{name}\": Google Drive authorization is not finished. \
+                         Use the OAuth setup page to authorize it first."
+                    ));
+                }
+                if param(&source.params, "folder_id").is_none() {
+                    return Err(format!("\"{name}\": Google Drive folder ID is required."));
+                }
+
+                let has_api_key = param(&source.params, "api_key").is_some();
+                let has_oauth = param(&source.params, "refresh_token").is_some()
+                    && param(&source.params, "client_id").is_some()
+                    && param(&source.params, "client_secret").is_some();
+                if !has_api_key && !has_oauth {
+                    return Err(format!(
+                        "\"{name}\": provide a Google Drive API key or a complete \
+                         refresh token, client ID, and client secret."
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn escape_html(input: &str) -> String {
@@ -552,11 +685,174 @@ fn find_free_port() -> io::Result<u16> {
 mod tests {
     use super::*;
 
+    fn source(
+        source_type: &str,
+        name: &str,
+        params: &[(&str, &str)],
+        interval: u64,
+    ) -> RemoteSourceConfig {
+        RemoteSourceConfig {
+            source_type: source_type.to_string(),
+            name: name.to_string(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            check_interval_seconds: interval,
+        }
+    }
+
     #[test]
     fn test_base64_encode() {
         assert_eq!(
             base64_encode("photo-frame:test"),
             "cGhvdG8tZnJhbWU6dGVzdA=="
         );
+    }
+
+    #[test]
+    fn test_validate_allows_empty_list() {
+        // Removing every source is a supported action.
+        assert!(validate_sources(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_dropbox_requires_access_token() {
+        let ok = source("dropbox", "DB", &[("access_token", "sl.x")], 3600);
+        assert!(validate_sources(&[ok]).is_ok());
+
+        let missing = source("dropbox", "DB", &[("folder", "/Photos")], 3600);
+        let err = validate_sources(&[missing]).unwrap_err();
+        assert!(err.contains("access token"), "got: {err}");
+
+        let blank = source("dropbox", "DB", &[("access_token", "   ")], 3600);
+        assert!(validate_sources(&[blank]).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_and_duplicate_names() {
+        let no_name = source("dropbox", "  ", &[("access_token", "sl.x")], 3600);
+        let err = validate_sources(&[no_name]).unwrap_err();
+        assert!(err.contains("empty name"), "got: {err}");
+
+        let first = source("dropbox", "Photos", &[("access_token", "sl.x")], 3600);
+        let second = source("dropbox", " Photos ", &[("access_token", "sl.y")], 3600);
+        let err = validate_sources(&[first, second]).unwrap_err();
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_interval() {
+        let source = source("dropbox", "DB", &[("access_token", "sl.x")], 0);
+        let err = validate_sources(&[source]).unwrap_err();
+        assert!(err.contains("check interval"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_google_drive() {
+        let missing_folder = source("google_drive", "GD", &[("api_key", "AIza")], 3600);
+        let err = validate_sources(&[missing_folder]).unwrap_err();
+        assert!(err.contains("folder ID"), "got: {err}");
+
+        let no_auth = source("google_drive", "GD", &[("folder_id", "f1")], 3600);
+        let err = validate_sources(&[no_auth]).unwrap_err();
+        assert!(err.contains("API key"), "got: {err}");
+
+        let api_key = source(
+            "google_drive",
+            "GD",
+            &[("folder_id", "f1"), ("api_key", "AIza")],
+            3600,
+        );
+        assert!(validate_sources(&[api_key]).is_ok());
+
+        let oauth = source(
+            "google_drive",
+            "GD",
+            &[
+                ("folder_id", "f1"),
+                ("refresh_token", "1//token"),
+                ("client_id", "id"),
+                ("client_secret", "secret"),
+            ],
+            3600,
+        );
+        assert!(validate_sources(&[oauth]).is_ok());
+
+        let incomplete_oauth = source(
+            "google_drive",
+            "GD",
+            &[
+                ("folder_id", "f1"),
+                ("refresh_token", "1//token"),
+                ("client_id", "id"),
+            ],
+            3600,
+        );
+        let err = validate_sources(&[incomplete_oauth]).unwrap_err();
+        assert!(err.contains("refresh token"), "got: {err}");
+
+        let pending = source(
+            "google_drive",
+            "GD",
+            &[("folder_id", "f1"), ("oauth_pending", "1")],
+            3600,
+        );
+        let err = validate_sources(&[pending]).unwrap_err();
+        assert!(err.contains("not finished"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_accepts_unknown_source_types() {
+        let other = source("immich", "Immich", &[("url", "https://example.test")], 3600);
+        assert!(validate_sources(&[other]).is_ok());
+    }
+
+    #[test]
+    fn test_read_sync_status_missing_or_malformed_is_empty() {
+        let server = AdminServer {
+            port: 0,
+            password: String::new(),
+            staged_sources: Arc::new(Mutex::new(Vec::new())),
+            finished: Arc::new(AtomicBool::new(false)),
+            last_request: Arc::new(Mutex::new(Instant::now())),
+            status_path: Some(PathBuf::from("/nonexistent/sync-status.json")),
+        };
+        assert_eq!(server.read_sync_status(), serde_json::json!({}));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SYNC_STATUS_FILE);
+        std::fs::write(&path, "not json").unwrap();
+        let server = AdminServer {
+            status_path: Some(path.clone()),
+            ..server
+        };
+        assert_eq!(server.read_sync_status(), serde_json::json!({}));
+
+        std::fs::write(&path, "[1,2,3]").unwrap();
+        assert_eq!(server.read_sync_status(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_read_sync_status_passes_through_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SYNC_STATUS_FILE);
+        std::fs::write(
+            &path,
+            r#"{"sources":{"My Dropbox":{"last_sync":123,"state":"ok"}}}"#,
+        )
+        .unwrap();
+
+        let server = AdminServer {
+            port: 0,
+            password: String::new(),
+            staged_sources: Arc::new(Mutex::new(Vec::new())),
+            finished: Arc::new(AtomicBool::new(false)),
+            last_request: Arc::new(Mutex::new(Instant::now())),
+            status_path: Some(path),
+        };
+        let status = server.read_sync_status();
+        assert_eq!(status["sources"]["My Dropbox"]["last_sync"], 123);
+        assert_eq!(status["sources"]["My Dropbox"]["state"], "ok");
     }
 }

@@ -72,7 +72,14 @@ impl ControlClient {
         self.connect()?;
         let msg = format!("{cmd}\n");
         let stream = self.stream.as_mut().unwrap();
-        stream.write_all(msg.as_bytes())
+        let result = stream.write_all(msg.as_bytes());
+        if result.is_err() {
+            // Drop the dead connection so the next command reconnects instead
+            // of writing to a stale socket forever (e.g. after the display app
+            // restarted).
+            self.stream = None;
+        }
+        result
     }
 
     /// Clear the render queue and pause the slideshow.
