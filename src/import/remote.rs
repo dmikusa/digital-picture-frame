@@ -74,7 +74,10 @@ pub fn run_sync_scheduler(
     // second. The cursor file still only records successful syncs.
     let mut last_attempts: HashMap<String, u64> = HashMap::new();
     let mut reloader = ConfigReloader::new(config_path);
-    let mut status = SyncStatus::default();
+    // Reload the published status so `last_sync` survives a restart. Opaque
+    // provider cursors (`dbx:`, `gdrive:`) carry no timestamp, so the status
+    // file is the only record of when those sources last synced.
+    let mut status = SyncStatus::load(&status_path(&config));
     status.retain_configured(&config);
     status.refresh_last_sync(&cursors);
     status.save(&status_path(&config));
@@ -125,7 +128,7 @@ pub fn run_sync_scheduler(
             .collect();
 
         for source in &sources {
-            let last_sync = cursors.get(&source.name).and_then(|c| parse_cursor_time(c));
+            let last_sync = source_last_sync(&source.name, &cursors, &status);
             let last_attempt = last_attempts.get(&source.name).copied();
 
             if !is_due(last_sync, last_attempt, source.interval_secs, unix_now()) {
@@ -153,6 +156,13 @@ pub fn run_sync_scheduler(
             // Publish the result for the admin UI after every attempt.
             status.record_attempt(&source.name, attempt_at, error.as_deref());
             status.refresh_last_sync(&cursors);
+            if result.is_ok() {
+                // Record the completion time so opaque provider cursors still
+                // report a last sync and do not look never-synced after a
+                // restart. `refresh_last_sync` above only understands numeric
+                // cursors.
+                status.record_success(&source.name, unix_now());
+            }
             status.save(&status_path(&config));
         }
 
@@ -161,7 +171,7 @@ pub fn run_sync_scheduler(
         let next_wake = sources
             .iter()
             .map(|s| {
-                let last_sync = cursors.get(&s.name).and_then(|c| parse_cursor_time(c));
+                let last_sync = source_last_sync(&s.name, &cursors, &status);
                 let last_attempt = last_attempts.get(&s.name).copied();
                 seconds_until_due(last_sync, last_attempt, s.interval_secs, now)
             })
@@ -260,6 +270,23 @@ fn last_touch(last_sync_unix: Option<u64>, last_attempt_unix: Option<u64>) -> Op
         (None, Some(attempt)) => Some(attempt),
         (None, None) => None,
     }
+}
+
+/// The last successful sync time for a source, in Unix seconds.
+///
+/// A numeric cursor encodes the time directly, so it is preferred. Opaque
+/// provider cursors (`dbx:`, `gdrive:`) do not, so fall back to the time
+/// recorded in `sync-status.json`, which is what keeps a source from looking
+/// never-synced after a restart.
+fn source_last_sync(
+    name: &str,
+    cursors: &HashMap<String, String>,
+    status: &SyncStatus,
+) -> Option<u64> {
+    cursors
+        .get(name)
+        .and_then(|cursor| parse_cursor_time(cursor))
+        .or_else(|| status.sources.get(name).and_then(|entry| entry.last_sync))
 }
 
 /// A source is due when it has never synced, or when a full interval has
@@ -513,7 +540,8 @@ pub enum SyncState {
 /// Per-source status published to `<photos_dir>/sync-status.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceStatus {
-    /// Unix seconds of the last successful cursor timestamp, or null.
+    /// Unix seconds of the last successful sync, or null. For opaque provider
+    /// cursors this is the completion time recorded by the scheduler.
     pub last_sync: Option<u64>,
     /// Unix seconds of the last attempt, or null if never attempted.
     pub last_attempt: Option<u64>,
@@ -532,6 +560,15 @@ fn status_path(config: &Config) -> PathBuf {
 }
 
 impl SyncStatus {
+    /// Load a previously saved status document. A missing or malformed file
+    /// degrades to an empty status so it never blocks startup.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+            Err(_) => SyncStatus::default(),
+        }
+    }
+
     /// Keep only sources that are currently configured, adding an empty entry
     /// for each new one so the admin UI sees it before its first attempt.
     pub fn retain_configured(&mut self, config: &Config) {
@@ -573,6 +610,15 @@ impl SyncStatus {
                 status.error = None;
             }
         }
+    }
+
+    /// Record a successful sync completion time.
+    ///
+    /// Unlike [`Self::refresh_last_sync`], this does not depend on the cursor
+    /// format, so it also works for opaque provider cursors.
+    pub fn record_success(&mut self, name: &str, synced_at: u64) {
+        let status = self.sources.entry(name.to_string()).or_default();
+        status.last_sync = Some(synced_at);
     }
 
     /// Write the file atomically (temp file + rename) so the admin server never
@@ -944,6 +990,86 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         assert_eq!(status_path(&config), dir.path().join("sync-status.json"));
+    }
+
+    #[test]
+    fn test_record_success_sets_last_sync() {
+        let mut status = SyncStatus::default();
+        status.record_success("Dropbox", 1_700_000_000);
+
+        assert_eq!(status.sources["Dropbox"].last_sync, Some(1_700_000_000));
+        // A later success replaces the earlier time.
+        status.record_success("Dropbox", 1_700_000_500);
+        assert_eq!(status.sources["Dropbox"].last_sync, Some(1_700_000_500));
+        // Attempt fields are untouched.
+        assert_eq!(status.sources["Dropbox"].last_attempt, None);
+        assert_eq!(status.sources["Dropbox"].state, SyncState::Ok);
+    }
+
+    #[test]
+    fn test_load_preserves_last_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-status.json");
+
+        let mut status = SyncStatus::default();
+        status.record_success("Dropbox", 1_700_000_000);
+        status.record_attempt("Dropbox", 1_700_000_100, None);
+        status.save(&path);
+
+        let loaded = SyncStatus::load(&path);
+        assert_eq!(loaded.sources["Dropbox"].last_sync, Some(1_700_000_000));
+        assert_eq!(loaded.sources["Dropbox"].last_attempt, Some(1_700_000_100));
+
+        // Missing and malformed files degrade to an empty status.
+        assert!(SyncStatus::load(&dir.path().join("missing.json"))
+            .sources
+            .is_empty());
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(SyncStatus::load(&path).sources.is_empty());
+    }
+
+    #[test]
+    fn test_opaque_cursor_uses_status_last_sync_for_scheduling() {
+        let cursors: HashMap<String, String> =
+            [("Dropbox".to_string(), "dbx:opaque-cursor".to_string())]
+                .into_iter()
+                .collect();
+        let mut status = SyncStatus::default();
+        status.record_success("Dropbox", 1_000);
+
+        // The opaque cursor carries no timestamp, so the status supplies it.
+        let last_sync = source_last_sync("Dropbox", &cursors, &status);
+        assert_eq!(last_sync, Some(1_000));
+
+        // A fresh status time means the source is not due yet.
+        assert!(!is_due(last_sync, None, 3_600, 1_500));
+        assert!(is_due(last_sync, None, 3_600, 4_600));
+
+        // Without a recorded success it looks never-synced and is due.
+        let empty = SyncStatus::default();
+        let none = source_last_sync("Dropbox", &cursors, &empty);
+        assert_eq!(none, None);
+        assert!(is_due(none, None, 3_600, 1_500));
+    }
+
+    #[test]
+    fn test_numeric_cursor_takes_precedence_over_status_last_sync() {
+        let cursors: HashMap<String, String> = [("Drive".to_string(), "1704240000".to_string())]
+            .into_iter()
+            .collect();
+        let mut status = SyncStatus::default();
+        status.record_success("Drive", 999);
+
+        // A numeric cursor is the timestamp and wins over the status time.
+        assert_eq!(
+            source_last_sync("Drive", &cursors, &status),
+            Some(1_704_240_000)
+        );
+        // With no cursor entry the status time is the fallback.
+        assert_eq!(
+            source_last_sync("Drive", &HashMap::new(), &status),
+            Some(999)
+        );
     }
 
     fn photo(name: &str) -> RemotePhoto {
