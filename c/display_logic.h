@@ -40,6 +40,10 @@ float image_aspect_ratio(int width, int height);
 /* Returns: 0 = slot 0, 1 = slot 1, 2 = pending, 3 = drop */
 int select_image_destination(int slot0_occupied, int slot1_occupied, int has_pending);
 
+/* 1 when losing the control connection should resume the slideshow.
+ * Intentional shutdown (running == 0) never auto-resumes. */
+int control_loss_should_resume(int running, int paused, int show_image, int show_held);
+
 /* Protocol parser callback. Returns 1 if accepted, 0 if rejected (backpressure). */
 typedef int (*protocol_cmd_handler)(const char *path, void *ctx);
 

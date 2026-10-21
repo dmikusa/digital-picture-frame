@@ -224,6 +224,9 @@ idle timeout) and on shutdown.
 - The C app creates a second Unix socket (`control_socket_path`) for
   `CLR\n`, `SHOW <path>\n`, and `RESUME\n`. Config mode uses it to pause the
   slideshow and hold a setup or status image.
+- If the control connection drops while the slideshow is paused or a `SHOW`
+  image is held, the display app resumes the slideshow automatically, so a
+  crashed or restarted manager cannot leave a stale QR/status screen up.
 - The QR encodes `http://photo-frame:<password>@<ip>:<port>` so a phone can open
   the UI and authenticate in one scan. The screen also prints the plain
   `http://<ip>:<port>` URL, the password, and an optional

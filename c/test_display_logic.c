@@ -129,6 +129,25 @@ static int test_select_image_destination(void)
     return 0;
 }
 
+static int test_control_loss_should_resume(void)
+{
+    /* Intentional shutdown never resumes */
+    TEST_ASSERT(control_loss_should_resume(0, 0, 0, 0) == 0);
+    TEST_ASSERT(control_loss_should_resume(0, 1, 1, 1) == 0);
+
+    /* Nothing held, nothing to do */
+    TEST_ASSERT(control_loss_should_resume(1, 0, 0, 0) == 0);
+
+    /* Any of the hold states triggers a resume */
+    TEST_ASSERT(control_loss_should_resume(1, 1, 0, 0) == 1);
+    TEST_ASSERT(control_loss_should_resume(1, 0, 1, 0) == 1);
+    TEST_ASSERT(control_loss_should_resume(1, 0, 0, 1) == 1);
+    TEST_ASSERT(control_loss_should_resume(1, 1, 1, 1) == 1);
+
+    printf("PASS: control_loss_should_resume\n");
+    return 0;
+}
+
 struct parse_test_ctx {
     int cmd_count;
     char paths[4][256];
@@ -210,6 +229,7 @@ int main(void)
     failures += test_image_aspect_ratio();
     failures += test_read_display_config();
     failures += test_select_image_destination();
+    failures += test_control_loss_should_resume();
     failures += test_parse_protocol_buffer();
     if (failures == 0) {
         printf("\nAll tests passed.\n");
