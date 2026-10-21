@@ -10,11 +10,11 @@ Photo display reads a CSV list of photos and sends paths to the C app over a Uni
 
 USB import watches `/media` for USB drives. When you plug one in, it scans for JPEGs and HEICs, checks if you already have them (using a quick hash), converts them to your screen's resolution, and copies them into a `YYYY/MM/DD` folder tree.
 
-Remote sync pulls photos from Dropbox or Google Drive on a schedule. It pages through the remote folder, downloads new files into a temporary directory on the photo partition, and runs them through the same dedup and conversion pipeline as a USB import. It keeps a timestamp cursor so each run only looks at new photos, and it reports per-source status to the admin UI.
+Remote sync pulls photos from Dropbox or Google Drive on a schedule. It pages through the remote folder, downloads new files into a temporary directory on the photo partition, and runs them through the same dedup and conversion pipeline as a USB import. Dropbox uses its own opaque cursor and bearer-auth Google Drive sources use the Changes API, so each run only looks at what changed; API-key Drive sources and legacy cursors fall back to a timestamp. It reports per-source status to the admin UI.
 
 Config mode is the setup UI. When the frame has no photos and no remote sources, or after you insert a USB drive, it shows a QR code on screen and starts a small web server. Scan the code with a phone to add or edit remote sources. Changes are staged in memory and written to `config.toml` only when you press **Finish**.
 
-Storage cleanup kicks in automatically if the photo partition fills up. It deletes the oldest batch of photos to make room.
+Storage cleanup kicks in automatically if the photo partition fills up. It deletes the oldest batch of photos to make room, whether the write that ran out of space was a USB import or a remote download.
 
 ## Private Google Drive
 
@@ -143,7 +143,7 @@ flowchart TB
 
 3. The USB watcher thread watches `/media` for new directories, and also rescans every couple of seconds so drives mounted before startup or by hand are not missed. When a drive mounts, it spawns a thread to handle the import. That thread recursively scans for images, hashes the first 32KB plus file size, checks against the shared dedup set, runs ImageMagick to resize, copies the result into `photos_dir/YYYY/MM/DD/`, and appends a line to the CSV. If the disk is full, it triggers rotation (deletes oldest photos) and retries. A process-wide import lock keeps USB and remote imports from stepping on the index.
 
-4. The remote sync thread wakes on each source's `check_interval_seconds`, reloads `config.toml` when it changes, and lists new photos. Dropbox follows `has_more`; Google Drive follows `nextPageToken`. Downloads stream into `photos_dir/.sync-tmp/` and then go through the normal import pipeline. Transient HTTP errors are retried with backoff. If a download fails, the cursor stays put so the batch is retried instead of skipped. Cursors live in `sync-cursors.json`, and status goes to `sync-status.json`.
+4. The remote sync thread wakes on each source's `check_interval_seconds`, reloads `config.toml` when it changes, and lists new photos. Dropbox uses its opaque `files/list_folder` cursor (`dbx:`) and authenticates with either a static access token or a refresh-token set (`refresh_token` + `app_key` + `app_secret`); bearer-auth Google Drive sources use the Changes API (`gdrive:`). API-key Drive sources and legacy cursors keep a timestamp. Downloads stream into `photos_dir/.sync-tmp/` and then go through the normal import pipeline. A download that hits `ENOSPC` rotates the oldest photos and retries. Transient HTTP errors are retried with backoff. If a download fails, the cursor stays put so the batch is retried instead of skipped. Cursors live in `sync-cursors.json`, and status goes to `sync-status.json`; `last_sync` records the last successful sync, is reloaded at startup, and schedules sources whose cursor is opaque.
 
 5. The config mode thread decides what the screen should show: slideshow, "Importing photos...", "First remote sync in progress", or the setup QR. In setup it starts the admin server, renders the QR and status screens, and sends `CLR`/`SHOW`/`RESUME` over the control socket. It stages changes in memory, validates them on **Finish**, and atomically rewrites `config.toml`. Removing the USB drive or hitting the 10-minute idle timeout discards the session without writing anything.
 
@@ -152,7 +152,7 @@ Some design choices that might matter:
 - Everything is synchronous. We use `std::thread` for concurrency and plain blocking I/O. This keeps dependencies small and avoids pulling in tokio.
 - The display app doesn't respond to protocol messages. Backpressure is just the kernel socket buffer. When it's full, the Rust side blocks. That is the whole mechanism.
 - Deleted entries stay in the CSV file as ghosts. The filename tracks the valid range (`index-<start>-<count>.csv`). When ghosts exceed 50%, the file gets rewritten.
-- Remote cursors are Unix timestamps, so a file changed in the same second as the last cursor may wait for a later change.
+- Remote cursors are opaque provider cursors: `dbx:` for Dropbox and `gdrive:` for bearer-auth Google Drive. API-key Drive sources and legacy cursors keep a Unix timestamp, with a 2-second overlap so a file changed in the same second as the last cursor is not missed.
 - Config mode is plain HTTP with a rotating 8-character password and HTTP Basic Auth. There are no unauthenticated admin routes. HTTPS is future work.
 - Logs go to `/tmp` (tmpfs), so there is no SD card wear from logging. The photo partition uses `noatime,lazytime`.
 
