@@ -151,6 +151,7 @@ struct app_state {
     size_t               control_len;
     int                  paused;
     int                  show_image;
+    int                  show_held;      /* a SHOW image is on screen */
     char                 show_path[512];
 
     /* Fade state */
@@ -375,6 +376,59 @@ static int handle_img_cmd_wrapper(const char *path, void *ctx)
     return !(g.slots[0].occupied && g.slots[1].occupied && g.pending_pixels);
 }
 
+/* Advance declarations: the control-loss path resumes the display socket,
+ * which is defined with the rest of the socket handling below. */
+static void handle_socket_data(void);
+static void resume_display_socket(const char *reason);
+
+/* Re-add the display socket to epoll after it was paused for backpressure.
+ * Needed when a control-mode hold ends: CLR frees the slots, but no fade will
+ * complete to trigger the usual resume. */
+static void resume_display_socket(const char *reason)
+{
+    if (!g.socket_paused || g.conn_fd < 0) return;
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = g.conn_fd;
+    int ret = epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.conn_fd, &ev);
+    if (ret < 0 && errno != EEXIST) {
+        log_msg(LOG_ERROR, "epoll_ctl ADD (resume: %s) failed: %s",
+                reason, strerror(errno));
+        return;
+    }
+    g.socket_paused = 0;
+    log_msg(LOG_INFO, "Display socket resumed (%s)", reason);
+    handle_socket_data();
+}
+
+/* Drop a control-mode hold when the control connection goes away. The manager
+ * may have crashed or restarted, so never leave the frame paused on a stale
+ * QR/status image. Intentional shutdown does not auto-resume. */
+static void auto_resume_control_hold(const char *reason)
+{
+    if (!control_loss_should_resume(g.running, g.paused, g.show_image, g.show_held))
+        return;
+
+    log_msg(LOG_WARN,
+            "Control connection lost while %s; auto-resuming slideshow (%s)",
+            g.show_held ? "holding a SHOW image" :
+            (g.paused ? "paused" : "a SHOW command was pending"), reason);
+
+    g.paused = 0;
+    g.show_image = 0;
+    if (g.show_held) {
+        g.show_held = 0;
+        /* Forget the held QR/status texture so the next photos refill the slot
+         * instead of replaying the stale image. The buffer on screen is owned
+         * by scanout_fb and is untouched. */
+        if (g.phase == PHASE_WAITING) {
+            g.slots[0].occupied = 0;
+        }
+    }
+    resume_display_socket("control connection lost");
+}
+
 /* Close the control connection and drop any partial command. epoll removes
  * closed descriptors automatically, but callers that replace a live connection
  * delete it explicitly first. */
@@ -387,6 +441,7 @@ static void close_control_conn(const char *reason)
     g.control_conn_fd = -1;
     g.control_len = 0;
     g.control_buf[0] = '\0';
+    auto_resume_control_hold(reason);
 }
 
 static void handle_control_data(void)
@@ -432,6 +487,7 @@ static void handle_control_data(void)
             log_msg(LOG_INFO, "Control command: CLR (clear queue, pause)");
             g.paused = 1;
             g.show_image = 0;
+            g.show_held = 0;
             if (g.slots[0].occupied) { g.slots[0].occupied = 0; }
             if (g.slots[1].occupied) { g.slots[1].occupied = 0; }
             if (g.pending_pixels) {
@@ -456,6 +512,10 @@ static void handle_control_data(void)
             log_msg(LOG_INFO, "Control command: RESUME");
             g.paused = 0;
             g.show_image = 0;
+            g.show_held = 0;
+            /* CLR freed the slots while the socket was paused; re-add it so
+             * queued IMG commands can refill them. */
+            resume_display_socket("RESUME");
         } else {
             log_msg(LOG_WARN, "Unknown control command: '%s'", cmd);
         }
@@ -674,20 +734,7 @@ static void advance_fade(void)
         }
 
         /* Resume socket reads if we had backpressure */
-        if (g.socket_paused && g.conn_fd >= 0) {
-            g.socket_paused = 0;
-            struct epoll_event ev;
-            ev.events = EPOLLIN;
-            ev.data.fd = g.conn_fd;
-            int ret = epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.conn_fd, &ev);
-            if (ret < 0 && errno != EEXIST) {
-                log_msg(LOG_ERROR, "epoll_ctl ADD (resume) failed: %s", strerror(errno));
-                fprintf(stderr, "epoll_ctl ADD (resume): %s\n", strerror(errno));
-            } else {
-                log_msg(LOG_INFO, "Display socket resumed");
-                handle_socket_data();
-            }
-        }
+        resume_display_socket("fade complete");
 
         g.fading = 0;
         g.phase  = PHASE_HOLDING;
@@ -826,6 +873,7 @@ static int handle_show_command(drmModeConnector *conn, drmModeModeInfo *mode)
     }
     g.scanout_fb.bo    = new_bo;
     g.scanout_fb.fb_id = new_fb;
+    g.show_held = 1;
 
     log_msg(LOG_INFO, "SHOW displayed: %s (fb=%u)", g.show_path, new_fb);
     return 0;
@@ -1214,6 +1262,14 @@ int main(void)
             }
         }
 
+        /* A flip that completed outside the fade path (for example after CLR
+         * aborted a fade) still owns its pending buffer. Promote it so scanout
+         * stays accurate and the pending framebuffer is not leaked. */
+        if (g.phase != PHASE_FADING && g.flip_done) {
+            g.flip_done = 0;
+            promote_pending_fb();
+        }
+
         /* Check hold deadline */
         if (g.phase == PHASE_HOLDING && !g.hold_complete) {
             struct timespec now;
@@ -1227,6 +1283,16 @@ int main(void)
 
         /* Waiting for initial images */
         if (g.phase == PHASE_WAITING) {
+            if (g.slots[0].occupied && g.slots[1].occupied && g.flip_pending) {
+                /* A flip left over from an aborted fade is still in flight.
+                 * drmModeSetCrtc would return EBUSY, so drain it first. */
+                if (wait_for_pending_flip(FLIP_WAIT_TIMEOUT_MS) < 0) {
+                    log_msg(LOG_WARN, "Deferring first frame: page flip still pending");
+                    continue;
+                }
+                g.flip_done = 0;
+                promote_pending_fb();
+            }
             if (g.slots[0].occupied && g.slots[1].occupied) {
                 log_msg(LOG_INFO, "Both slots filled, starting display");
                 g.current_slot = 0;
@@ -1301,6 +1367,10 @@ int main(void)
     } else {
         log_msg(LOG_INFO, "Display loop exited, shutting down");
     }
+
+    /* Prevent control-connection teardown below from auto-resuming into GL
+     * code that has already been destroyed. */
+    g.running = 0;
 
     if (g.pending_pixels) stbi_image_free(g.pending_pixels);
     if (g.pending_fb.bo) {

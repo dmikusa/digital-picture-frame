@@ -38,6 +38,14 @@ const CONFIG_MODE_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// or shown. Retrying never stops the admin server, so login stays possible.
 const SCREEN_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// How long to wait before retrying a `RESUME` that the display app did not
+/// accept (usually because it closed the control socket).
+const RESUME_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Log a failing `RESUME` at roughly every 30 seconds, not every 2 seconds, so
+/// a long display outage cannot fill the tmpfs log.
+const RESUME_LOG_EVERY: u32 = 15;
+
 /// Fallback credentials file, written for as long as config mode is active.
 ///
 /// The password only exists on the QR screen otherwise, so a display app that
@@ -241,6 +249,17 @@ struct PendingScreen {
     retry_at: Instant,
 }
 
+/// A `RESUME` that the display app has not accepted yet.
+///
+/// The display app can close its control socket (restart, crash, or a broken
+/// pipe on write), leaving the QR or status screen on the panel. Keep retrying
+/// until the command lands instead of warning once and giving up.
+struct PendingResume {
+    retry_at: Instant,
+    /// Failed attempts so far, used only for log throttling.
+    attempts: u32,
+}
+
 /// Owns the config-mode state machine.  Communicates with the USB-watcher via
 /// the shared `MountEvent` channel.
 pub struct ConfigEnvironment {
@@ -256,6 +275,7 @@ pub struct ConfigEnvironment {
     server_handle: Option<JoinHandle<()>>,
     server_shutdown: Arc<AtomicBool>,
     pending_screen: Option<PendingScreen>,
+    resume_pending: Option<PendingResume>,
 }
 
 impl ConfigEnvironment {
@@ -275,6 +295,7 @@ impl ConfigEnvironment {
             server_handle: None,
             server_shutdown: Arc::new(AtomicBool::new(false)),
             pending_screen: None,
+            resume_pending: None,
         }
     }
 
@@ -309,6 +330,10 @@ impl ConfigEnvironment {
             }
         }));
         self.server = Some(server);
+
+        // A new session is about to pause the display again, so a queued
+        // RESUME from an earlier session is obsolete.
+        self.resume_pending = None;
 
         // Write the fallback before touching the display app. The password only
         // exists on screen otherwise, so this file is the safety net when the
@@ -516,15 +541,62 @@ impl ConfigEnvironment {
         Ok(())
     }
 
-    /// Best-effort `RESUME`; a missing display app must not stop the loop.
-    fn resume_slideshow(&mut self) {
-        if let Err(e) = self.control.resume() {
-            log::warn!("Could not resume slideshow: {e}");
+    /// Send `RESUME` and report whether the display app accepted it.
+    ///
+    /// A failure queues a retry instead of only warning, because a dead control
+    /// socket would otherwise leave the QR or status screen up forever.
+    fn resume_slideshow(&mut self) -> bool {
+        match self.control.resume() {
+            Ok(()) => {
+                if let Some(pending) = self.resume_pending.take() {
+                    log::info!(
+                        "Slideshow resumed after {} failed attempt(s)",
+                        pending.attempts
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                let attempts = self
+                    .resume_pending
+                    .as_ref()
+                    .map_or(1, |pending| pending.attempts + 1);
+                if attempts == 1 || attempts.is_multiple_of(RESUME_LOG_EVERY) {
+                    log::warn!(
+                        "Could not resume slideshow ({e}); retrying every {RESUME_RETRY_DELAY:?}"
+                    );
+                }
+                self.resume_pending = Some(PendingResume {
+                    retry_at: Instant::now() + RESUME_RETRY_DELAY,
+                    attempts,
+                });
+                false
+            }
         }
+    }
+
+    /// Retry a queued `RESUME` when it is due.
+    ///
+    /// Only runs in `Normal`: in every other state the display is intentionally
+    /// showing a setup or status screen, so resuming would fight it.
+    fn retry_resume(&mut self) {
+        if !matches!(self.state, ConfigState::Normal) {
+            return;
+        }
+        let Some(pending) = self.resume_pending.as_ref() else {
+            return;
+        };
+        if Instant::now() < pending.retry_at {
+            return;
+        }
+        self.resume_slideshow();
     }
 
     /// Draw a simple status screen (importing, waiting for first sync, ...).
     fn show_status_screen(&mut self, title: &str, lines: &[&str]) {
+        // This screen pauses the slideshow, so any queued RESUME is obsolete.
+        self.resume_pending = None;
+
         match qr::render_status_screen(&self.config, title, lines) {
             Ok(path) => {
                 if let Err(e) = self.control.clear().and_then(|()| self.control.show(&path)) {
@@ -684,6 +756,17 @@ pub fn run_config_mode_loop(
             } else {
                 env.stop_server();
             }
+
+            // Leaving config mode may have queued a RESUME. Try once more before
+            // exiting so the panel is not left holding the QR/status image.
+            if env.resume_pending.is_some() {
+                log::info!("Making a final RESUME attempt before shutdown");
+                if !env.resume_slideshow() {
+                    log::warn!(
+                        "Slideshow may still be paused; it will recover when the display app restarts"
+                    );
+                }
+            }
             break;
         }
 
@@ -706,6 +789,9 @@ pub fn run_config_mode_loop(
         // Retry a setup screen that could not be shown earlier. This never
         // stops the admin server, so the fallback file keeps working.
         env.retry_setup_screen();
+
+        // Retry a RESUME the display app never accepted.
+        env.retry_resume();
 
         // Retry config-mode entry after a transient display-app failure.
         if let ConfigState::PendingConfigMode { retry_at } = env.state {
@@ -1047,6 +1133,10 @@ mod tests {
         assert!(env.server.is_none());
         assert!(env.pending_screen.is_none());
         assert_eq!(env.state, ConfigState::Normal);
+        assert!(
+            env.resume_pending.is_some(),
+            "the failed RESUME should be queued for retry"
+        );
     }
 
     #[test]
@@ -1097,5 +1187,93 @@ mod tests {
         );
 
         env.stop_server();
+    }
+
+    #[test]
+    fn failed_resume_queues_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = test_env(dir.path(), sample_config(dir.path().to_path_buf()));
+        assert_eq!(env.state, ConfigState::Normal);
+
+        assert!(!env.resume_slideshow(), "RESUME must fail without a socket");
+
+        let pending = env
+            .resume_pending
+            .as_ref()
+            .expect("a failed RESUME should be queued");
+        assert_eq!(pending.attempts, 1);
+        assert!(
+            pending.retry_at > Instant::now(),
+            "the retry should be delayed, not immediate"
+        );
+
+        // Not due yet: calling the loop helper must not send another RESUME.
+        env.retry_resume();
+        assert_eq!(env.resume_pending.as_ref().unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn resume_retry_clears_when_the_display_app_returns() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = test_env(dir.path(), sample_config(dir.path().to_path_buf()));
+        let socket_path = dir.path().join("missing-control.sock");
+
+        // Start with no display app: RESUME fails and is queued.
+        assert!(!env.resume_slideshow());
+        assert!(env.resume_pending.is_some());
+
+        // The display app comes back and binds its control socket.
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 32];
+            let n = stream.read(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        env.resume_pending.as_mut().unwrap().retry_at = Instant::now();
+        env.retry_resume();
+
+        assert!(
+            env.resume_pending.is_none(),
+            "a successful RESUME clears the retry"
+        );
+        assert_eq!(handle.join().unwrap(), "RESUME\n");
+    }
+
+    #[test]
+    fn entering_config_mode_clears_a_pending_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = test_env(dir.path(), sample_config(dir.path().to_path_buf()));
+
+        assert!(!env.resume_slideshow());
+        assert!(env.resume_pending.is_some());
+
+        env.enter_config_mode("127.0.0.1").unwrap();
+
+        assert!(
+            env.resume_pending.is_none(),
+            "config mode pauses the display again"
+        );
+        env.stop_server();
+    }
+
+    #[test]
+    fn status_screen_cancels_a_pending_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = test_env(dir.path(), sample_config(dir.path().to_path_buf()));
+
+        assert!(!env.resume_slideshow());
+        assert!(env.resume_pending.is_some());
+
+        env.show_status_screen("Importing photos...", &["Please wait."]);
+
+        assert!(
+            env.resume_pending.is_none(),
+            "showing a status screen pauses the slideshow"
+        );
     }
 }

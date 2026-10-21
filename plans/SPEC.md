@@ -193,6 +193,15 @@ Transitions:
 Every transition that stops the admin server also removes
 `/tmp/photo-frame-setup.txt`.
 
+A `RESUME` the display app does not accept (for example because it closed the
+control socket) is queued and retried every 2 seconds while the state is
+`Normal`, until it succeeds or the manager shuts down. The first failure is
+logged as a warning, then roughly every 30 seconds; a successful retry logs the
+number of failed attempts. Entering config mode, or showing a status screen,
+clears the queue because the display is being paused again. On shutdown, a
+pending `RESUME` gets one final best-effort attempt; worker threads are not
+joined, so process exit can cut that attempt short.
+
 Config-mode screens are rendered as JPEGs with `fontdue` text and a `qrcode`
 code at the configured native resolution, written to
 `/tmp/photo-frame-qr.jpg` or `/tmp/photo-frame-status.jpg`, and shown with
@@ -215,6 +224,9 @@ idle timeout) and on shutdown.
 - The C app creates a second Unix socket (`control_socket_path`) for
   `CLR\n`, `SHOW <path>\n`, and `RESUME\n`. Config mode uses it to pause the
   slideshow and hold a setup or status image.
+- If the control connection drops while the slideshow is paused or a `SHOW`
+  image is held, the display app resumes the slideshow automatically, so a
+  crashed or restarted manager cannot leave a stale QR/status screen up.
 - The QR encodes `http://photo-frame:<password>@<ip>:<port>` so a phone can open
   the UI and authenticate in one scan. The screen also prints the plain
   `http://<ip>:<port>` URL, the password, and an optional

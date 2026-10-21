@@ -76,6 +76,12 @@ int select_image_destination(int slot0_occupied, int slot1_occupied, int has_pen
     return 3;
 }
 
+int control_loss_should_resume(int running, int paused, int show_image, int show_held)
+{
+    if (!running) return 0;
+    return paused || show_image || show_held;
+}
+
 size_t parse_protocol_buffer(const char *data, size_t len,
     protocol_cmd_handler handler, void *ctx,
     int *paused)
