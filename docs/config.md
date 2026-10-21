@@ -73,10 +73,23 @@ a cloud folder into the same import pipeline as USB drives.
 
 ```toml
 # Public Dropbox folder (or any folder the token can read).
+# Use either a static access_token or the refresh-token triple shown below,
+# never both.
 [[remote_sources]]
 type = "dropbox"
 name = "Family Dropbox"
 access_token = "sl.xxxx"
+folder = "/Photos"
+check_interval_seconds = 86400
+
+# Dropbox with a refresh token. Dropbox access tokens expire after a few hours;
+# these three fields let the manager mint a fresh one on demand.
+[[remote_sources]]
+type = "dropbox"
+name = "Family Dropbox (refresh)"
+refresh_token = "xxxx"
+app_key = "xxxx"
+app_secret = "xxxx"
 folder = "/Photos"
 check_interval_seconds = 86400
 
@@ -104,12 +117,17 @@ check_interval_seconds = 86400
 | `type` | Yes | `"dropbox"`, `"google_drive"`, or another supported integration |
 | `name` | Yes | Unique, non-empty label used in the UI and cursor file |
 | `check_interval_seconds` | No | Seconds between sync checks. Default `86400`; must be greater than 0 |
-| `access_token` | Dropbox | Dropbox API access token |
+| `access_token` | Dropbox | Static Dropbox API access token. Use this **or** the refresh-token triple, not both |
+| `refresh_token`, `app_key`, `app_secret` | Dropbox | Dropbox refresh-token credential set. Exchanged for a short-lived access token that is cached and refreshed 60 seconds before expiry |
 | `folder` | No | Dropbox folder to scan. Default: `/Photos` |
 | `folder_id` | Google Drive | ID of the shared folder |
 | `api_key` | Google Drive | Key for a publicly shared folder |
 | `service_account_json` | Google Drive (private) | Full service-account JSON key, as a TOML literal string. See [google-drive-setup.md](google-drive-setup.md) |
 | `client_id`, `client_secret`, `refresh_token` | Google Drive (private) | Complete OAuth refresh-token credential set. There is no admin UI flow for creating these; the service-account method is recommended |
+
+A Dropbox source needs exactly one authentication method: a static
+`access_token`, or the full `refresh_token` + `app_key` + `app_secret` set.
+Supplying both, or only part of the refresh set, is rejected.
 
 A Google Drive source needs `folder_id` and exactly one authentication method:
 `api_key`, `service_account_json`, or the full `refresh_token` + `client_id` +
@@ -119,10 +137,20 @@ service-account JSON is rejected.
 The admin UI validates these rules when the user clicks **Finish**. An empty
 `[[remote_sources]]` list is valid and removes all remote sources.
 
-> **Dropbox tokens are static.** The Dropbox source requires a valid
-> `access_token` in the config file. Refresh-token support is not implemented,
-> so a short-lived token that expires will make sync fail until the config is
-> updated with a fresh token.
+> **Prefer a Dropbox refresh token over a static access token.** Dropbox access
+> tokens expire after a few hours. A static `access_token` that expires stops
+> sync until the config is updated, while a `refresh_token` + `app_key` +
+> `app_secret` set lets the manager mint a fresh token automatically.
+
+### Sync cursors
+
+The manager keeps a per-source cursor in `<photos_dir>/sync-cursors.json`. A
+value is either a provider cursor (`dbx:<cursor>` for Dropbox, or
+`gdrive:<pageToken>` for a bearer-auth Google Drive source) or a legacy Unix
+timestamp in seconds. Dropbox and bearer-auth Drive sources use the provider's
+own cursor; API-key Drive sources keep the timestamp listing, with a 2-second
+overlap so a same-second edit is not missed. A legacy numeric Dropbox cursor
+triggers a full catch-up listing on the next sync.
 
 ## Config mode
 
@@ -167,7 +195,9 @@ is removed when config mode exits — after **Finish**, on USB removal, on the i
 timeout, and on shutdown.
 
 The admin session stages changes in memory. **Finish** validates them and
-atomically rewrites this file; leaving config mode (USB removal or the
+atomically rewrites `config.toml`; a validation error is reported without
+stopping the server, and a write failure leaves the server running so the user
+can fix the problem and retry. Leaving config mode (USB removal or the
 10-minute idle timeout) discards staged changes without writing anything.
 
 Leaving config mode sends `RESUME` to the display app. If that write fails (for
@@ -184,16 +214,26 @@ The remote sync scheduler writes `<photos_dir>/sync-status.json`:
 {"sources":{"Family Dropbox":{"last_sync":123,"last_attempt":123,"state":"ok","error":null}}}
 ```
 
+`last_sync` is the Unix time of the last successful sync. It is written after
+every attempt, reloaded at startup so it survives a manager restart, and used as
+the scheduling fallback when the source's cursor is opaque (a `dbx:` or
+`gdrive:` provider cursor carries no timestamp of its own).
+
 The admin API exposes it at `GET /api/status`, together with the staged sources:
 
 ```json
 {
   "configured_sources": ["Family Dropbox"],
   "count": 1,
-  "sources": [{"type": "dropbox", "name": "Family Dropbox", "access_token": "sl.xxxx", "check_interval_seconds": 86400}],
+  "sources": [{"type": "dropbox", "name": "Family Dropbox", "access_token": "***", "check_interval_seconds": 86400}],
   "sync": {"sources": {"Family Dropbox": {"last_sync": 123, "last_attempt": 123, "state": "ok", "error": null}}}
 }
 ```
+
+`GET /api/sources` and `GET /api/status` replace sensitive parameter values with
+`"***"`: `access_token`, `api_key`, `refresh_token`, `client_id`,
+`client_secret`, `app_key`, `app_secret`, and `service_account_json`. Staging,
+validation, and the saved `config.toml` keep the real values.
 
 If the status file is missing or unreadable, `sync` is an empty object. The
 endpoint requires the config-mode basic-auth password.

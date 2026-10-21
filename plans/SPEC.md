@@ -40,11 +40,15 @@ primitives. There is no async runtime (no tokio) and no third-party CSV parser.
   memory.
 - Picks a random valid line on startup, streams line-by-line, and wraps to the
   first valid line at EOF.
+- Malformed lines are logged and skipped rather than treated as EOF, so a single
+  bad row cannot stop the slideshow.
 - Sends `IMG <path>\n` to the display app over `display_socket_path`.
 - Backpressure is the kernel socket buffer: when the display app stops reading,
-  `write_all()` blocks. A 30-second `SO_SNDTIMEO` bounds each write; timeouts are
-  treated as backpressure and retried on the same connection after 100ms. A
-  broken pipe or reset drops the connection, waits 5 seconds, and reconnects.
+  the write blocks. A 30-second `SO_SNDTIMEO` bounds each write. A partial write
+  resumes at the current offset, so no bytes are ever sent twice. Timeouts
+  (`WouldBlock`/`TimedOut`) are treated as backpressure and retried on the same
+  connection after 100ms. A broken pipe or reset drops the connection, waits 5
+  seconds, reconnects, and resends the message from the start.
 - Watches the index directory with `notify` (inotify). On modify/create, reopens
   the index and seeks back to the current line. If the seek fails, it restarts
   at the first valid line.
@@ -91,18 +95,30 @@ The scheduler runs in its own `std::thread` and pulls photos from configured
 - New sources sync immediately after being added. Removed sources are dropped
   from the sync status; their cursor entries are left in place.
 - Cursors are stored in `{photos_dir}/sync-cursors.json`, keyed by source name.
-  Values are Unix timestamps in seconds.
+  A value is a provider cursor (`dbx:<cursor>` or `gdrive:<pageToken>`) or a
+  legacy Unix timestamp in seconds.
 - Per-source status is written to `{photos_dir}/sync-status.json` after every
-  attempt (see `docs/config.md`).
+  attempt (see `docs/config.md`). `last_sync` records the time a sync completed
+  successfully, is reloaded at startup so it survives a restart, and is the
+  scheduling fallback when the cursor is opaque.
 
 #### Supported sources
 
 **Dropbox** (`type = "dropbox"`)
-- Static `access_token`, validated with `users/get_current_account`.
+- Authenticates with exactly one method, validated with
+  `users/get_current_account`:
+  - a static `access_token`, or
+  - `refresh_token` + `app_key` + `app_secret`. The refresh token is exchanged
+    for a short-lived access token at
+    `https://api.dropboxapi.com/oauth2/token` with `grant_type=refresh_token`;
+    tokens are cached and refreshed 60 seconds before expiry.
 - `files/list_folder` with `recursive = true` and `folder` (default `/Photos`).
 - Follows `has_more` with `files/list_folder/continue`, capped at 1000 pages per
   check.
-- Keeps image entries whose `server_modified` is newer than the cursor.
+- Cursors are the provider's opaque cursors, stored as `dbx:<cursor>`. A later
+  sync continues with `files/list_folder/continue`; a cursor the provider
+  rejects falls back to a full listing. A legacy numeric cursor also triggers a
+  full catch-up listing.
 - Downloads via `files/download` with `Dropbox-API-Arg`, streaming the body to
   disk.
 
@@ -117,6 +133,19 @@ The scheduler runs in its own `std::thread` and pulls photos from configured
     `drive.readonly` scope, and exchanges it for an access token at
     `token_uri` (default `https://oauth2.googleapis.com/token`). Tokens are
     cached and refreshed 60 seconds before expiry.
+- Bearer-auth sources (service account or OAuth refresh token) use the Drive
+  Changes API, with cursors stored as `gdrive:<pageToken>`:
+  - first sync, or a legacy cursor: fetch `changes/startPageToken` **before** the
+    folder listing, then return that start token. Taking the token first means a
+    file added while the folder is being paginated is still returned by the next
+    `changes/list`. If the start token fails, fall back to the timestamp cursor.
+  - later syncs: `changes/list`, following `nextPageToken`, keeping only
+    added or changed images still inside the folder (deletions, non-images, and
+    files in other folders are filtered out), and returning the new start token.
+  - a permission or unsupported Changes error falls back to a full folder
+    listing rather than pinning the cursor.
+- API-key sources keep the timestamp folder listing, re-listing a 2-second
+  window before the cursor so a file modified in the same second is not missed.
 - Lists `'<folder_id>' in parents and mimeType contains 'image/' and
   trashed = false`, ordered by `modifiedTime`, page size 1000, following
   `nextPageToken` up to 1000 pages.
@@ -240,8 +269,15 @@ idle timeout) and on shutdown.
 - Every route is behind HTTP Basic Auth. There are no unauthenticated callbacks.
 - Admin changes are staged in memory, seeded with the current sources. `Finish`
   validates every entry and atomically rewrites `config.toml` (temp file created
-  with mode 0600 in the same directory, then `rename()`). Leaving without
-  finishing writes nothing.
+  with mode 0600 in the same directory, then `rename()`). A validation failure
+  returns 400 and a save failure returns 500; either way the server keeps running
+  with `finished` false so the user can fix the problem and retry. Leaving config
+  mode without finishing writes nothing, and leaving after a successful finish
+  does not write the file a second time.
+- `GET /api/sources` and `GET /api/status` redact sensitive parameter values
+  (`access_token`, `api_key`, `refresh_token`, `client_id`, `client_secret`,
+  `app_key`, `app_secret`, `service_account_json`) as `"***"`. Staging,
+  validation, and the saved config keep the real values.
 
 Routes:
 
@@ -253,12 +289,12 @@ Routes:
 | `/sources/dropbox` | GET | Dropbox form |
 | `/sources/google-drive` | GET | Public Google Drive form |
 | `/sources/google-drive-service-account` | GET | Service-account form and instructions |
-| `/api/sources` | GET | Staged sources as JSON |
+| `/api/sources` | GET | Staged sources as JSON (credentials redacted) |
 | `/api/sources/dropbox` | POST | Stage a Dropbox source |
 | `/api/sources/google-drive` | POST | Stage a Google Drive source |
 | `/api/sources/<name>` | DELETE / POST | Remove a staged source |
-| `/api/status` | GET | Staged sources plus `sync-status.json` |
-| `/api/finish` | POST | Validate, save, and stop the server |
+| `/api/status` | GET | Staged sources plus `sync-status.json` (credentials redacted) |
+| `/api/finish` | POST | Validate, save, and stop the server; 400 on invalid input, 500 on save failure |
 
 Browser source form posts receive `303` redirects, the finish form returns an
 HTML success page, and JSON requests receive JSON. Invalid input returns an HTML
@@ -271,6 +307,9 @@ error page for browsers and a JSON 400 for API clients.
   `batch_delete_size` photos (files removed, `start_line` incremented, index
   renamed) and retries. This repeats until the write succeeds or there is
   nothing left to delete.
+- Remote downloads stage files on the photos partition, so an `ENOSPC` download
+  also rotates the oldest photos and retries. Rotation runs under the import
+  lock; if it frees nothing, the sync fails.
 - Deleted entries remain as ghosts in the CSV. When ghosts exceed 50% of the
   file, the index is compacted on startup to avoid runtime pauses.
 
@@ -343,8 +382,9 @@ single-core Pi Zero W2. Blocking HTTP and socket calls are also easier to test.
 
 **Decision:** Send `IMG` without waiting for `READY`. Backpressure is the kernel
 socket buffer. A 30-second write timeout distinguishes a stalled-but-alive app
-(backpressure) from a dead connection; timeouts retry, broken pipes reconnect
-after 5 seconds.
+(backpressure) from a dead connection. A partial write resumes at its current
+offset so bytes are never duplicated; timeouts retry on the same connection, and
+broken pipes reconnect after 5 seconds and resend from the start.
 
 **Why:** The display app already pauses `read()` when its image pipeline is
 full. Kernel-level blocking is simpler than a round-trip protocol and avoids the
@@ -355,6 +395,11 @@ risk of a lost `READY`.
 **Decision:** One CSV line per photo: `path,original_name,hash`. The filename
 encodes metadata: `index-<start_line>-<valid_count>.csv`. Logical deletion
 increments `start_line`; compaction rewrites the file when ghosts exceed 50%.
+
+Fields containing a comma or quote are CSV-quoted with doubled quotes. Embedded
+`\r`/`\n` are replaced with spaces (with a warning) because the reader is
+line-based and cannot represent them. A malformed row is logged and skipped
+rather than treated as EOF; legacy unquoted lines still parse.
 
 **Why:** CSV parsing is cheap, appends are atomic and cheap, and the
 filename-as-metadata approach needs no sidecar file. Since startup scans the
@@ -391,23 +436,29 @@ pre-mounted drives and manual mounts without polling file contents.
 
 ### 2.7 Image Conversion — Shell Out to ImageMagick
 
-**Decision:** Use `magick`, falling back to `convert`. Fit mode uses
-`-resize WxH`; fill mode uses `-resize WxH^ -gravity center -extent WxH`. Output
-is always JPEG; HEIC/HEIF sources are normalized so `stb_image` can decode them.
+**Decision:** Use `magick`, falling back to `convert`. `-auto-orient` runs first
+so EXIF rotation is applied before resizing. Fit mode uses `-resize WxH`; fill
+mode uses `-resize WxH^ -gravity center -extent WxH`. Output is always JPEG;
+HEIC/HEIF sources are normalized so `stb_image` can decode them.
 
 **Why:** Avoids a heavy Rust image pipeline, keeps memory low, and uses a
 well-optimized external tool for the CPU-heavy resize. Imports are infrequent,
 so process startup cost is acceptable.
 
-### 2.8 Remote Sync — Timestamp Cursors, Bounded Pages
+### 2.8 Remote Sync — Provider Cursors with a Timestamp Fallback
 
-**Decision:** Both sources store a Unix timestamp cursor rather than the
-provider's own opaque cursor. Listings are filtered to entries strictly newer
-than that timestamp. Pagination is followed within one check and capped at 1000
-pages.
+**Decision:** Each source uses the provider's own cursor when it can: Dropbox's
+opaque `files/list_folder` cursor (`dbx:<cursor>`) and the Drive Changes API page
+token (`gdrive:<pageToken>`) for bearer-auth Google sources. Cursors are
+prefixed so a stored value can be told apart from a legacy Unix-timestamp
+cursor. API-key Google sources keep the timestamp listing, with a 2-second
+overlap. Pagination is followed within one check and capped at 1000 pages.
 
-**Why:** One cursor format works for both providers and survives provider cursor
-expiry. The cap protects against a server that never clears `has_more`.
+**Why:** Provider cursors express exactly what changed since the last sync and
+avoid re-scanning a large folder, which the timestamp filter could not do. A
+timestamp remains the fallback for API-key sources and legacy cursors because it
+needs no extra API surface, and the overlap covers a same-second edit. The cap
+protects against a server that never clears `has_more`.
 
 ### 2.9 Cursor Advances Only on Complete Download Batches
 
@@ -509,9 +560,11 @@ indefinitely. The display app already tolerates disconnects.
 - **Index:** CSV, fields `path,original_name,hash`; metadata in the filename.
 - **Photos:** `photos_dir/YYYY/MM/DD/DDDDD_<original_name>.jpg`, where `DDDDD` is
   the CSV line index and the date comes from the source file's mtime (UTC).
-- **Sync cursors:** `photos_dir/sync-cursors.json`, `{source_name: "unix_seconds"}`.
+- **Sync cursors:** `photos_dir/sync-cursors.json`,
+  `{source_name: "dbx:<cursor>" | "gdrive:<pageToken>" | "unix_seconds"}`.
 - **Sync status:** `photos_dir/sync-status.json`,
-  `{"sources": {name: {last_sync, last_attempt, state, error}}}`.
+  `{"sources": {name: {last_sync, last_attempt, state, error}}}`. `last_sync` is
+  the last successful sync completion time and is reloaded at startup.
 - **Download staging:** `photos_dir/.sync-tmp/<index>/<safe_name>`.
 
 ### 3.5 Dependencies and System Requirements
@@ -545,8 +598,6 @@ segments), `askama` (templates), `serde_urlencoded`/`form_urlencoded` (forms).
 
 ## 4. Known Limitations
 
-- **Dropbox uses a static access token.** Refresh-token support is not
-  implemented; an expired token stops sync until `config.toml` is updated.
 - **Google service accounts cannot own files.** Create the folder with a normal
   Google account and share it with the service account as Viewer. A service
   account has no storage quota of its own.
@@ -559,9 +610,13 @@ segments), `askama` (templates), `serde_urlencoded`/`form_urlencoded` (forms).
   `drive.file`, which cannot read an existing folder of photos.
 - **Google Drive lists one folder level.** Subfolders are not traversed; Dropbox
   sync is recursive.
-- **Remote cursors are timestamps.** Files modified in the same second as the
-  cursor, or with clock skew, may be skipped until a later change. Unknown
-  source types are skipped by the scheduler.
+- **Opaque cursors rely on the status file for scheduling.** Dropbox and
+  bearer-auth Google Drive cursors carry no timestamp, so their last successful
+  sync time comes from `sync-status.json`; deleting that file makes those
+  sources look never-synced and sync immediately. API-key Google Drive sources
+  still use a timestamp cursor, where a file modified in the same second as the
+  cursor (or with clock skew) is covered by the 2-second overlap but may be
+  re-listed. Unknown source types are skipped by the scheduler.
 - **Config mode is USB-triggered** after the first setup; there is no on-screen
   menu or button. It also needs the display app's control socket and retries
   every 2 seconds if the app is not ready.
