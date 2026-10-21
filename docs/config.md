@@ -170,6 +170,12 @@ The admin session stages changes in memory. **Finish** validates them and
 atomically rewrites this file; leaving config mode (USB removal or the
 10-minute idle timeout) discards staged changes without writing anything.
 
+Leaving config mode sends `RESUME` to the display app. If that write fails (for
+example a broken pipe after the display app closed its control socket), the
+manager retries every 2 seconds until the slideshow resumes or it shuts down, so
+the QR image is not left on the panel. Starting a new config session cancels the
+retry because the display is being paused again.
+
 ### Sync status file
 
 The remote sync scheduler writes `<photos_dir>/sync-status.json`:

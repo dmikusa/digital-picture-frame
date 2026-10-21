@@ -77,6 +77,10 @@ Flow details:
   every entry (names, required credentials, check interval) and atomically
   rewrites `config.toml`. An empty list is allowed: it removes all remote
   sources. Clearing the list or abandoning the session writes nothing.
+- **Leaving config mode**: the manager sends `RESUME` so the slideshow takes the
+  panel back. If the display app does not accept it (for example `Broken pipe`
+  because it closed the control socket), the manager retries every 2 seconds
+  until the command lands or it shuts down, instead of leaving the QR image up.
 - **Status**: `GET /api/status` returns the staged sources plus the contents of
   `<photos_dir>/sync-status.json` when the scheduler has written it. A missing
   file yields an empty `sync` object.
