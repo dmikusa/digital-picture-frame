@@ -543,9 +543,8 @@ fn validate_sources(sources: &[RemoteSourceConfig]) -> Result<(), String> {
 
         match source.source_type.as_str() {
             "dropbox" => {
-                if param(&source.params, "access_token").is_none() {
-                    return Err(format!("\"{name}\": Dropbox access token is required."));
-                }
+                validate_dropbox_params(&source.params)
+                    .map_err(|message| format!("\"{name}\": {message}"))?;
             }
             "google_drive" => {
                 validate_gdrive_params(&source.params)
@@ -556,6 +555,43 @@ fn validate_sources(sources: &[RemoteSourceConfig]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Validate the Dropbox portion of a source: it needs exactly one
+/// authentication method, either a static access token or a complete
+/// refresh-token credential set (`refresh_token` + `app_key` + `app_secret`).
+fn validate_dropbox_params(params: &HashMap<String, String>) -> Result<(), String> {
+    let has_access_token = param(params, "access_token").is_some();
+    let refresh_fields = ["refresh_token", "app_key", "app_secret"];
+    let present_refresh: Vec<&str> = refresh_fields
+        .iter()
+        .copied()
+        .filter(|field| param(params, field).is_some())
+        .collect();
+    let has_refresh = present_refresh.len() == refresh_fields.len();
+
+    if has_access_token && has_refresh {
+        return Err(
+            "Dropbox accepts exactly one authentication method: a static access token, \
+             or a refresh token with an app key and app secret."
+                .into(),
+        );
+    }
+    if has_access_token || has_refresh {
+        return Ok(());
+    }
+    if !present_refresh.is_empty() {
+        return Err(
+            "Dropbox refresh credentials are incomplete: refresh token, app key, and \
+             app secret are all required."
+                .into(),
+        );
+    }
+    Err(
+        "Dropbox access token is required, or provide a refresh token with an app key \
+         and app secret."
+            .into(),
+    )
 }
 
 /// Validate the Google Drive portion of a source: it needs a folder and
@@ -780,6 +816,52 @@ mod tests {
 
         let blank = source("dropbox", "DB", &[("access_token", "   ")], 3600);
         assert!(validate_sources(&[blank]).is_err());
+    }
+
+    #[test]
+    fn test_validate_dropbox_refresh_token_credentials() {
+        let refresh = source(
+            "dropbox",
+            "DB",
+            &[
+                ("refresh_token", "rt"),
+                ("app_key", "key"),
+                ("app_secret", "secret"),
+            ],
+            3600,
+        );
+        assert!(validate_sources(&[refresh]).is_ok());
+
+        // A partial refresh set is rejected and names the missing field.
+        let partial = source(
+            "dropbox",
+            "DB",
+            &[("refresh_token", "rt"), ("app_key", "key")],
+            3600,
+        );
+        let err = validate_sources(&[partial]).unwrap_err();
+        assert!(err.contains("incomplete"), "got: {err}");
+        assert!(err.contains("app secret"), "got: {err}");
+
+        // Mixing a static token with refresh credentials is rejected.
+        let mixed = source(
+            "dropbox",
+            "DB",
+            &[
+                ("access_token", "sl.x"),
+                ("refresh_token", "rt"),
+                ("app_key", "key"),
+                ("app_secret", "secret"),
+            ],
+            3600,
+        );
+        let err = validate_sources(&[mixed]).unwrap_err();
+        assert!(err.contains("exactly one"), "got: {err}");
+
+        // No method at all is rejected.
+        let none = source("dropbox", "DB", &[("folder", "/Photos")], 3600);
+        let err = validate_sources(&[none]).unwrap_err();
+        assert!(err.contains("access token"), "got: {err}");
     }
 
     #[test]

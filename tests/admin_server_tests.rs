@@ -276,6 +276,121 @@ fn json_dropbox_save_still_returns_201_json() {
 }
 
 #[test]
+fn dropbox_form_offers_refresh_token_credentials() {
+    let s = TestServer::start();
+
+    let page = s.get("/sources/dropbox").text().expect("read dropbox form");
+    assert!(
+        page.contains("name=\"access_token\""),
+        "static token field missing: {page}"
+    );
+    assert!(
+        page.contains("name=\"refresh_token\""),
+        "refresh token field missing: {page}"
+    );
+    assert!(
+        page.contains("name=\"app_key\""),
+        "app key field missing: {page}"
+    );
+    assert!(
+        page.contains("name=\"app_secret\""),
+        "app secret field missing: {page}"
+    );
+    assert!(
+        page.contains("simpler option"),
+        "the form must note that a static token is simpler: {page}"
+    );
+}
+
+#[test]
+fn form_dropbox_refresh_credentials_are_staged() {
+    let s = TestServer::start();
+
+    let response = s.post_form(
+        "/api/sources/dropbox",
+        &[
+            ("name", "Refresh Dropbox"),
+            ("refresh_token", "rt.token"),
+            ("app_key", "app-key"),
+            ("app_secret", "app-secret"),
+            ("folder", "/Photos"),
+            ("check_interval_seconds", "3600"),
+        ],
+    );
+
+    assert_eq!(response.status(), 303);
+    let sources = s.server.take_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(
+        sources[0].params.get("refresh_token"),
+        Some(&"rt.token".to_string())
+    );
+    assert_eq!(
+        sources[0].params.get("app_key"),
+        Some(&"app-key".to_string())
+    );
+    assert_eq!(
+        sources[0].params.get("app_secret"),
+        Some(&"app-secret".to_string())
+    );
+}
+
+#[test]
+fn finish_rejects_partial_dropbox_refresh_credentials() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Partial",
+        &[("refresh_token", "rt"), ("app_key", "key")],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 400);
+    let body = response.text().expect("read error page");
+    assert!(body.contains("incomplete"), "error page: {body}");
+    assert!(!s.server.finished());
+}
+
+#[test]
+fn finish_rejects_mixed_dropbox_credentials() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Mixed",
+        &[
+            ("access_token", "sl.x"),
+            ("refresh_token", "rt"),
+            ("app_key", "key"),
+            ("app_secret", "secret"),
+        ],
+    )]);
+
+    let response = s.post_json("/api/finish", "{}");
+
+    assert_eq!(response.status(), 400);
+    let body = response.text().expect("read error JSON");
+    assert!(body.contains("exactly one"), "error JSON: {body}");
+    assert!(!s.server.finished());
+}
+
+#[test]
+fn finish_succeeds_with_dropbox_refresh_credentials() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Refresh Dropbox",
+        &[
+            ("refresh_token", "rt"),
+            ("app_key", "key"),
+            ("app_secret", "secret"),
+        ],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 200);
+    assert!(s.server.finished());
+}
+
+#[test]
 fn form_delete_via_post_redirects_and_removes_source() {
     let s = TestServer::start();
 
