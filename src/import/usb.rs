@@ -600,7 +600,7 @@ fn convert_image(
 }
 
 /// True when an error means the photos partition is out of space.
-fn is_enospc(e: &io::Error) -> bool {
+pub(crate) fn is_enospc(e: &io::Error) -> bool {
     if e.raw_os_error() == Some(libc::ENOSPC) {
         return true;
     }
@@ -655,6 +655,23 @@ where
             }
         }
     }
+}
+
+/// Delete the oldest `count` photos to free space for a remote download.
+///
+/// Acquires the process-wide import lock so rotation cannot race a USB import:
+/// both mutate the same index and dedup set. Returns the number of files
+/// actually deleted; `0` means there was nothing left to delete.
+pub(crate) fn rotate_for_space(photos_dir: &Path, count: usize) -> io::Result<usize> {
+    let _import_guard = lock_imports();
+
+    let (_index_path, meta) = index::init_index(photos_dir)?;
+    if meta.valid_count == 0 {
+        return Ok(0);
+    }
+
+    let (_new_meta, deleted) = index::delete_oldest(photos_dir, &meta, count)?;
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -852,6 +869,41 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(calls, 1, "non-ENOSPC errors must not trigger rotation");
         assert!(photos.iter().all(|photo| photo.exists()));
+    }
+
+    #[test]
+    fn test_rotate_for_space_deletes_oldest_and_returns_count() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 4);
+
+        let deleted = rotate_for_space(tmpdir.path(), 2).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(!photos[0].exists(), "oldest photo should be deleted");
+        assert!(!photos[1].exists(), "second oldest photo should be deleted");
+        assert!(photos[2].exists(), "newer photo should be kept");
+        assert!(photos[3].exists(), "newest photo should be kept");
+
+        let (_path, meta) = index::init_index(tmpdir.path()).unwrap();
+        assert_eq!(meta.start_line, 2);
+        assert_eq!(meta.valid_count, 2);
+    }
+
+    #[test]
+    fn test_rotate_for_space_caps_at_valid_count() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 2);
+
+        assert_eq!(rotate_for_space(tmpdir.path(), 10).unwrap(), 2);
+        assert!(photos.iter().all(|photo| !photo.exists()));
+    }
+
+    #[test]
+    fn test_rotate_for_space_returns_zero_when_nothing_to_delete() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        index::init_index(tmpdir.path()).unwrap();
+
+        assert_eq!(rotate_for_space(tmpdir.path(), 5).unwrap(), 0);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::Config;
-use crate::import::usb::import_single_photo;
+use crate::import::usb::{import_single_photo, is_enospc, rotate_for_space};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -341,7 +341,13 @@ fn download_and_import(
     dedup_set: &Arc<Mutex<HashSet<u64>>>,
 ) -> io::Result<()> {
     let tmp_dir = sync_tmp_dir(config);
-    prepare_tmp_dir(&tmp_dir)?;
+    // Creating the staging directory can also fail with ENOSPC, so it goes
+    // through the same rotate-and-retry path as the downloads.
+    run_with_rotation(
+        || prepare_tmp_dir(&tmp_dir),
+        &config.photos_dir,
+        config.batch_delete_size,
+    )?;
 
     let mut failed: Vec<String> = Vec::new();
 
@@ -350,11 +356,22 @@ fn download_and_import(
         // staged file keeps the remote name. The per-item directory avoids
         // collisions instead of renaming the file.
         let dest = temp_path(&tmp_dir, &photo.filename, index);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
 
-        if let Err(e) = src.download(&photo.remote_id, &dest) {
+        // A full photos partition would otherwise fail the download forever:
+        // the normal import rotation only runs after a download succeeds. Free
+        // space by deleting the oldest photos and retry the download.
+        let downloaded = run_with_rotation(
+            || {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                src.download(&photo.remote_id, &dest)
+            },
+            &config.photos_dir,
+            config.batch_delete_size,
+        );
+
+        if let Err(e) = downloaded {
             log::warn!(r#"Download failed for "{}": {}"#, photo.filename, e);
             cleanup_temp_file(&dest);
             failed.push(format!("{}: {}", photo.filename, e));
@@ -391,6 +408,40 @@ fn download_and_import(
             photos.len(),
             failed.join("; ")
         )))
+    }
+}
+
+/// Run `op`, rotating out the oldest photos whenever it fails with ENOSPC.
+///
+/// Remote downloads stage files on the photos partition, so a full partition
+/// fails them before the normal import rotation can run. Rotation always makes
+/// progress or errors out: each pass deletes valid index entries, and we stop
+/// as soon as rotation frees nothing (no photos left). Returns the total number
+/// of photos deleted.
+fn run_with_rotation<F>(mut op: F, photos_dir: &Path, batch_delete_size: usize) -> io::Result<usize>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    let mut deleted_total = 0;
+
+    loop {
+        match op() {
+            Ok(()) => return Ok(deleted_total),
+            Err(e) if !is_enospc(&e) => return Err(e),
+            Err(e) => {
+                log::warn!("Disk full ({}), attempting rotation", e);
+
+                let deleted = rotate_for_space(photos_dir, batch_delete_size)?;
+                if deleted == 0 {
+                    return Err(io::Error::other(format!(
+                        "Operation failed and rotation freed no space: {}",
+                        e
+                    )));
+                }
+                log::info!("Deleted {} old photos to free space", deleted);
+                deleted_total += deleted;
+            }
+        }
     }
 }
 
@@ -943,6 +994,131 @@ mod tests {
 
         let tmp = dir.path().join(".sync-tmp");
         assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+    }
+
+    /// Create `count` placeholder photos plus an index that references them.
+    fn create_index_with_photos(dir: &Path, count: usize) -> Vec<PathBuf> {
+        use std::io::Write;
+
+        let mut paths = Vec::new();
+        for i in 0..count {
+            let path = dir.join(format!("{i:05}_photo.jpg"));
+            std::fs::write(&path, b"photo").unwrap();
+            paths.push(path);
+        }
+
+        let meta = crate::index::IndexMetadata {
+            start_line: 0,
+            valid_count: count,
+        };
+        let mut file =
+            std::fs::File::create(dir.join(crate::index::build_index_filename(&meta))).unwrap();
+        for (i, path) in paths.iter().enumerate() {
+            writeln!(file, "{},photo{}.jpg,{}", path.display(), i, i + 1).unwrap();
+        }
+        file.flush().unwrap();
+
+        paths
+    }
+
+    /// Fails the first download with ENOSPC, then succeeds.
+    struct EnospcOnceSource {
+        failed_once: bool,
+    }
+
+    impl RemotePhotoSource for EnospcOnceSource {
+        fn connect(_config: &HashMap<String, String>) -> io::Result<Self> {
+            Ok(EnospcOnceSource { failed_once: false })
+        }
+
+        fn list_changes(
+            &mut self,
+            _cursor: Option<&str>,
+        ) -> io::Result<(Vec<RemotePhoto>, String)> {
+            Ok((Vec::new(), "1".to_string()))
+        }
+
+        fn download(&mut self, _remote_id: &str, dest: &Path) -> io::Result<()> {
+            if !self.failed_once {
+                self.failed_once = true;
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            std::fs::write(dest, b"fake image bytes")
+        }
+    }
+
+    /// Always fails downloads with ENOSPC.
+    struct AlwaysEnospcSource;
+
+    impl RemotePhotoSource for AlwaysEnospcSource {
+        fn connect(_config: &HashMap<String, String>) -> io::Result<Self> {
+            Ok(AlwaysEnospcSource)
+        }
+
+        fn list_changes(
+            &mut self,
+            _cursor: Option<&str>,
+        ) -> io::Result<(Vec<RemotePhoto>, String)> {
+            Ok((Vec::new(), "1".to_string()))
+        }
+
+        fn download(&mut self, _remote_id: &str, _dest: &Path) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+    }
+
+    #[test]
+    fn test_download_enospc_rotates_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.batch_delete_size = 2;
+        let photos = create_index_with_photos(dir.path(), 3);
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = EnospcOnceSource { failed_once: false };
+
+        download_and_import(&mut source, &[photo("new.jpg")], &config, &dedup_set).unwrap();
+
+        assert!(!photos[0].exists(), "oldest photo should be deleted");
+        assert!(!photos[1].exists(), "second oldest photo should be deleted");
+        assert!(photos[2].exists(), "newest photo should be kept");
+        let (_path, meta) = crate::index::init_index(dir.path()).unwrap();
+        assert_eq!(meta.valid_count, 1, "only the newest photo remains");
+    }
+
+    #[test]
+    fn test_download_enospc_errors_when_no_photos_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        crate::index::init_index(dir.path()).unwrap();
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = AlwaysEnospcSource;
+
+        let err = download_and_import(&mut source, &[photo("a.jpg")], &config, &dedup_set)
+            .expect_err("an unfixable ENOSPC must be reported");
+        assert!(err.to_string().contains("download(s) failed"), "{err}");
+    }
+
+    #[test]
+    fn test_download_non_enospc_error_does_not_rotate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let photos = create_index_with_photos(dir.path(), 2);
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = FakeSource {
+            fail_downloads: true,
+            list: Vec::new(),
+        };
+
+        let err = download_and_import(&mut source, &[photo("a.jpg")], &config, &dedup_set)
+            .expect_err("a non-ENOSPC failure must be reported");
+        assert!(
+            err.to_string().contains("simulated download failure"),
+            "the original error must be preserved: {err}"
+        );
+        assert!(
+            photos.iter().all(|p| p.exists()),
+            "non-ENOSPC errors must not trigger rotation"
+        );
     }
 
     #[test]
