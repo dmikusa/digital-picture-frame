@@ -255,7 +255,8 @@ impl AdminServer {
 
     fn api_list_sources(&self) -> Response<Box<dyn std::io::Read + Send>> {
         let sources = self.staged_sources.lock().unwrap();
-        let json = serde_json::to_string(&*sources).unwrap_or_else(|_| "[]".into());
+        let redacted = redact_sources(&sources);
+        let json = serde_json::to_string(&redacted).unwrap_or_else(|_| "[]".into());
         json_response(200, &json)
     }
 
@@ -332,11 +333,12 @@ impl AdminServer {
     fn api_status(&self) -> Response<Box<dyn std::io::Read + Send>> {
         let sources = self.staged_sources.lock().unwrap();
         let names: Vec<_> = sources.iter().map(|s| &s.name).collect();
+        let redacted = redact_sources(&sources);
         let sync = self.read_sync_status();
         let json = serde_json::json!({
             "configured_sources": names,
             "count": sources.len(),
-            "sources": &*sources,
+            "sources": redacted,
             "sync": sync,
         });
         json_response(200, &json.to_string())
@@ -462,6 +464,59 @@ fn param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> 
         .get(key)
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
+}
+
+/// Placeholder substituted for sensitive parameter values in JSON API
+/// responses. Staging, validation, and the config file keep the real values.
+const REDACTED_PARAM: &str = "***";
+
+/// Parameter names whose values must never appear in an API response. These
+/// carry Dropbox tokens, Google Drive API keys and OAuth secrets, and
+/// service-account key material.
+const SENSITIVE_PARAMS: &[&str] = &[
+    "access_token",
+    "api_key",
+    "refresh_token",
+    "client_id",
+    "client_secret",
+    "app_key",
+    "app_secret",
+    "service_account_json",
+];
+
+/// Whether a parameter name holds a credential that must not be echoed back.
+fn is_sensitive_param(key: &str) -> bool {
+    SENSITIVE_PARAMS
+        .iter()
+        .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
+}
+
+/// Copy a source with every sensitive parameter value replaced by
+/// [`REDACTED_PARAM`]. Used only for JSON API responses; the staged values,
+/// validation, and config writes keep the real secrets.
+fn redact_source(source: &RemoteSourceConfig) -> RemoteSourceConfig {
+    let params = source
+        .params
+        .iter()
+        .map(|(key, value)| {
+            if is_sensitive_param(key) {
+                (key.clone(), REDACTED_PARAM.to_string())
+            } else {
+                (key.clone(), value.clone())
+            }
+        })
+        .collect();
+
+    RemoteSourceConfig {
+        source_type: source.source_type.clone(),
+        name: source.name.clone(),
+        params,
+        check_interval_seconds: source.check_interval_seconds,
+    }
+}
+
+fn redact_sources(sources: &[RemoteSourceConfig]) -> Vec<RemoteSourceConfig> {
+    sources.iter().map(redact_source).collect()
 }
 
 /// Validate the staged source list at "Finish" time.
@@ -865,6 +920,72 @@ mod tests {
     fn test_validate_accepts_unknown_source_types() {
         let other = source("immich", "Immich", &[("url", "https://example.test")], 3600);
         assert!(validate_sources(&[other]).is_ok());
+    }
+
+    #[test]
+    fn test_redact_sources_replaces_sensitive_values() {
+        let dropbox = source(
+            "dropbox",
+            "DB",
+            &[
+                ("access_token", "sl.secret"),
+                ("refresh_token", "rt.secret"),
+                ("app_key", "app-key"),
+                ("app_secret", "app-secret"),
+                ("folder", "/Photos"),
+            ],
+            3600,
+        );
+        let gdrive = source(
+            "google_drive",
+            "GD",
+            &[
+                ("folder_id", "f1"),
+                ("api_key", "AIza-secret"),
+                ("client_id", "client-id"),
+                ("client_secret", "client-secret"),
+                ("service_account_json", r#"{"private_key":"secret"}"#),
+            ],
+            3600,
+        );
+
+        let redacted = redact_sources(&[dropbox, gdrive]);
+
+        for key in [
+            "access_token",
+            "refresh_token",
+            "app_key",
+            "app_secret",
+            "api_key",
+            "client_id",
+            "client_secret",
+            "service_account_json",
+        ] {
+            let value = redacted
+                .iter()
+                .find_map(|s| s.params.get(key))
+                .unwrap_or_else(|| panic!("{key} should still be present"));
+            assert_eq!(value, REDACTED_PARAM, "{key} must be redacted");
+        }
+
+        // Non-sensitive parameters and metadata survive untouched.
+        assert_eq!(
+            redacted[0].params.get("folder"),
+            Some(&"/Photos".to_string())
+        );
+        assert_eq!(redacted[0].name, "DB");
+        assert_eq!(redacted[1].params.get("folder_id"), Some(&"f1".to_string()));
+        assert_eq!(redacted[1].source_type, "google_drive");
+    }
+
+    #[test]
+    fn test_redaction_is_case_insensitive() {
+        let upper = source("dropbox", "DB", &[("Access_Token", "sl.secret")], 3600);
+        let redacted = redact_sources(&[upper]);
+        assert_eq!(
+            redacted[0].params.get("Access_Token"),
+            Some(&REDACTED_PARAM.to_string())
+        );
     }
 
     #[test]

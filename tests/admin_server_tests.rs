@@ -566,6 +566,49 @@ fn status_without_sync_file_returns_empty_sync_object() {
     assert_eq!(body["count"], 0);
 }
 
+#[test]
+fn api_responses_redact_source_secrets() {
+    let s = TestServer::start_with(vec![
+        staged_source(
+            "dropbox",
+            "My Dropbox",
+            &[("access_token", "sl.secret"), ("folder", "/Photos")],
+        ),
+        staged_source(
+            "google_drive",
+            "My Drive",
+            &[("folder_id", "f1"), ("api_key", "AIza-secret")],
+        ),
+    ]);
+
+    let sources: serde_json::Value =
+        serde_json::from_str(&s.get("/api/sources").text().expect("read sources"))
+            .expect("valid sources JSON");
+    assert_eq!(sources[0]["access_token"], "***");
+    assert_eq!(sources[0]["folder"], "/Photos");
+    assert_eq!(sources[1]["api_key"], "***");
+    assert_eq!(sources[1]["folder_id"], "f1");
+
+    let status: serde_json::Value =
+        serde_json::from_str(&s.get("/api/status").text().expect("read status"))
+            .expect("valid status JSON");
+    assert_eq!(status["sources"][0]["access_token"], "***");
+    assert_eq!(status["sources"][1]["api_key"], "***");
+    assert_eq!(status["configured_sources"][0], "My Dropbox");
+
+    // The staged values keep the real secrets for the scheduler and the
+    // config file.
+    let staged = s.server.take_sources();
+    assert_eq!(
+        staged[0].params.get("access_token"),
+        Some(&"sl.secret".to_string())
+    );
+    assert_eq!(
+        staged[1].params.get("api_key"),
+        Some(&"AIza-secret".to_string())
+    );
+}
+
 /// Shape-only service-account key used by the admin tests. The private key is
 /// not a real PEM because saving a source never signs anything.
 fn service_account_json() -> String {
