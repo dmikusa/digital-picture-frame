@@ -19,6 +19,7 @@ use crate::index::{self, IndexWriter};
 use crc32fast::Hasher;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
@@ -539,6 +540,35 @@ fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime, seq: u
     dest
 }
 
+/// Build the ImageMagick argument list for resizing `src` into `dest`.
+///
+/// `-auto-orient` comes first so EXIF rotation is applied to the pixels before
+/// resizing; otherwise a phone photo keeps its sideways orientation.
+fn convert_args(
+    src: &Path,
+    dest: &Path,
+    width: u32,
+    height: u32,
+    mode: &AspectRatioMode,
+) -> Vec<OsString> {
+    let mut args = vec![src.as_os_str().to_owned(), OsString::from("-auto-orient")];
+
+    if matches!(mode, AspectRatioMode::Fill) {
+        args.push(OsString::from("-resize"));
+        args.push(OsString::from(format!("{}x{}^", width, height)));
+        args.push(OsString::from("-gravity"));
+        args.push(OsString::from("center"));
+        args.push(OsString::from("-extent"));
+        args.push(OsString::from(format!("{}x{}", width, height)));
+    } else {
+        args.push(OsString::from("-resize"));
+        args.push(OsString::from(format!("{}x{}", width, height)));
+    }
+
+    args.push(dest.as_os_str().to_owned());
+    args
+}
+
 /// Convert an image using ImageMagick.
 fn convert_image(
     src: &Path,
@@ -558,18 +588,7 @@ fn convert_image(
     };
 
     let mut cmd = Command::new(magick_cmd);
-    cmd.arg(src);
-    if matches!(mode, AspectRatioMode::Fill) {
-        cmd.arg("-resize")
-            .arg(format!("{}x{}^", width, height))
-            .arg("-gravity")
-            .arg("center")
-            .arg("-extent")
-            .arg(format!("{}x{}", width, height));
-    } else {
-        cmd.arg("-resize").arg(format!("{}x{}", width, height));
-    }
-    cmd.arg(dest);
+    cmd.args(convert_args(src, dest, width, height, mode));
 
     unsafe {
         cmd.pre_exec(|| {
@@ -600,7 +619,7 @@ fn convert_image(
 }
 
 /// True when an error means the photos partition is out of space.
-fn is_enospc(e: &io::Error) -> bool {
+pub(crate) fn is_enospc(e: &io::Error) -> bool {
     if e.raw_os_error() == Some(libc::ENOSPC) {
         return true;
     }
@@ -655,6 +674,23 @@ where
             }
         }
     }
+}
+
+/// Delete the oldest `count` photos to free space for a remote download.
+///
+/// Acquires the process-wide import lock so rotation cannot race a USB import:
+/// both mutate the same index and dedup set. Returns the number of files
+/// actually deleted; `0` means there was nothing left to delete.
+pub(crate) fn rotate_for_space(photos_dir: &Path, count: usize) -> io::Result<usize> {
+    let _import_guard = lock_imports();
+
+    let (_index_path, meta) = index::init_index(photos_dir)?;
+    if meta.valid_count == 0 {
+        return Ok(0);
+    }
+
+    let (_new_meta, deleted) = index::delete_oldest(photos_dir, &meta, count)?;
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -852,6 +888,64 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(calls, 1, "non-ENOSPC errors must not trigger rotation");
         assert!(photos.iter().all(|photo| photo.exists()));
+    }
+
+    #[test]
+    fn test_rotate_for_space_deletes_oldest_and_returns_count() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 4);
+
+        let deleted = rotate_for_space(tmpdir.path(), 2).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(!photos[0].exists(), "oldest photo should be deleted");
+        assert!(!photos[1].exists(), "second oldest photo should be deleted");
+        assert!(photos[2].exists(), "newer photo should be kept");
+        assert!(photos[3].exists(), "newest photo should be kept");
+
+        let (_path, meta) = index::init_index(tmpdir.path()).unwrap();
+        assert_eq!(meta.start_line, 2);
+        assert_eq!(meta.valid_count, 2);
+    }
+
+    #[test]
+    fn test_rotate_for_space_caps_at_valid_count() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let photos = create_index_with_photos(tmpdir.path(), 2);
+
+        assert_eq!(rotate_for_space(tmpdir.path(), 10).unwrap(), 2);
+        assert!(photos.iter().all(|photo| !photo.exists()));
+    }
+
+    #[test]
+    fn test_rotate_for_space_returns_zero_when_nothing_to_delete() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        index::init_index(tmpdir.path()).unwrap();
+
+        assert_eq!(rotate_for_space(tmpdir.path(), 5).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_convert_args_places_auto_orient_before_resize() {
+        for mode in [AspectRatioMode::Fit, AspectRatioMode::Fill] {
+            let args = convert_args(Path::new("in.jpg"), Path::new("out.jpg"), 800, 600, &mode);
+
+            let auto = args
+                .iter()
+                .position(|arg| arg == "-auto-orient")
+                .expect("auto-orient must be present");
+            let resize = args
+                .iter()
+                .position(|arg| arg == "-resize")
+                .expect("resize must be present");
+            assert!(
+                auto < resize,
+                "auto-orient must precede resize for {mode:?}: {args:?}"
+            );
+
+            assert_eq!(args.first().unwrap(), &OsString::from("in.jpg"));
+            assert_eq!(args.last().unwrap(), &OsString::from("out.jpg"));
+        }
     }
 
     #[test]

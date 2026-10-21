@@ -22,7 +22,7 @@
 //! is stopped with its `Arc<AtomicBool>` shutdown flag.
 
 use photo_frame_manager::admin_server::AdminServer;
-use photo_frame_manager::config::RemoteSourceConfig;
+use photo_frame_manager::config::{AspectRatioMode, Config, RemoteSourceConfig};
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
 use std::collections::HashMap;
@@ -59,21 +59,56 @@ fn staged_source(source_type: &str, name: &str, params: &[(&str, &str)]) -> Remo
     }
 }
 
+/// A minimal valid config used as the base for `with_config_save`. Only
+/// `remote_sources` changes when the user finishes setup.
+fn base_config(photos_dir: &std::path::Path) -> Config {
+    Config {
+        photos_dir: photos_dir.to_path_buf(),
+        display_socket_path: PathBuf::from("/run/photo-frame/photo-frame.sock"),
+        control_socket_path: PathBuf::from("/run/photo-frame/control.sock"),
+        native_resolution: "1024x768".to_string(),
+        aspect_ratio_mode: AspectRatioMode::Fit,
+        batch_delete_size: 10,
+        log_max_size: 2048,
+        log_max_files: 3,
+        remote_sources: Vec::new(),
+    }
+}
+
 impl TestServer {
     fn start() -> Self {
         Self::start_with(Vec::new())
     }
 
     fn start_with(sources: Vec<RemoteSourceConfig>) -> Self {
-        Self::start_with_status(sources, None)
+        Self::start_full(sources, None, None)
     }
 
     fn start_with_status(sources: Vec<RemoteSourceConfig>, status_path: Option<PathBuf>) -> Self {
+        Self::start_full(sources, status_path, None)
+    }
+
+    fn start_with_config_save(
+        sources: Vec<RemoteSourceConfig>,
+        path: PathBuf,
+        base: Config,
+    ) -> Self {
+        Self::start_full(sources, None, Some((path, base)))
+    }
+
+    fn start_full(
+        sources: Vec<RemoteSourceConfig>,
+        status_path: Option<PathBuf>,
+        save_target: Option<(PathBuf, Config)>,
+    ) -> Self {
         let lock = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut server =
             AdminServer::new(PASSWORD.to_string(), sources).expect("create admin server");
         if let Some(path) = status_path {
             server = server.with_status_path(path);
+        }
+        if let Some((path, base)) = save_target {
+            server = server.with_config_save(path, base);
         }
         let server = Arc::new(server);
         let port = server.port();
@@ -241,6 +276,121 @@ fn json_dropbox_save_still_returns_201_json() {
 }
 
 #[test]
+fn dropbox_form_offers_refresh_token_credentials() {
+    let s = TestServer::start();
+
+    let page = s.get("/sources/dropbox").text().expect("read dropbox form");
+    assert!(
+        page.contains("name=\"access_token\""),
+        "static token field missing: {page}"
+    );
+    assert!(
+        page.contains("name=\"refresh_token\""),
+        "refresh token field missing: {page}"
+    );
+    assert!(
+        page.contains("name=\"app_key\""),
+        "app key field missing: {page}"
+    );
+    assert!(
+        page.contains("name=\"app_secret\""),
+        "app secret field missing: {page}"
+    );
+    assert!(
+        page.contains("simpler option"),
+        "the form must note that a static token is simpler: {page}"
+    );
+}
+
+#[test]
+fn form_dropbox_refresh_credentials_are_staged() {
+    let s = TestServer::start();
+
+    let response = s.post_form(
+        "/api/sources/dropbox",
+        &[
+            ("name", "Refresh Dropbox"),
+            ("refresh_token", "rt.token"),
+            ("app_key", "app-key"),
+            ("app_secret", "app-secret"),
+            ("folder", "/Photos"),
+            ("check_interval_seconds", "3600"),
+        ],
+    );
+
+    assert_eq!(response.status(), 303);
+    let sources = s.server.take_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(
+        sources[0].params.get("refresh_token"),
+        Some(&"rt.token".to_string())
+    );
+    assert_eq!(
+        sources[0].params.get("app_key"),
+        Some(&"app-key".to_string())
+    );
+    assert_eq!(
+        sources[0].params.get("app_secret"),
+        Some(&"app-secret".to_string())
+    );
+}
+
+#[test]
+fn finish_rejects_partial_dropbox_refresh_credentials() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Partial",
+        &[("refresh_token", "rt"), ("app_key", "key")],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 400);
+    let body = response.text().expect("read error page");
+    assert!(body.contains("incomplete"), "error page: {body}");
+    assert!(!s.server.finished());
+}
+
+#[test]
+fn finish_rejects_mixed_dropbox_credentials() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Mixed",
+        &[
+            ("access_token", "sl.x"),
+            ("refresh_token", "rt"),
+            ("app_key", "key"),
+            ("app_secret", "secret"),
+        ],
+    )]);
+
+    let response = s.post_json("/api/finish", "{}");
+
+    assert_eq!(response.status(), 400);
+    let body = response.text().expect("read error JSON");
+    assert!(body.contains("exactly one"), "error JSON: {body}");
+    assert!(!s.server.finished());
+}
+
+#[test]
+fn finish_succeeds_with_dropbox_refresh_credentials() {
+    let s = TestServer::start_with(vec![staged_source(
+        "dropbox",
+        "Refresh Dropbox",
+        &[
+            ("refresh_token", "rt"),
+            ("app_key", "key"),
+            ("app_secret", "secret"),
+        ],
+    )]);
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 200);
+    assert!(s.server.finished());
+}
+
+#[test]
 fn form_delete_via_post_redirects_and_removes_source() {
     let s = TestServer::start();
 
@@ -305,6 +455,80 @@ fn finish_via_json_returns_json() {
     let body = response.text().expect("read finish JSON");
     assert!(body.contains(r#""ok":true"#), "finish body: {body}");
     assert!(s.server.finished());
+}
+
+#[test]
+fn finish_with_save_target_writes_config_and_sets_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let s = TestServer::start_with_config_save(
+        vec![staged_source(
+            "dropbox",
+            "Saved Dropbox",
+            &[("access_token", "sl.good"), ("folder", "/Photos")],
+        )],
+        config_path.clone(),
+        base_config(dir.path()),
+    );
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("text/html"));
+    assert!(s.server.finished());
+
+    let saved = Config::from_file(&config_path).expect("saved config should parse");
+    assert_eq!(saved.remote_sources.len(), 1);
+    assert_eq!(saved.remote_sources[0].name, "Saved Dropbox");
+    assert_eq!(
+        saved.remote_sources[0].params.get("access_token"),
+        Some(&"sl.good".to_string())
+    );
+}
+
+#[test]
+fn finish_save_failure_returns_error_and_leaves_unfinished() {
+    let dir = tempfile::tempdir().unwrap();
+    // A parent directory that does not exist makes the atomic write fail
+    // without depending on file permissions (which root bypasses).
+    let config_path = PathBuf::from("/nonexistent-photo-frame-dir/config.toml");
+    let s = TestServer::start_with_config_save(
+        vec![staged_source(
+            "dropbox",
+            "Valid Dropbox",
+            &[("access_token", "sl.good")],
+        )],
+        config_path,
+        base_config(dir.path()),
+    );
+
+    let form = s.post_empty_form("/api/finish");
+    assert_eq!(form.status(), 500);
+    assert!(
+        content_type(&form).starts_with("text/html"),
+        "browser save errors must be HTML, got {}",
+        content_type(&form)
+    );
+    let body = form.text().expect("read error page");
+    assert!(body.contains("Could not save config"), "error page: {body}");
+    assert!(
+        !s.server.finished(),
+        "a failed save must not stop the server"
+    );
+
+    let json = s.post_json("/api/finish", "{}");
+    assert_eq!(json.status(), 500);
+    assert!(
+        content_type(&json).starts_with("application/json"),
+        "API save errors must be JSON, got {}",
+        content_type(&json)
+    );
+    let body = json.text().expect("read error JSON");
+    assert!(body.contains("Could not save config"), "error JSON: {body}");
+    assert!(!s.server.finished());
+
+    // The sources are still staged so the user can retry after fixing the path.
+    assert_eq!(s.server.take_sources().len(), 1);
 }
 
 #[test]
@@ -455,6 +679,49 @@ fn status_without_sync_file_returns_empty_sync_object() {
             .expect("valid status JSON");
     assert_eq!(body["sync"], serde_json::json!({}));
     assert_eq!(body["count"], 0);
+}
+
+#[test]
+fn api_responses_redact_source_secrets() {
+    let s = TestServer::start_with(vec![
+        staged_source(
+            "dropbox",
+            "My Dropbox",
+            &[("access_token", "sl.secret"), ("folder", "/Photos")],
+        ),
+        staged_source(
+            "google_drive",
+            "My Drive",
+            &[("folder_id", "f1"), ("api_key", "AIza-secret")],
+        ),
+    ]);
+
+    let sources: serde_json::Value =
+        serde_json::from_str(&s.get("/api/sources").text().expect("read sources"))
+            .expect("valid sources JSON");
+    assert_eq!(sources[0]["access_token"], "***");
+    assert_eq!(sources[0]["folder"], "/Photos");
+    assert_eq!(sources[1]["api_key"], "***");
+    assert_eq!(sources[1]["folder_id"], "f1");
+
+    let status: serde_json::Value =
+        serde_json::from_str(&s.get("/api/status").text().expect("read status"))
+            .expect("valid status JSON");
+    assert_eq!(status["sources"][0]["access_token"], "***");
+    assert_eq!(status["sources"][1]["api_key"], "***");
+    assert_eq!(status["configured_sources"][0], "My Dropbox");
+
+    // The staged values keep the real secrets for the scheduler and the
+    // config file.
+    let staged = s.server.take_sources();
+    assert_eq!(
+        staged[0].params.get("access_token"),
+        Some(&"sl.secret".to_string())
+    );
+    assert_eq!(
+        staged[1].params.get("api_key"),
+        Some(&"AIza-secret".to_string())
+    );
 }
 
 /// Shape-only service-account key used by the admin tests. The private key is

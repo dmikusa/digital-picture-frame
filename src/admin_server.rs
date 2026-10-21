@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::config::RemoteSourceConfig;
+use crate::config::{Config, RemoteSourceConfig};
 use askama::Template;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -32,6 +32,13 @@ pub const SYNC_STATUS_FILE: &str = "sync-status.json";
 /// Basic-auth username for the config-mode admin server. Shown on the setup
 /// screen and written to the fallback credentials file.
 pub const AUTH_USERNAME: &str = "photo-frame";
+
+/// Where `POST /api/finish` writes the staged sources, and the config the
+/// staged sources are merged into. Without one, `finish` only stops the server.
+struct ConfigSaveTarget {
+    path: PathBuf,
+    base: Config,
+}
 
 // ---------------------------------------------------------------------------
 // Askama templates — compiled from templates/*.html at build time
@@ -76,6 +83,7 @@ pub struct AdminServer {
     finished: Arc<AtomicBool>,
     last_request: Arc<Mutex<Instant>>,
     status_path: Option<PathBuf>,
+    save_target: Option<ConfigSaveTarget>,
 }
 
 impl AdminServer {
@@ -92,6 +100,7 @@ impl AdminServer {
             finished: Arc::new(AtomicBool::new(false)),
             last_request: Arc::new(Mutex::new(Instant::now())),
             status_path: None,
+            save_target: None,
         })
     }
 
@@ -99,6 +108,20 @@ impl AdminServer {
     /// the status endpoint reports an empty `sync` object.
     pub fn with_status_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.status_path = Some(path.into());
+        self
+    }
+
+    /// Persist the staged sources to `path` when the user finishes setup.
+    ///
+    /// `base` supplies the settings that config mode does not edit; only its
+    /// `remote_sources` are replaced by the staged list. The write happens
+    /// inside `POST /api/finish`, so a failure is reported to the user and the
+    /// server keeps running instead of pretending the save succeeded.
+    pub fn with_config_save(mut self, path: impl Into<PathBuf>, base: Config) -> Self {
+        self.save_target = Some(ConfigSaveTarget {
+            path: path.into(),
+            base,
+        });
         self
     }
 
@@ -232,7 +255,8 @@ impl AdminServer {
 
     fn api_list_sources(&self) -> Response<Box<dyn std::io::Read + Send>> {
         let sources = self.staged_sources.lock().unwrap();
-        let json = serde_json::to_string(&*sources).unwrap_or_else(|_| "[]".into());
+        let redacted = redact_sources(&sources);
+        let json = serde_json::to_string(&redacted).unwrap_or_else(|_| "[]".into());
         json_response(200, &json)
     }
 
@@ -309,11 +333,12 @@ impl AdminServer {
     fn api_status(&self) -> Response<Box<dyn std::io::Read + Send>> {
         let sources = self.staged_sources.lock().unwrap();
         let names: Vec<_> = sources.iter().map(|s| &s.name).collect();
+        let redacted = redact_sources(&sources);
         let sync = self.read_sync_status();
         let json = serde_json::json!({
             "configured_sources": names,
             "count": sources.len(),
-            "sources": &*sources,
+            "sources": redacted,
             "sync": sync,
         });
         json_response(200, &json.to_string())
@@ -363,6 +388,23 @@ impl AdminServer {
             } else {
                 json_error(400, &message)
             };
+        }
+
+        // Write the config before reporting success. A failed write must leave
+        // the server running so the user can fix the problem and retry.
+        if let Some(target) = self.save_target.as_ref() {
+            let mut config = target.base.clone();
+            config.remote_sources = sources;
+            if let Err(e) = crate::config::save_config_atomic(&target.path, &config) {
+                let message = format!("Could not save config to {}: {e}", target.path.display());
+                log::error!("{message}");
+                return if html {
+                    html_error(500, &message)
+                } else {
+                    json_error(500, &message)
+                };
+            }
+            log::info!("Config saved to {}", target.path.display());
         }
 
         self.finished.store(true, Ordering::Relaxed);
@@ -424,6 +466,59 @@ fn param<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> 
         .filter(|value| !value.is_empty())
 }
 
+/// Placeholder substituted for sensitive parameter values in JSON API
+/// responses. Staging, validation, and the config file keep the real values.
+const REDACTED_PARAM: &str = "***";
+
+/// Parameter names whose values must never appear in an API response. These
+/// carry Dropbox tokens, Google Drive API keys and OAuth secrets, and
+/// service-account key material.
+const SENSITIVE_PARAMS: &[&str] = &[
+    "access_token",
+    "api_key",
+    "refresh_token",
+    "client_id",
+    "client_secret",
+    "app_key",
+    "app_secret",
+    "service_account_json",
+];
+
+/// Whether a parameter name holds a credential that must not be echoed back.
+fn is_sensitive_param(key: &str) -> bool {
+    SENSITIVE_PARAMS
+        .iter()
+        .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
+}
+
+/// Copy a source with every sensitive parameter value replaced by
+/// [`REDACTED_PARAM`]. Used only for JSON API responses; the staged values,
+/// validation, and config writes keep the real secrets.
+fn redact_source(source: &RemoteSourceConfig) -> RemoteSourceConfig {
+    let params = source
+        .params
+        .iter()
+        .map(|(key, value)| {
+            if is_sensitive_param(key) {
+                (key.clone(), REDACTED_PARAM.to_string())
+            } else {
+                (key.clone(), value.clone())
+            }
+        })
+        .collect();
+
+    RemoteSourceConfig {
+        source_type: source.source_type.clone(),
+        name: source.name.clone(),
+        params,
+        check_interval_seconds: source.check_interval_seconds,
+    }
+}
+
+fn redact_sources(sources: &[RemoteSourceConfig]) -> Vec<RemoteSourceConfig> {
+    sources.iter().map(redact_source).collect()
+}
+
 /// Validate the staged source list at "Finish" time.
 ///
 /// An empty list is valid: it means the user removed every source. Sources of
@@ -448,9 +543,8 @@ fn validate_sources(sources: &[RemoteSourceConfig]) -> Result<(), String> {
 
         match source.source_type.as_str() {
             "dropbox" => {
-                if param(&source.params, "access_token").is_none() {
-                    return Err(format!("\"{name}\": Dropbox access token is required."));
-                }
+                validate_dropbox_params(&source.params)
+                    .map_err(|message| format!("\"{name}\": {message}"))?;
             }
             "google_drive" => {
                 validate_gdrive_params(&source.params)
@@ -461,6 +555,43 @@ fn validate_sources(sources: &[RemoteSourceConfig]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Validate the Dropbox portion of a source: it needs exactly one
+/// authentication method, either a static access token or a complete
+/// refresh-token credential set (`refresh_token` + `app_key` + `app_secret`).
+fn validate_dropbox_params(params: &HashMap<String, String>) -> Result<(), String> {
+    let has_access_token = param(params, "access_token").is_some();
+    let refresh_fields = ["refresh_token", "app_key", "app_secret"];
+    let present_refresh: Vec<&str> = refresh_fields
+        .iter()
+        .copied()
+        .filter(|field| param(params, field).is_some())
+        .collect();
+    let has_refresh = present_refresh.len() == refresh_fields.len();
+
+    if has_access_token && has_refresh {
+        return Err(
+            "Dropbox accepts exactly one authentication method: a static access token, \
+             or a refresh token with an app key and app secret."
+                .into(),
+        );
+    }
+    if has_access_token || has_refresh {
+        return Ok(());
+    }
+    if !present_refresh.is_empty() {
+        return Err(
+            "Dropbox refresh credentials are incomplete: refresh token, app key, and \
+             app secret are all required."
+                .into(),
+        );
+    }
+    Err(
+        "Dropbox access token is required, or provide a refresh token with an app key \
+         and app secret."
+            .into(),
+    )
 }
 
 /// Validate the Google Drive portion of a source: it needs a folder and
@@ -688,6 +819,52 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_dropbox_refresh_token_credentials() {
+        let refresh = source(
+            "dropbox",
+            "DB",
+            &[
+                ("refresh_token", "rt"),
+                ("app_key", "key"),
+                ("app_secret", "secret"),
+            ],
+            3600,
+        );
+        assert!(validate_sources(&[refresh]).is_ok());
+
+        // A partial refresh set is rejected and names the missing field.
+        let partial = source(
+            "dropbox",
+            "DB",
+            &[("refresh_token", "rt"), ("app_key", "key")],
+            3600,
+        );
+        let err = validate_sources(&[partial]).unwrap_err();
+        assert!(err.contains("incomplete"), "got: {err}");
+        assert!(err.contains("app secret"), "got: {err}");
+
+        // Mixing a static token with refresh credentials is rejected.
+        let mixed = source(
+            "dropbox",
+            "DB",
+            &[
+                ("access_token", "sl.x"),
+                ("refresh_token", "rt"),
+                ("app_key", "key"),
+                ("app_secret", "secret"),
+            ],
+            3600,
+        );
+        let err = validate_sources(&[mixed]).unwrap_err();
+        assert!(err.contains("exactly one"), "got: {err}");
+
+        // No method at all is rejected.
+        let none = source("dropbox", "DB", &[("folder", "/Photos")], 3600);
+        let err = validate_sources(&[none]).unwrap_err();
+        assert!(err.contains("access token"), "got: {err}");
+    }
+
+    #[test]
     fn test_validate_rejects_empty_and_duplicate_names() {
         let no_name = source("dropbox", "  ", &[("access_token", "sl.x")], 3600);
         let err = validate_sources(&[no_name]).unwrap_err();
@@ -828,6 +1005,72 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_sources_replaces_sensitive_values() {
+        let dropbox = source(
+            "dropbox",
+            "DB",
+            &[
+                ("access_token", "sl.secret"),
+                ("refresh_token", "rt.secret"),
+                ("app_key", "app-key"),
+                ("app_secret", "app-secret"),
+                ("folder", "/Photos"),
+            ],
+            3600,
+        );
+        let gdrive = source(
+            "google_drive",
+            "GD",
+            &[
+                ("folder_id", "f1"),
+                ("api_key", "AIza-secret"),
+                ("client_id", "client-id"),
+                ("client_secret", "client-secret"),
+                ("service_account_json", r#"{"private_key":"secret"}"#),
+            ],
+            3600,
+        );
+
+        let redacted = redact_sources(&[dropbox, gdrive]);
+
+        for key in [
+            "access_token",
+            "refresh_token",
+            "app_key",
+            "app_secret",
+            "api_key",
+            "client_id",
+            "client_secret",
+            "service_account_json",
+        ] {
+            let value = redacted
+                .iter()
+                .find_map(|s| s.params.get(key))
+                .unwrap_or_else(|| panic!("{key} should still be present"));
+            assert_eq!(value, REDACTED_PARAM, "{key} must be redacted");
+        }
+
+        // Non-sensitive parameters and metadata survive untouched.
+        assert_eq!(
+            redacted[0].params.get("folder"),
+            Some(&"/Photos".to_string())
+        );
+        assert_eq!(redacted[0].name, "DB");
+        assert_eq!(redacted[1].params.get("folder_id"), Some(&"f1".to_string()));
+        assert_eq!(redacted[1].source_type, "google_drive");
+    }
+
+    #[test]
+    fn test_redaction_is_case_insensitive() {
+        let upper = source("dropbox", "DB", &[("Access_Token", "sl.secret")], 3600);
+        let redacted = redact_sources(&[upper]);
+        assert_eq!(
+            redacted[0].params.get("Access_Token"),
+            Some(&REDACTED_PARAM.to_string())
+        );
+    }
+
+    #[test]
     fn test_read_sync_status_missing_or_malformed_is_empty() {
         let server = AdminServer {
             port: 0,
@@ -836,6 +1079,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(false)),
             last_request: Arc::new(Mutex::new(Instant::now())),
             status_path: Some(PathBuf::from("/nonexistent/sync-status.json")),
+            save_target: None,
         };
         assert_eq!(server.read_sync_status(), serde_json::json!({}));
 
@@ -869,6 +1113,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(false)),
             last_request: Arc::new(Mutex::new(Instant::now())),
             status_path: Some(path),
+            save_target: None,
         };
         let status = server.read_sync_status();
         assert_eq!(status["sources"]["My Dropbox"]["last_sync"], 123);

@@ -29,8 +29,9 @@ The suite has three parts:
   `magick`/`convert` is not installed.
 - **Admin server tests** in `tests/admin_server_tests.rs` start a real server and
   drive it over HTTP with `reqwest::blocking`, covering Basic Auth, form and
-  JSON requests, redirects, staged-source behavior, sync status, and atomic
-  finish validation.
+  JSON requests, redirects, staged-source behavior, sync status, secret
+  redaction in API responses, the Finish-time config save (including a failed
+  save that leaves the server running), and finish validation.
 
 Remote-source tests use a local mock HTTP server (`src/import/test_http.rs`), so
 they do not need network access or real Dropbox/Google credentials. The

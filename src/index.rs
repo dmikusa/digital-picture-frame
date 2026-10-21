@@ -153,22 +153,35 @@ impl IndexReader {
     }
 
     pub fn next_record(&mut self) -> io::Result<Option<PhotoRecord>> {
-        if self.current_valid >= self.metadata.valid_count {
-            return Ok(None);
+        loop {
+            if self.current_valid >= self.metadata.valid_count {
+                return Ok(None);
+            }
+
+            let mut line = String::new();
+            let bytes_read = self.reader.read_line(&mut line)?;
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+
+            let line = line.trim_end();
+            let record = parse_csv_line(line, self.current_line);
+            self.current_line += 1;
+            self.current_valid += 1;
+
+            match record {
+                Some(record) => return Ok(Some(record)),
+                None => {
+                    // Skip malformed rows instead of treating them as EOF so a
+                    // single bad line does not stop the slideshow.
+                    log::warn!(
+                        "Skipping malformed index line {}: {:?}",
+                        self.current_line - 1,
+                        line
+                    );
+                }
+            }
         }
-
-        let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-
-        let line = line.trim_end();
-        let record = parse_csv_line(line, self.current_line);
-        self.current_line += 1;
-        self.current_valid += 1;
-
-        Ok(record)
     }
 
     #[allow(dead_code)]
@@ -202,8 +215,7 @@ impl IndexWriter {
 
     pub fn append(&mut self, path: &str, original_name: &str, hash: u64) -> io::Result<usize> {
         let line_number = self.metadata.total_lines();
-        let hash_str = hash.to_string();
-        let line = format!("{},{},{}\n", path, original_name, hash_str);
+        let line = encode_csv_record(path, original_name, hash);
         self.file.write_all(line.as_bytes())?;
         self.file.flush()?;
         self.metadata.valid_count += 1;
@@ -236,16 +248,100 @@ impl IndexWriter {
     }
 }
 
+/// Encode a single CSV field, quoting it when it contains a delimiter, quote,
+/// carriage return, or newline. Embedded quotes are doubled.
+fn encode_csv_field(field: &str) -> String {
+    if field.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Replace embedded carriage returns and newlines with spaces.
+///
+/// The index is read line-by-line, so a field containing a literal newline
+/// cannot be represented without corrupting the file. Sanitize instead of
+/// quoting so a hostile or odd filename cannot break the reader. Commas and
+/// quotes are preserved losslessly by the CSV encoder.
+fn sanitize_csv_field(field: &str) -> String {
+    if field.contains(['\r', '\n']) {
+        log::warn!("Sanitizing newline in index field: {:?}", field);
+        field
+            .chars()
+            .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+            .collect()
+    } else {
+        field.to_string()
+    }
+}
+
+/// Encode one `path,original_name,hash` record (including the trailing newline).
+fn encode_csv_record(path: &str, original_name: &str, hash: u64) -> String {
+    let path = sanitize_csv_field(path);
+    let original_name = sanitize_csv_field(original_name);
+    format!(
+        "{},{},{}\n",
+        encode_csv_field(&path),
+        encode_csv_field(&original_name),
+        hash
+    )
+}
+
+/// Decode a single CSV line into its fields, handling quoted fields and
+/// doubled-quote escapes. Returns `None` on malformed input.
+fn decode_csv_line(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut chars = line.chars().peekable();
+
+    loop {
+        let mut field = String::new();
+
+        if chars.peek() == Some(&'"') {
+            chars.next(); // consume opening quote
+            loop {
+                match chars.next() {
+                    Some('"') if chars.peek() == Some(&'"') => {
+                        chars.next(); // consume escaped quote
+                        field.push('"');
+                    }
+                    Some('"') => break, // closing quote
+                    Some(c) => field.push(c),
+                    None => return None, // unterminated quote
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                field.push(c);
+                chars.next();
+            }
+        }
+
+        fields.push(field);
+
+        match chars.next() {
+            Some(',') => continue,
+            None => break,
+            Some(_) => return None, // unexpected data after a quoted field
+        }
+    }
+
+    Some(fields)
+}
+
 /// Parse a single CSV line into a PhotoRecord.
 fn parse_csv_line(line: &str, line_number: usize) -> Option<PhotoRecord> {
-    let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() != 3 {
+    let fields = decode_csv_line(line)?;
+    if fields.len() != 3 {
         return None;
     }
-    let hash = parts[2].parse().ok()?;
+    let hash = fields[2].parse().ok()?;
     Some(PhotoRecord {
-        path: parts[0].to_string(),
-        original_name: parts[1].to_string(),
+        path: fields[0].clone(),
+        original_name: fields[1].clone(),
         hash,
         line_number,
     })
@@ -580,5 +676,169 @@ mod tests {
         assert!(set.contains(&200));
         assert!(set.contains(&300));
         assert!(!set.contains(&999));
+    }
+
+    #[test]
+    fn test_csv_round_trip_special_chars() {
+        let path = "/photos/00001_we,ird \"quoted\" \\ name.jpg";
+        let name = "we,ird \"quoted\" \\ name.jpg";
+
+        let encoded = encode_csv_record(path, name, 4242);
+        assert!(encoded.ends_with('\n'));
+        assert!(encoded.contains("\"\""), "embedded quotes must be doubled");
+
+        let record = parse_csv_line(encoded.trim_end(), 7).unwrap();
+        assert_eq!(record.path, path);
+        assert_eq!(record.original_name, name);
+        assert_eq!(record.hash, 4242);
+        assert_eq!(record.line_number, 7);
+    }
+
+    #[test]
+    fn test_csv_round_trip_via_writer_and_reader() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = "/photos/00001_a,b\"c.jpg";
+        let name = "a,b\"c.jpg";
+
+        let meta = IndexMetadata {
+            start_line: 0,
+            valid_count: 0,
+        };
+        let mut writer = IndexWriter::open(tmpdir.path(), meta).unwrap();
+        writer.append(path, name, 99).unwrap();
+        drop(writer);
+
+        let read_path = tmpdir.path().join("index-0-0.csv");
+        let meta = IndexMetadata {
+            start_line: 0,
+            valid_count: 1,
+        };
+        let mut reader = IndexReader::open(&read_path, meta).unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.path, path);
+        assert_eq!(record.original_name, name);
+        assert_eq!(record.hash, 99);
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_unquoted_legacy_line() {
+        let record = parse_csv_line("/photos/00001_test.jpg,test.jpg,12345", 0).unwrap();
+        assert_eq!(record.path, "/photos/00001_test.jpg");
+        assert_eq!(record.original_name, "test.jpg");
+        assert_eq!(record.hash, 12345);
+    }
+
+    #[test]
+    fn test_malformed_line_is_skipped() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("index-0-3.csv");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "/photos/00001_first.jpg,first.jpg,111").unwrap();
+        writeln!(file, "this line is malformed").unwrap();
+        writeln!(file, "/photos/00003_third.jpg,third.jpg,333").unwrap();
+
+        let meta = IndexMetadata {
+            start_line: 0,
+            valid_count: 3,
+        };
+        let mut reader = IndexReader::open(&path, meta).unwrap();
+
+        let first = reader.next_record().unwrap().unwrap();
+        assert_eq!(first.path, "/photos/00001_first.jpg");
+
+        // The malformed line is skipped; the next valid line is returned.
+        let third = reader.next_record().unwrap().unwrap();
+        assert_eq!(third.path, "/photos/00003_third.jpg");
+        assert_eq!(third.line_number, 2);
+
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_malformed_line_does_not_loop_forever() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("index-0-2.csv");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "bad one").unwrap();
+        writeln!(file, "bad two").unwrap();
+
+        let meta = IndexMetadata {
+            start_line: 0,
+            valid_count: 2,
+        };
+        let mut reader = IndexReader::open(&path, meta).unwrap();
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_newline_in_name_is_sanitized() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let meta = IndexMetadata {
+            start_line: 0,
+            valid_count: 0,
+        };
+        let mut writer = IndexWriter::open(tmpdir.path(), meta).unwrap();
+        writer
+            .append("/photos/00001_evil.jpg", "evil\nname\r.jpg", 7)
+            .unwrap();
+        writer.append("/photos/00002_ok.jpg", "ok.jpg", 8).unwrap();
+        drop(writer);
+
+        let read_path = tmpdir.path().join("index-0-0.csv");
+        let contents = fs::read_to_string(&read_path).unwrap();
+        // The sanitized field keeps the record on a single physical line.
+        assert_eq!(contents.lines().count(), 2);
+        assert!(!contents.contains('\r'));
+
+        let meta = IndexMetadata {
+            start_line: 0,
+            valid_count: 2,
+        };
+        let mut reader = IndexReader::open(&read_path, meta).unwrap();
+        let first = reader.next_record().unwrap().unwrap();
+        assert_eq!(first.original_name, "evil name .jpg");
+        let second = reader.next_record().unwrap().unwrap();
+        assert_eq!(second.original_name, "ok.jpg");
+    }
+
+    #[test]
+    fn test_dedup_set_with_quoted_fields() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("index-0-2.csv");
+        let mut file = File::create(&path).unwrap();
+        write!(file, "{}", encode_csv_record("/a,b.jpg", "a,b.jpg", 100)).unwrap();
+        write!(file, "{}", encode_csv_record("/c.jpg", "c.jpg", 200)).unwrap();
+
+        let meta = IndexMetadata {
+            start_line: 0,
+            valid_count: 2,
+        };
+        let set = build_dedup_set(&path, &meta).unwrap();
+        assert!(set.contains(&100));
+        assert!(set.contains(&200));
+    }
+
+    #[test]
+    fn test_compact_index_preserves_quoted_fields() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("index-1-1.csv");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "old,old.jpg,1").unwrap();
+        write!(file, "{}", encode_csv_record("/a,b.jpg", "a,b.jpg", 2)).unwrap();
+
+        let meta = IndexMetadata {
+            start_line: 1,
+            valid_count: 1,
+        };
+        let new_meta = compact_index(tmpdir.path(), &meta).unwrap();
+        assert_eq!(new_meta.start_line, 0);
+        assert_eq!(new_meta.valid_count, 1);
+
+        let new_path = tmpdir.path().join("index-0-1.csv");
+        let mut reader = IndexReader::open(&new_path, new_meta).unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.path, "/a,b.jpg");
+        assert_eq!(record.original_name, "a,b.jpg");
     }
 }

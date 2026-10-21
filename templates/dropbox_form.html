@@ -7,6 +7,12 @@
     <label>Access Token</label><input name="access_token" type="password" placeholder="sl.xxxx">
     <label>Folder</label><input name="folder" value="/Photos">
     <label>Check Interval (seconds)</label><input name="check_interval_seconds" value="86400" type="number">
+    <p class="muted">Optional refresh-token credentials. A static access token above is the
+    simpler option, but it expires after a few hours. Filling in all three fields keeps sync
+    working after the short-lived token expires.</p>
+    <label>Refresh Token</label><input name="refresh_token" type="password" placeholder="Optional">
+    <label>App Key</label><input name="app_key" type="password" placeholder="Optional">
+    <label>App Secret</label><input name="app_secret" type="password" placeholder="Optional">
     <br><button>Save</button>
 </form>
 {% endblock %}

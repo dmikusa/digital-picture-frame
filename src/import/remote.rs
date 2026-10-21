@@ -15,7 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::Config;
-use crate::import::usb::import_single_photo;
+use crate::import::usb::{import_single_photo, is_enospc, rotate_for_space};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -74,7 +74,10 @@ pub fn run_sync_scheduler(
     // second. The cursor file still only records successful syncs.
     let mut last_attempts: HashMap<String, u64> = HashMap::new();
     let mut reloader = ConfigReloader::new(config_path);
-    let mut status = SyncStatus::default();
+    // Reload the published status so `last_sync` survives a restart. Opaque
+    // provider cursors (`dbx:`, `gdrive:`) carry no timestamp, so the status
+    // file is the only record of when those sources last synced.
+    let mut status = SyncStatus::load(&status_path(&config));
     status.retain_configured(&config);
     status.refresh_last_sync(&cursors);
     status.save(&status_path(&config));
@@ -125,7 +128,7 @@ pub fn run_sync_scheduler(
             .collect();
 
         for source in &sources {
-            let last_sync = cursors.get(&source.name).and_then(|c| parse_cursor_time(c));
+            let last_sync = source_last_sync(&source.name, &cursors, &status);
             let last_attempt = last_attempts.get(&source.name).copied();
 
             if !is_due(last_sync, last_attempt, source.interval_secs, unix_now()) {
@@ -153,6 +156,13 @@ pub fn run_sync_scheduler(
             // Publish the result for the admin UI after every attempt.
             status.record_attempt(&source.name, attempt_at, error.as_deref());
             status.refresh_last_sync(&cursors);
+            if result.is_ok() {
+                // Record the completion time so opaque provider cursors still
+                // report a last sync and do not look never-synced after a
+                // restart. `refresh_last_sync` above only understands numeric
+                // cursors.
+                status.record_success(&source.name, unix_now());
+            }
             status.save(&status_path(&config));
         }
 
@@ -161,7 +171,7 @@ pub fn run_sync_scheduler(
         let next_wake = sources
             .iter()
             .map(|s| {
-                let last_sync = cursors.get(&s.name).and_then(|c| parse_cursor_time(c));
+                let last_sync = source_last_sync(&s.name, &cursors, &status);
                 let last_attempt = last_attempts.get(&s.name).copied();
                 seconds_until_due(last_sync, last_attempt, s.interval_secs, now)
             })
@@ -262,6 +272,23 @@ fn last_touch(last_sync_unix: Option<u64>, last_attempt_unix: Option<u64>) -> Op
     }
 }
 
+/// The last successful sync time for a source, in Unix seconds.
+///
+/// A numeric cursor encodes the time directly, so it is preferred. Opaque
+/// provider cursors (`dbx:`, `gdrive:`) do not, so fall back to the time
+/// recorded in `sync-status.json`, which is what keeps a source from looking
+/// never-synced after a restart.
+fn source_last_sync(
+    name: &str,
+    cursors: &HashMap<String, String>,
+    status: &SyncStatus,
+) -> Option<u64> {
+    cursors
+        .get(name)
+        .and_then(|cursor| parse_cursor_time(cursor))
+        .or_else(|| status.sources.get(name).and_then(|entry| entry.last_sync))
+}
+
 /// A source is due when it has never synced, or when a full interval has
 /// elapsed since the most recent successful sync or failed attempt.
 fn is_due(
@@ -341,7 +368,13 @@ fn download_and_import(
     dedup_set: &Arc<Mutex<HashSet<u64>>>,
 ) -> io::Result<()> {
     let tmp_dir = sync_tmp_dir(config);
-    prepare_tmp_dir(&tmp_dir)?;
+    // Creating the staging directory can also fail with ENOSPC, so it goes
+    // through the same rotate-and-retry path as the downloads.
+    run_with_rotation(
+        || prepare_tmp_dir(&tmp_dir),
+        &config.photos_dir,
+        config.batch_delete_size,
+    )?;
 
     let mut failed: Vec<String> = Vec::new();
 
@@ -350,11 +383,22 @@ fn download_and_import(
         // staged file keeps the remote name. The per-item directory avoids
         // collisions instead of renaming the file.
         let dest = temp_path(&tmp_dir, &photo.filename, index);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
 
-        if let Err(e) = src.download(&photo.remote_id, &dest) {
+        // A full photos partition would otherwise fail the download forever:
+        // the normal import rotation only runs after a download succeeds. Free
+        // space by deleting the oldest photos and retry the download.
+        let downloaded = run_with_rotation(
+            || {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                src.download(&photo.remote_id, &dest)
+            },
+            &config.photos_dir,
+            config.batch_delete_size,
+        );
+
+        if let Err(e) = downloaded {
             log::warn!(r#"Download failed for "{}": {}"#, photo.filename, e);
             cleanup_temp_file(&dest);
             failed.push(format!("{}: {}", photo.filename, e));
@@ -391,6 +435,40 @@ fn download_and_import(
             photos.len(),
             failed.join("; ")
         )))
+    }
+}
+
+/// Run `op`, rotating out the oldest photos whenever it fails with ENOSPC.
+///
+/// Remote downloads stage files on the photos partition, so a full partition
+/// fails them before the normal import rotation can run. Rotation always makes
+/// progress or errors out: each pass deletes valid index entries, and we stop
+/// as soon as rotation frees nothing (no photos left). Returns the total number
+/// of photos deleted.
+fn run_with_rotation<F>(mut op: F, photos_dir: &Path, batch_delete_size: usize) -> io::Result<usize>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    let mut deleted_total = 0;
+
+    loop {
+        match op() {
+            Ok(()) => return Ok(deleted_total),
+            Err(e) if !is_enospc(&e) => return Err(e),
+            Err(e) => {
+                log::warn!("Disk full ({}), attempting rotation", e);
+
+                let deleted = rotate_for_space(photos_dir, batch_delete_size)?;
+                if deleted == 0 {
+                    return Err(io::Error::other(format!(
+                        "Operation failed and rotation freed no space: {}",
+                        e
+                    )));
+                }
+                log::info!("Deleted {} old photos to free space", deleted);
+                deleted_total += deleted;
+            }
+        }
     }
 }
 
@@ -462,7 +540,8 @@ pub enum SyncState {
 /// Per-source status published to `<photos_dir>/sync-status.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceStatus {
-    /// Unix seconds of the last successful cursor timestamp, or null.
+    /// Unix seconds of the last successful sync, or null. For opaque provider
+    /// cursors this is the completion time recorded by the scheduler.
     pub last_sync: Option<u64>,
     /// Unix seconds of the last attempt, or null if never attempted.
     pub last_attempt: Option<u64>,
@@ -481,6 +560,15 @@ fn status_path(config: &Config) -> PathBuf {
 }
 
 impl SyncStatus {
+    /// Load a previously saved status document. A missing or malformed file
+    /// degrades to an empty status so it never blocks startup.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+            Err(_) => SyncStatus::default(),
+        }
+    }
+
     /// Keep only sources that are currently configured, adding an empty entry
     /// for each new one so the admin UI sees it before its first attempt.
     pub fn retain_configured(&mut self, config: &Config) {
@@ -522,6 +610,15 @@ impl SyncStatus {
                 status.error = None;
             }
         }
+    }
+
+    /// Record a successful sync completion time.
+    ///
+    /// Unlike [`Self::refresh_last_sync`], this does not depend on the cursor
+    /// format, so it also works for opaque provider cursors.
+    pub fn record_success(&mut self, name: &str, synced_at: u64) {
+        let status = self.sources.entry(name.to_string()).or_default();
+        status.last_sync = Some(synced_at);
     }
 
     /// Write the file atomically (temp file + rename) so the admin server never
@@ -895,6 +992,86 @@ mod tests {
         assert_eq!(status_path(&config), dir.path().join("sync-status.json"));
     }
 
+    #[test]
+    fn test_record_success_sets_last_sync() {
+        let mut status = SyncStatus::default();
+        status.record_success("Dropbox", 1_700_000_000);
+
+        assert_eq!(status.sources["Dropbox"].last_sync, Some(1_700_000_000));
+        // A later success replaces the earlier time.
+        status.record_success("Dropbox", 1_700_000_500);
+        assert_eq!(status.sources["Dropbox"].last_sync, Some(1_700_000_500));
+        // Attempt fields are untouched.
+        assert_eq!(status.sources["Dropbox"].last_attempt, None);
+        assert_eq!(status.sources["Dropbox"].state, SyncState::Ok);
+    }
+
+    #[test]
+    fn test_load_preserves_last_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-status.json");
+
+        let mut status = SyncStatus::default();
+        status.record_success("Dropbox", 1_700_000_000);
+        status.record_attempt("Dropbox", 1_700_000_100, None);
+        status.save(&path);
+
+        let loaded = SyncStatus::load(&path);
+        assert_eq!(loaded.sources["Dropbox"].last_sync, Some(1_700_000_000));
+        assert_eq!(loaded.sources["Dropbox"].last_attempt, Some(1_700_000_100));
+
+        // Missing and malformed files degrade to an empty status.
+        assert!(SyncStatus::load(&dir.path().join("missing.json"))
+            .sources
+            .is_empty());
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(SyncStatus::load(&path).sources.is_empty());
+    }
+
+    #[test]
+    fn test_opaque_cursor_uses_status_last_sync_for_scheduling() {
+        let cursors: HashMap<String, String> =
+            [("Dropbox".to_string(), "dbx:opaque-cursor".to_string())]
+                .into_iter()
+                .collect();
+        let mut status = SyncStatus::default();
+        status.record_success("Dropbox", 1_000);
+
+        // The opaque cursor carries no timestamp, so the status supplies it.
+        let last_sync = source_last_sync("Dropbox", &cursors, &status);
+        assert_eq!(last_sync, Some(1_000));
+
+        // A fresh status time means the source is not due yet.
+        assert!(!is_due(last_sync, None, 3_600, 1_500));
+        assert!(is_due(last_sync, None, 3_600, 4_600));
+
+        // Without a recorded success it looks never-synced and is due.
+        let empty = SyncStatus::default();
+        let none = source_last_sync("Dropbox", &cursors, &empty);
+        assert_eq!(none, None);
+        assert!(is_due(none, None, 3_600, 1_500));
+    }
+
+    #[test]
+    fn test_numeric_cursor_takes_precedence_over_status_last_sync() {
+        let cursors: HashMap<String, String> = [("Drive".to_string(), "1704240000".to_string())]
+            .into_iter()
+            .collect();
+        let mut status = SyncStatus::default();
+        status.record_success("Drive", 999);
+
+        // A numeric cursor is the timestamp and wins over the status time.
+        assert_eq!(
+            source_last_sync("Drive", &cursors, &status),
+            Some(1_704_240_000)
+        );
+        // With no cursor entry the status time is the fallback.
+        assert_eq!(
+            source_last_sync("Drive", &HashMap::new(), &status),
+            Some(999)
+        );
+    }
+
     fn photo(name: &str) -> RemotePhoto {
         RemotePhoto {
             remote_id: format!("/photos/{name}"),
@@ -943,6 +1120,131 @@ mod tests {
 
         let tmp = dir.path().join(".sync-tmp");
         assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+    }
+
+    /// Create `count` placeholder photos plus an index that references them.
+    fn create_index_with_photos(dir: &Path, count: usize) -> Vec<PathBuf> {
+        use std::io::Write;
+
+        let mut paths = Vec::new();
+        for i in 0..count {
+            let path = dir.join(format!("{i:05}_photo.jpg"));
+            std::fs::write(&path, b"photo").unwrap();
+            paths.push(path);
+        }
+
+        let meta = crate::index::IndexMetadata {
+            start_line: 0,
+            valid_count: count,
+        };
+        let mut file =
+            std::fs::File::create(dir.join(crate::index::build_index_filename(&meta))).unwrap();
+        for (i, path) in paths.iter().enumerate() {
+            writeln!(file, "{},photo{}.jpg,{}", path.display(), i, i + 1).unwrap();
+        }
+        file.flush().unwrap();
+
+        paths
+    }
+
+    /// Fails the first download with ENOSPC, then succeeds.
+    struct EnospcOnceSource {
+        failed_once: bool,
+    }
+
+    impl RemotePhotoSource for EnospcOnceSource {
+        fn connect(_config: &HashMap<String, String>) -> io::Result<Self> {
+            Ok(EnospcOnceSource { failed_once: false })
+        }
+
+        fn list_changes(
+            &mut self,
+            _cursor: Option<&str>,
+        ) -> io::Result<(Vec<RemotePhoto>, String)> {
+            Ok((Vec::new(), "1".to_string()))
+        }
+
+        fn download(&mut self, _remote_id: &str, dest: &Path) -> io::Result<()> {
+            if !self.failed_once {
+                self.failed_once = true;
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            std::fs::write(dest, b"fake image bytes")
+        }
+    }
+
+    /// Always fails downloads with ENOSPC.
+    struct AlwaysEnospcSource;
+
+    impl RemotePhotoSource for AlwaysEnospcSource {
+        fn connect(_config: &HashMap<String, String>) -> io::Result<Self> {
+            Ok(AlwaysEnospcSource)
+        }
+
+        fn list_changes(
+            &mut self,
+            _cursor: Option<&str>,
+        ) -> io::Result<(Vec<RemotePhoto>, String)> {
+            Ok((Vec::new(), "1".to_string()))
+        }
+
+        fn download(&mut self, _remote_id: &str, _dest: &Path) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+    }
+
+    #[test]
+    fn test_download_enospc_rotates_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.batch_delete_size = 2;
+        let photos = create_index_with_photos(dir.path(), 3);
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = EnospcOnceSource { failed_once: false };
+
+        download_and_import(&mut source, &[photo("new.jpg")], &config, &dedup_set).unwrap();
+
+        assert!(!photos[0].exists(), "oldest photo should be deleted");
+        assert!(!photos[1].exists(), "second oldest photo should be deleted");
+        assert!(photos[2].exists(), "newest photo should be kept");
+        let (_path, meta) = crate::index::init_index(dir.path()).unwrap();
+        assert_eq!(meta.valid_count, 1, "only the newest photo remains");
+    }
+
+    #[test]
+    fn test_download_enospc_errors_when_no_photos_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        crate::index::init_index(dir.path()).unwrap();
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = AlwaysEnospcSource;
+
+        let err = download_and_import(&mut source, &[photo("a.jpg")], &config, &dedup_set)
+            .expect_err("an unfixable ENOSPC must be reported");
+        assert!(err.to_string().contains("download(s) failed"), "{err}");
+    }
+
+    #[test]
+    fn test_download_non_enospc_error_does_not_rotate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let photos = create_index_with_photos(dir.path(), 2);
+        let dedup_set = Arc::new(Mutex::new(HashSet::new()));
+        let mut source = FakeSource {
+            fail_downloads: true,
+            list: Vec::new(),
+        };
+
+        let err = download_and_import(&mut source, &[photo("a.jpg")], &config, &dedup_set)
+            .expect_err("a non-ENOSPC failure must be reported");
+        assert!(
+            err.to_string().contains("simulated download failure"),
+            "the original error must be preserved: {err}"
+        );
+        assert!(
+            photos.iter().all(|p| p.exists()),
+            "non-ENOSPC errors must not trigger rotation"
+        );
     }
 
     #[test]

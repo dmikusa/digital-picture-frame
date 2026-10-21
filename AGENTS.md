@@ -9,8 +9,8 @@ A Rust manager + C display app for a Pi Zero W2. The Rust app streams photo path
 ```
 src/
   main.rs          - CLI, signal handling, worker thread spawn, PID lock
-  config.rs        - TOML parsing (manager settings only, no display settings)
-  display.rs       - Unix socket client. Blocking write, 30s timeout, no PING
+  config.rs        - TOML parsing (manager settings only, no display settings) and atomic save
+  display.rs       - Unix socket client. Resumable writes, 30s timeout, no PING
   app.rs           - Display loop: stream CSV, send IMG, watch index
   control.rs       - Control socket client (CLR/SHOW/RESUME)
   config_mode.rs   - Config-mode state machine, QR screens, staged config saves
@@ -22,8 +22,8 @@ src/
     mod.rs         - Re-exports USB + remote import APIs
     usb.rs         - /media watcher, photo scan, ImageMagick, import lock
     remote.rs      - Sync scheduler, cursor/status files, download pipeline
-    dropbox.rs     - Dropbox source
-    gdrive.rs      - Google Drive source (API key, OAuth, service account)
+    dropbox.rs     - Dropbox source (static token or refresh-token auth)
+    gdrive.rs      - Google Drive source (API key, OAuth, service account, Changes API)
     http.rs        - Shared blocking HTTP client, retries, streaming downloads
 c/
   photo-frame-display.c - DRM/GBM/EGL display server (env vars for fade/skip)

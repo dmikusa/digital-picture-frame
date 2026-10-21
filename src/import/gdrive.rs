@@ -34,10 +34,22 @@ const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 /// Ask for the page token alongside the file fields; without it the caller
 /// cannot tell that more pages exist.
 const FIELDS: &str = "nextPageToken,files(id,name,size,mimeType,modifiedTime)";
+/// Fields for a `changes/list` call. `newStartPageToken` is only present on the
+/// last page; `fileId`/`removed` let us skip deletions, and `parents` lets us
+/// keep only changes inside the configured folder.
+const CHANGES_FIELDS: &str = "nextPageToken,newStartPageToken,\
+changes(fileId,removed,file(id,name,size,mimeType,modifiedTime,parents))";
 const PAGE_SIZE: usize = 1_000;
 /// Safety valve: the server controls `nextPageToken`, so cap the number of
 /// pages one sync check will follow.
 const MAX_PAGES: usize = 1_000;
+/// New cursors are page tokens from the Drive Changes API. The prefix keeps
+/// them distinct from the legacy numeric (Unix seconds) cursors.
+const GDRIVE_CURSOR_PREFIX: &str = "gdrive:";
+/// API-key sources cannot call the Changes API, so they keep the timestamp
+/// listing. Re-list a short window before the cursor so a file modified in the
+/// same second as the cursor is not skipped; duplicates are deduplicated.
+const API_KEY_OVERLAP_SECS: u64 = 2;
 /// Service-account assertions are valid for an hour; refresh a little early so
 /// a token cannot expire in flight.
 const ASSERTION_LIFETIME_SECS: u64 = 3_600;
@@ -196,6 +208,22 @@ impl GoogleDriveSource {
         }
     }
 
+    /// Bearer-auth constructor with an injectable API root, used by unit tests
+    /// that exercise the Changes API without a token exchange.
+    #[cfg(test)]
+    pub(crate) fn with_access_token(
+        access_token: String,
+        folder_id: String,
+        api_base: String,
+    ) -> Self {
+        GoogleDriveSource {
+            client: http::build_client().expect("test HTTP client"),
+            auth: AuthMode::Bearer(BearerAuth::RefreshToken { access_token }),
+            folder_id,
+            api_base,
+        }
+    }
+
     /// Resolve credentials from source params and open the API root. Tests use
     /// this with a mock root so the whole connect path is exercised.
     pub(crate) fn connect_to(config: &HashMap<String, String>, api_base: &str) -> io::Result<Self> {
@@ -317,35 +345,26 @@ impl GoogleDriveSource {
             AuthMode::Bearer(BearerAuth::ServiceAccount { .. })
         )
     }
-}
 
-#[derive(Deserialize)]
-struct FileList {
-    #[serde(rename = "nextPageToken")]
-    next_page_token: Option<String>,
-    #[serde(default)]
-    files: Vec<DriveFile>,
-}
-
-#[derive(Deserialize)]
-struct DriveFile {
-    id: String,
-    name: String,
-    size: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "mimeType")]
-    mime_type: Option<String>,
-    #[serde(rename = "modifiedTime")]
-    modified_time: Option<String>,
-}
-
-impl RemotePhotoSource for GoogleDriveSource {
-    fn connect(config: &HashMap<String, String>) -> io::Result<Self> {
-        Self::connect_to(config, API_BASE)
+    /// API keys can list and download public files, but the Changes API needs
+    /// user or service-account auth, so an API-key source stays on the
+    /// timestamp listing.
+    fn uses_api_key(&self) -> bool {
+        matches!(&self.auth, AuthMode::ApiKey(_))
     }
 
-    fn list_changes(&mut self, cursor: Option<&str>) -> io::Result<(Vec<RemotePhoto>, String)> {
-        let last_sync = cursor.and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
+    /// List the image files in the configured folder, newest first.
+    ///
+    /// `last_sync` is the timestamp cursor to resume from and `overlap` re-lists
+    /// a short window before it. Returns the photos and the newest modification
+    /// time seen, which is never older than `last_sync`, so the cursor cannot
+    /// move backwards.
+    fn list_folder_photos(
+        &mut self,
+        last_sync: u64,
+        overlap: u64,
+    ) -> io::Result<(Vec<RemotePhoto>, u64)> {
+        let threshold = last_sync.saturating_sub(overlap);
 
         let query = format!(
             "'{}' in parents and mimeType contains 'image/' and trashed = false",
@@ -389,11 +408,214 @@ impl RemotePhotoSource for GoogleDriveSource {
             }
 
             let result: FileList = resp.json().map_err(io::Error::other)?;
-            collect_photos(&result.files, last_sync, &mut latest, &mut photos);
+            collect_photos(&result.files, threshold, &mut latest, &mut photos);
 
             match result.next_page_token {
                 Some(token) if !token.is_empty() => page_token = Some(token),
-                _ => return Ok((photos, latest.to_string())),
+                _ => break,
+            }
+        }
+
+        Ok((photos, latest))
+    }
+
+    /// Ask Drive for a token representing "now". Every change after this token
+    /// is returned by `changes/list`.
+    fn start_page_token(&mut self) -> io::Result<String> {
+        let url = format!(
+            "{}/changes/startPageToken?{}",
+            self.api_base,
+            self.auth_param()
+        );
+        let resp = self.make_get(&url)?;
+
+        if !resp.status().is_success() {
+            return Err(drive_status_error(
+                "Google Drive startPageToken request failed",
+                resp.status(),
+            ));
+        }
+
+        let token: StartPageToken = resp.json().map_err(io::Error::other)?;
+        token
+            .start_page_token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| io::Error::other("Google Drive startPageToken response had no token"))
+    }
+
+    /// Fetch changes since `page_token`, following `nextPageToken` until the
+    /// final page supplies `newStartPageToken`. Returns the photos and the new
+    /// start token.
+    fn list_native_changes(&mut self, page_token: &str) -> io::Result<(Vec<RemotePhoto>, String)> {
+        let mut photos = Vec::new();
+        let mut new_start_token: Option<String> = None;
+        let mut next_token: Option<String> = Some(page_token.to_string());
+
+        let mut pages = 0usize;
+        while let Some(token) = next_token.take() {
+            pages += 1;
+            if pages > MAX_PAGES {
+                return Err(io::Error::other(format!(
+                    "Google Drive changes listing exceeded {MAX_PAGES} pages"
+                )));
+            }
+
+            let url = format!(
+                "{}/changes?pageToken={}&pageSize={}&fields={}&{}",
+                self.api_base,
+                urlencoding(&token),
+                PAGE_SIZE,
+                CHANGES_FIELDS,
+                self.auth_param()
+            );
+            let resp = self.make_get(&url)?;
+
+            if !resp.status().is_success() {
+                return Err(drive_status_error(
+                    "Google Drive changes list failed",
+                    resp.status(),
+                ));
+            }
+
+            let result: ChangesList = resp.json().map_err(io::Error::other)?;
+            collect_changes(&result.changes, &self.folder_id, &mut photos);
+
+            if let Some(token) = result
+                .new_start_page_token
+                .filter(|token| !token.is_empty())
+            {
+                new_start_token = Some(token);
+            }
+            next_token = result.next_page_token.filter(|token| !token.is_empty());
+        }
+
+        let new_start_token = new_start_token.ok_or_else(|| {
+            io::Error::other("Google Drive changes listing ended without a newStartPageToken")
+        })?;
+        Ok((photos, new_start_token))
+    }
+}
+
+#[derive(Deserialize)]
+struct FileList {
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(default)]
+    files: Vec<DriveFile>,
+}
+
+#[derive(Deserialize)]
+struct DriveFile {
+    id: String,
+    name: String,
+    size: Option<String>,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+    #[serde(rename = "modifiedTime")]
+    modified_time: Option<String>,
+    /// Only requested for `changes/list`; the folder listing omits it. Used to
+    /// keep only changes inside the configured folder.
+    #[serde(default)]
+    parents: Option<Vec<String>>,
+}
+
+/// `changes/startPageToken` response.
+#[derive(Deserialize)]
+struct StartPageToken {
+    #[serde(rename = "startPageToken")]
+    start_page_token: Option<String>,
+}
+
+/// `changes/list` response. `newStartPageToken` is only present on the last
+/// page of a result set.
+#[derive(Deserialize)]
+struct ChangesList {
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(rename = "newStartPageToken")]
+    new_start_page_token: Option<String>,
+    #[serde(default)]
+    changes: Vec<DriveChange>,
+}
+
+/// One entry from `changes/list`. `file` is absent when `removed` is true.
+#[derive(Deserialize)]
+struct DriveChange {
+    #[serde(rename = "fileId")]
+    file_id: String,
+    #[serde(default)]
+    removed: bool,
+    file: Option<DriveFile>,
+}
+
+impl RemotePhotoSource for GoogleDriveSource {
+    fn connect(config: &HashMap<String, String>) -> io::Result<Self> {
+        Self::connect_to(config, API_BASE)
+    }
+
+    fn list_changes(&mut self, cursor: Option<&str>) -> io::Result<(Vec<RemotePhoto>, String)> {
+        // API keys cannot call the Changes API, so keep the timestamp listing.
+        // The overlap covers files modified in the same second as the cursor.
+        if self.uses_api_key() {
+            let last_sync = cursor.and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
+            let (photos, latest) = self.list_folder_photos(last_sync, API_KEY_OVERLAP_SECS)?;
+            return Ok((photos, latest.to_string()));
+        }
+
+        match cursor {
+            Some(cursor) if cursor.starts_with(GDRIVE_CURSOR_PREFIX) => {
+                let token = &cursor[GDRIVE_CURSOR_PREFIX.len()..];
+                match self.list_native_changes(token) {
+                    Ok((photos, new_token)) => Ok((photos, gdrive_cursor(&new_token))),
+                    Err(e) if changes_unsupported(&e) => {
+                        // Permission or unsupported: fall back to a folder
+                        // listing. A page token carries no timestamp, so
+                        // re-list the whole folder (duplicates are skipped
+                        // downstream) and try to re-baseline on a fresh start
+                        // token. If even that is unavailable, keep the old
+                        // cursor so no change is ever silently dropped.
+                        log::warn!(
+                            "Google Drive Changes API unavailable ({e}); \
+                             falling back to a folder listing"
+                        );
+                        let (photos, _latest) = self.list_folder_photos(0, 0)?;
+                        match self.start_page_token() {
+                            Ok(token) => Ok((photos, gdrive_cursor(&token))),
+                            Err(e) => {
+                                log::warn!(
+                                    "Google Drive startPageToken unavailable ({e}); \
+                                     keeping the previous cursor"
+                                );
+                                Ok((photos, cursor.to_string()))
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            other => {
+                // First sync, or a legacy numeric cursor. Take the start token
+                // *before* listing so a file added while the folder is being
+                // paginated is still returned by the Changes API. Listing it
+                // again is harmless because duplicates are dropped downstream.
+                let last_sync = other.and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
+                match self.start_page_token() {
+                    Ok(token) => {
+                        let (photos, _latest) = self.list_folder_photos(last_sync, 0)?;
+                        Ok((photos, gdrive_cursor(&token)))
+                    }
+                    Err(e) => {
+                        // The Changes API is not available. Fall back to the
+                        // old timestamp listing and cursor so the photos still
+                        // import; the next sync retries the start token.
+                        log::warn!(
+                            "Google Drive startPageToken unavailable ({e}); \
+                             falling back to the timestamp cursor"
+                        );
+                        let (photos, latest) = self.list_folder_photos(last_sync, 0)?;
+                        Ok((photos, latest.to_string()))
+                    }
+                }
             }
         }
     }
@@ -431,7 +653,7 @@ fn send_request(request: RequestBuilder) -> io::Result<reqwest::blocking::Respon
 
 fn collect_photos(
     files: &[DriveFile],
-    last_sync: u64,
+    threshold: u64,
     latest: &mut u64,
     photos: &mut Vec<RemotePhoto>,
 ) {
@@ -441,7 +663,7 @@ fn collect_photos(
             .as_deref()
             .and_then(crate::import::remote::parse_iso8601)
             .unwrap_or(0);
-        if modified <= last_sync {
+        if modified <= threshold {
             continue;
         }
         if modified > *latest {
@@ -456,6 +678,64 @@ fn collect_photos(
             size_bytes,
         });
     }
+}
+
+/// Keep changes that add or modify an image inside the configured folder.
+/// Deletions and moves out of the folder are dropped, as are non-image files.
+fn collect_changes(changes: &[DriveChange], folder_id: &str, photos: &mut Vec<RemotePhoto>) {
+    for change in changes {
+        if change.removed {
+            continue;
+        }
+        let Some(file) = &change.file else {
+            continue;
+        };
+        let is_image = file
+            .mime_type
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/"));
+        if !is_image {
+            continue;
+        }
+        let in_folder = file
+            .parents
+            .as_deref()
+            .is_some_and(|parents| parents.iter().any(|parent| parent == folder_id));
+        if !in_folder {
+            continue;
+        }
+
+        photos.push(RemotePhoto {
+            remote_id: change.file_id.clone(),
+            filename: file.name.clone(),
+            size_bytes: file.size.as_deref().and_then(|s| s.parse::<u64>().ok()),
+        });
+    }
+}
+
+/// Prefix a Drive changes page token as a cursor.
+fn gdrive_cursor(token: &str) -> String {
+    format!("{GDRIVE_CURSOR_PREFIX}{token}")
+}
+
+/// Build an error whose kind marks a Changes API permission or availability
+/// failure, which `list_changes` turns into a safe timestamp-listing fallback.
+fn drive_status_error(context: &str, status: reqwest::StatusCode) -> io::Error {
+    let kind = match status.as_u16() {
+        403 => io::ErrorKind::PermissionDenied,
+        404 | 405 | 501 => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("{context}: {status}"))
+}
+
+/// True when a Changes API error means "this account cannot use the Changes
+/// API" rather than a transient failure worth retrying.
+fn changes_unsupported(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+    )
 }
 
 /// Percent-encode a string for use in a URL query parameter.
@@ -533,6 +813,16 @@ mod tests {
     fn test_source(server: &TestServer) -> GoogleDriveSource {
         GoogleDriveSource::with_api_key(
             "test-key".to_string(),
+            "folder-1".to_string(),
+            server.base_url.clone(),
+        )
+    }
+
+    /// A bearer-auth source so the Changes API path is exercised without a
+    /// token exchange.
+    fn test_bearer_source(server: &TestServer) -> GoogleDriveSource {
+        GoogleDriveSource::with_access_token(
+            "test-token".to_string(),
             "folder-1".to_string(),
             server.base_url.clone(),
         )
@@ -617,6 +907,8 @@ mod tests {
                 TestReply::json(r#"{"access_token":"sa-token","expires_in":3600}"#)
             } else if req.url.contains("alt=media") {
                 TestReply::new(200, b"photo-bytes".to_vec())
+            } else if req.url.contains("/changes/startPageToken") {
+                TestReply::json(r#"{"startPageToken":"start-token"}"#)
             } else {
                 TestReply::json(r#"{"files":[]}"#)
             }
@@ -632,8 +924,9 @@ mod tests {
 
         let mut source = GoogleDriveSource::connect_to(&config, &server.base_url)
             .expect("connect with service account");
-        let (photos, _cursor) = source.list_changes(None).unwrap();
+        let (photos, cursor) = source.list_changes(None).unwrap();
         assert!(photos.is_empty());
+        assert_eq!(cursor, "gdrive:start-token");
 
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("photo.jpg");
@@ -641,7 +934,12 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"photo-bytes");
 
         let requests = server.requests();
-        assert_eq!(requests.len(), 4, "one token request plus three API calls");
+        assert_eq!(
+            requests.len(),
+            5,
+            "one token request, a folder validation, the listing, a start \
+             token, and the download"
+        );
 
         let token_request = &requests[0];
         assert_eq!(token_request.method, "POST");
@@ -687,6 +985,8 @@ mod tests {
         let server = TestServer::start(|req, _idx| {
             if req.method == "POST" {
                 TestReply::json(r#"{"access_token":"short-token","expires_in":1}"#)
+            } else if req.url.contains("/changes/startPageToken") {
+                TestReply::json(r#"{"startPageToken":"tok"}"#)
             } else {
                 TestReply::json(r#"{"files":[]}"#)
             }
@@ -857,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_changes_skips_entries_at_or_before_cursor() {
+    fn test_api_key_listing_overlaps_cursor_to_avoid_missing_same_second_files() {
         let server = TestServer::start(|_req, _idx| {
             TestReply::json(format!(
                 r#"{{"files":[{},{}]}}"#,
@@ -870,7 +1170,294 @@ mod tests {
         let (photos, cursor) = source
             .list_changes(Some("1704240000")) // 2024-01-03T00:00:00Z
             .unwrap();
-        assert!(photos.is_empty(), "entries at the cursor must be skipped");
+
+        // A file exactly at the cursor is re-listed (the dedup set drops it
+        // later) so a same-second edit is not missed. Older files are skipped
+        // and the cursor never moves backwards.
+        let names: Vec<&str> = photos.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(names, vec!["new.jpg"]);
         assert_eq!(cursor, "1704240000");
+    }
+
+    #[test]
+    fn test_api_key_source_keeps_timestamp_listing_and_never_calls_changes() {
+        let server = TestServer::start(|req, _idx| {
+            assert!(
+                !req.url.contains("/changes"),
+                "API-key sources must not call the Changes API: {}",
+                req.url
+            );
+            TestReply::json(format!(
+                r#"{{"files":[{}]}}"#,
+                file("id-a", "a.jpg", "2024-01-02T00:00:00Z")
+            ))
+        });
+
+        let mut source = test_source(&server);
+        let (photos, cursor) = source.list_changes(None).unwrap();
+
+        assert_eq!(photos.len(), 1);
+        assert_eq!(cursor, "1704153600");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "only the folder listing is requested");
+        assert!(requests[0].url.contains("/files?"));
+        assert!(requests[0].url.contains("key=test-key"));
+    }
+
+    #[test]
+    fn test_first_sync_fetches_start_token_before_listing() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("/changes/startPageToken") {
+                TestReply::json(r#"{"startPageToken":"start-token-1"}"#)
+            } else if req.url.contains("/files?") {
+                TestReply::json(format!(
+                    r#"{{"files":[{}]}}"#,
+                    file("id-a", "a.jpg", "2024-01-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_bearer_source(&server);
+        let (photos, cursor) = source.list_changes(None).unwrap();
+
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].filename, "a.jpg");
+        assert_eq!(cursor, "gdrive:start-token-1");
+
+        // The token is taken first so a file added during the listing is still
+        // returned by the Changes API.
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "a token, then the folder listing");
+        assert!(requests[0].url.contains("/changes/startPageToken"));
+        assert!(requests[1].url.contains("/files?"));
+        assert!(requests.iter().all(|r| !r.url.contains("key=")));
+    }
+
+    #[test]
+    fn test_first_sync_falls_back_to_timestamp_cursor_when_start_token_fails() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("/changes/startPageToken") {
+                TestReply::status(403)
+            } else if req.url.contains("/files?") {
+                TestReply::json(format!(
+                    r#"{{"files":[{}]}}"#,
+                    file("id-a", "a.jpg", "2024-01-02T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_bearer_source(&server);
+        let (photos, cursor) = source.list_changes(None).unwrap();
+
+        assert_eq!(photos.len(), 1, "photos still import on the fallback");
+        assert_eq!(cursor, "1704153600", "the timestamp cursor is kept");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.contains("/changes/startPageToken"));
+        assert!(requests[1].url.contains("/files?"));
+    }
+
+    #[test]
+    fn test_legacy_cursor_falls_back_to_timestamp_cursor_when_start_token_fails() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("/changes/startPageToken") {
+                // A non-permission failure also falls back rather than
+                // pinning the sync.
+                TestReply::status(400)
+            } else if req.url.contains("/files?") {
+                TestReply::json(format!(
+                    r#"{{"files":[{},{}]}}"#,
+                    file("old", "old.jpg", "2024-01-01T00:00:00Z"),
+                    file("new", "new.jpg", "2024-01-03T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_bearer_source(&server);
+        let (photos, cursor) = source
+            .list_changes(Some("1704153600")) // 2024-01-02T00:00:00Z
+            .unwrap();
+
+        let names: Vec<&str> = photos.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(names, vec!["new.jpg"]);
+        assert_eq!(cursor, "1704240000");
+    }
+
+    #[test]
+    fn test_legacy_numeric_cursor_does_catch_up_and_returns_gdrive_cursor() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("/changes/startPageToken") {
+                TestReply::json(r#"{"startPageToken":"fresh-token"}"#)
+            } else if req.url.contains("/files?") {
+                TestReply::json(format!(
+                    r#"{{"files":[{},{}]}}"#,
+                    file("old", "old.jpg", "2024-01-01T00:00:00Z"),
+                    file("new", "new.jpg", "2024-01-03T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_bearer_source(&server);
+        let (photos, cursor) = source
+            .list_changes(Some("1704153600")) // 2024-01-02T00:00:00Z
+            .unwrap();
+
+        let names: Vec<&str> = photos.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(names, vec!["new.jpg"], "only files after the timestamp");
+        assert_eq!(cursor, "gdrive:fresh-token");
+    }
+
+    #[test]
+    fn test_gdrive_cursor_filters_changes_and_follows_pagination() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("pageToken=page-2") {
+                TestReply::json(
+                    serde_json::json!({
+                        "changes": [
+                            {"fileId":"in-2","removed":false,"file":{
+                                "id":"in-2","name":"b.jpg","size":"2","mimeType":"image/png",
+                                "modifiedTime":"2024-01-02T00:00:00Z","parents":["folder-1"]
+                            }},
+                        ],
+                        "newStartPageToken": "new-token",
+                    })
+                    .to_string(),
+                )
+            } else if req.url.contains("/changes?pageToken=page-1") {
+                TestReply::json(
+                    serde_json::json!({
+                        "changes": [
+                            // Kept: an image inside the folder.
+                            {"fileId":"in-1","removed":false,"file":{
+                                "id":"in-1","name":"a.jpg","size":"1","mimeType":"image/jpeg",
+                                "modifiedTime":"2024-01-01T00:00:00Z","parents":["folder-1"]
+                            }},
+                            // Dropped: a deletion.
+                            {"fileId":"gone","removed":true},
+                            // Dropped: not an image.
+                            {"fileId":"doc","removed":false,"file":{
+                                "id":"doc","name":"notes.txt","size":"3","mimeType":"text/plain",
+                                "modifiedTime":"2024-01-01T00:00:00Z","parents":["folder-1"]
+                            }},
+                            // Dropped: an image in another folder.
+                            {"fileId":"other","removed":false,"file":{
+                                "id":"other","name":"c.jpg","size":"4","mimeType":"image/jpeg",
+                                "modifiedTime":"2024-01-01T00:00:00Z","parents":["other-folder"]
+                            }},
+                            // Dropped: no parents reported.
+                            {"fileId":"noparents","removed":false,"file":{
+                                "id":"noparents","name":"d.jpg","size":"5","mimeType":"image/jpeg",
+                                "modifiedTime":"2024-01-01T00:00:00Z"
+                            }},
+                        ],
+                        "nextPageToken": "page-2",
+                    })
+                    .to_string(),
+                )
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_bearer_source(&server);
+        let (photos, cursor) = source.list_changes(Some("gdrive:page-1")).unwrap();
+
+        let names: Vec<&str> = photos.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(names, vec!["a.jpg", "b.jpg"]);
+        assert_eq!(cursor, "gdrive:new-token");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "both pages of changes are fetched");
+        assert!(requests[0].url.contains("/changes?pageToken=page-1"));
+        assert!(requests[0].url.contains("newStartPageToken"));
+        assert!(requests[0].url.contains("changes(fileId,removed,file("));
+        assert!(requests[1].url.contains("pageToken=page-2"));
+        assert!(
+            requests.iter().all(|r| !r.url.contains("/files?")),
+            "a native cursor must not re-list the folder"
+        );
+        for request in &requests {
+            assert_eq!(request.header("Authorization"), Some("Bearer test-token"));
+            assert!(!request.url.contains("key="));
+        }
+    }
+
+    #[test]
+    fn test_changes_permission_error_falls_back_and_keeps_cursor() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("/changes") {
+                TestReply::status(403)
+            } else if req.url.contains("/files?") {
+                TestReply::json(format!(
+                    r#"{{"files":[{}]}}"#,
+                    file("id-a", "a.jpg", "2024-01-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_bearer_source(&server);
+        let (photos, cursor) = source.list_changes(Some("gdrive:stale-token")).unwrap();
+
+        assert_eq!(photos.len(), 1, "the fallback still imports the folder");
+        assert_eq!(
+            cursor, "gdrive:stale-token",
+            "an unusable Changes API keeps the old cursor so nothing is skipped"
+        );
+    }
+
+    #[test]
+    fn test_changes_permission_error_rebaselines_when_start_token_available() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.contains("/changes?") {
+                TestReply::status(403)
+            } else if req.url.contains("/changes/startPageToken") {
+                TestReply::json(r#"{"startPageToken":"fresh-baseline"}"#)
+            } else if req.url.contains("/files?") {
+                TestReply::json(format!(
+                    r#"{{"files":[{}]}}"#,
+                    file("id-a", "a.jpg", "2024-01-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_bearer_source(&server);
+        let (photos, cursor) = source.list_changes(Some("gdrive:stale-token")).unwrap();
+
+        assert_eq!(photos.len(), 1);
+        assert_eq!(cursor, "gdrive:fresh-baseline");
+    }
+
+    #[test]
+    fn test_drive_status_error_marks_permission_and_unsupported() {
+        assert!(changes_unsupported(&drive_status_error(
+            "changes",
+            reqwest::StatusCode::FORBIDDEN
+        )));
+        assert!(changes_unsupported(&drive_status_error(
+            "changes",
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(changes_unsupported(&drive_status_error(
+            "changes",
+            reqwest::StatusCode::NOT_IMPLEMENTED
+        )));
+        assert!(!changes_unsupported(&drive_status_error(
+            "changes",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        )));
     }
 }

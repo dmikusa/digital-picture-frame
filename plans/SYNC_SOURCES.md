@@ -178,16 +178,20 @@ CONFIG_MODE ──user finishes (POST /finish)──▶ validate, save, resume s
 - On `POST /finish`:
   - Validate staged sources:
     - every name is non-empty and unique;
-    - Dropbox requires `access_token`;
+    - Dropbox requires exactly one method: `access_token`, or a complete
+      `refresh_token` + `app_key` + `app_secret` set;
     - Google Drive requires `folder_id` plus exactly one of: `api_key`, a
       complete `refresh_token` + `client_id` + `client_secret` set, or a
       `service_account_json` key containing `client_email` and `private_key`;
-    - malformed service-account JSON and mixed auth methods are rejected;
+    - malformed service-account JSON, mixed auth methods, and partial
+      credential sets are rejected;
     - `check_interval_seconds` must be greater than 0.
   - Return an HTML error page for browser/form clients and a JSON error object
-    for API clients. A validation failure keeps the server running.
+    for API clients. A validation failure (400) keeps the server running.
   - Atomically write to the real `config.toml`: write to `config.toml.tmp`,
-    then `fs::rename()`.
+    then `fs::rename()`. A write failure returns 500 and also keeps the server
+    running, with `finished` unset, so the user can retry. Config mode must not
+    write the file a second time when it leaves.
   - Update the in-memory config so a later config-mode session sees the new
     sources.
 - The scheduler hot-reloads `config.toml`, so sources added, edited, or removed
@@ -249,10 +253,17 @@ pub struct RemotePhoto {
   4. After all sources checked, sleep until next due or shutdown signal.
 - Startup sync: if any source has never synced, triggers a first sync. Shows
   status screen if no photos exist yet (see Task 3.3).
+- `sync-status.json` is loaded at startup, so a source's last successful sync
+  time survives a restart. This matters for opaque provider cursors
+  (`dbx:`/`gdrive:`), which carry no timestamp: the status file is the only
+  record of when the source last synced and is the scheduling fallback.
+- A remote download that fails with `ENOSPC` rotates the oldest photos (under
+  the import lock) and retries; if rotation frees nothing, the sync fails.
 - Cursor file format:
   ```json
-  {"My Dropbox": "2024-01-15T12:00:00Z", "Drive": "cursor_abc123"}
+  {"My Dropbox": "dbx:cursor_abc123", "Drive": "gdrive:page_token"}
   ```
+  Legacy numeric Unix-second values still parse.
 - Dependency: `serde_json` (add to `Cargo.toml`).
 
 ### Task 4.4: Config Schema
@@ -260,9 +271,18 @@ pub struct RemotePhoto {
 [[remote_sources]]
 type = "dropbox"
 name = "My Dropbox"
-access_token = "sl.xxxx"
+access_token = "sl.xxxx"      # or refresh_token + app_key + app_secret
 folder = "/Photos"
 check_interval_seconds = 86400
+
+# Dropbox with a refresh token (tokens expire after a few hours):
+# [[remote_sources]]
+# type = "dropbox"
+# name = "My Dropbox"
+# refresh_token = "xxxx"
+# app_key = "xxxx"
+# app_secret = "xxxx"
+# folder = "/Photos"
 
 [[remote_sources]]
 type = "google_drive"
@@ -288,22 +308,32 @@ check_interval_seconds = 86400
 
 ### Task 5.1: Implementation
 - New `src/import/dropbox.rs` implementing `RemotePhotoSource`.
-- Uses raw HTTP via `reqwest` (blocking client). No `dropbox-sdk` crate —
-  only 2 endpoints needed:
-  - `POST https://api.dropboxapi.com/2/files/list_folder` with
-    `Dropbox-API-Arg` header for pagination.
+- Uses raw HTTP via `reqwest` (blocking client). No `dropbox-sdk` crate — only
+  a few endpoints needed:
+  - `POST https://api.dropboxapi.com/2/files/list_folder` and
+    `.../files/list_folder/continue` for listing and pagination.
   - `POST https://content.dropboxapi.com/2/files/download` with
     `Dropbox-API-Arg` header.
-- `connect()`: validates the access token by calling `list_folder` with
-  `limit=1`.
+  - `POST https://api.dropboxapi.com/oauth2/token` for refresh-token auth.
+- Authentication: exactly one of a static `access_token`, or
+  `refresh_token` + `app_key` + `app_secret`. The refresh token is exchanged
+  with `grant_type=refresh_token`; the access token is cached and refreshed
+  60 seconds before expiry.
+- `connect()`: resolves credentials and validates them with
+  `users/get_current_account`. For refresh-token auth this fetches the first
+  token, so a bad refresh token fails immediately.
 - `list_changes()`:
-  - First call: `list_folder` with `recursive=true`.
-  - Subsequent: uses `list_folder/continue` with cursor from prior call.
-  - Compares `server_modified` against last sync timestamp to detect new files.
-  - Returns `RemotePhoto`s + cursor (ISO 8601 of latest `server_modified`).
+  - A stored `dbx:<cursor>` continues with `files/list_folder/continue`.
+  - No cursor, or a legacy numeric cursor, does a full `list_folder` with
+    `recursive=true` to catch up.
+  - A cursor the provider rejects falls back to a full listing.
+  - Follows `has_more` with `list_folder/continue` (capped at 1000 pages) and
+    returns the final provider cursor as `dbx:<cursor>`.
 - `download()`: calls `files/download`, streams response body to file.
-- Config fields: `access_token`, `folder`.
-- Unit tests: mock the HTTP layer, verify list/download behavior.
+- Config fields: `access_token` (or `refresh_token`/`app_key`/`app_secret`),
+  `folder`.
+- Unit tests: mock the HTTP layer, verify list/download behavior, token refresh,
+  and cursor continuation/fallback.
 
 ---
 
@@ -315,9 +345,21 @@ check_interval_seconds = 86400
   `?key=<api_key>` query parameter — no OAuth required.
 - `connect()`: validates the API key and folder by listing files with `limit=1`.
 - `list_changes()`:
-  - Lists files with `q='<folder_id>'+in+parents+and+mimeType+contains+'image/'`.
-  - Uses `modifiedTime` for filtering. Cursor is ISO 8601 of latest.
-  - Pagination via `pageToken`.
+  - **API-key sources** list files with
+    `q='<folder_id>'+in+parents+and+mimeType+contains+'image/'`, filter on
+    `modifiedTime`, and keep a numeric timestamp cursor. They re-list a
+    2-second window before the cursor so a same-second edit is not missed.
+  - **Bearer-auth sources** (service account or OAuth refresh token) use the
+    Drive Changes API with a `gdrive:<pageToken>` cursor:
+    - first sync, or a legacy cursor: fetch `changes/startPageToken` *before*
+      the folder listing so a file added during pagination is not lost, then
+      return the start token (falling back to the timestamp cursor if it
+      fails);
+    - later syncs: `changes/list`, following `nextPageToken`, keeping only
+      added/changed images still inside the folder and returning
+      `newStartPageToken`;
+    - a permission or unsupported Changes error falls back to a full folder
+      listing.
 - `download()`: `GET https://www.googleapis.com/drive/v3/files/<id>?alt=media`,
   streams to file.
 - Config fields: `api_key`, `folder_id`.
@@ -348,7 +390,9 @@ check_interval_seconds = 86400
 - Starts on a random port in range 8100–8199 during CONFIG_MODE state.
 - `AdminServer::new(password, staged_sources)` seeds staging from
   `config.remote_sources`; `.with_status_path(...)` points the status endpoint at
-  `<photos_dir>/sync-status.json`.
+  `<photos_dir>/sync-status.json`, and `.with_config_save(path, config)` makes
+  `POST /api/finish` write the staged sources to `config.toml` itself (merging
+  into `config`'s non-source settings).
 - The setup QR and primary URL use the detected LAN IP, so phones on the same
   network do not need mDNS. `photo-frame.local:<port>` is shown as an optional
   alternative.
@@ -363,12 +407,12 @@ check_interval_seconds = 86400
 
 | Route | Method | Auth | Description |
 |-------|--------|------|-------------|
-| `/api/sources` | GET | Yes | List all staged sources as JSON |
+| `/api/sources` | GET | Yes | List all staged sources as JSON, with sensitive parameter values redacted as `"***"` |
 | `/api/sources/dropbox` | POST | Yes | Save Dropbox config to staging. JSON request returns JSON; form request returns a 303 redirect. |
 | `/api/sources/google-drive` | POST | Yes | Save Google Drive config to staging. JSON request returns JSON; form request returns a 303 redirect. |
 | `/api/sources/<name>` | DELETE / POST | Yes | Remove a source from staging. DELETE returns JSON; form POST returns a 303 redirect. |
-| `/api/status` | GET | Yes | Staged sources plus the parsed contents of `<photos_dir>/sync-status.json` under `sync` (empty object if missing/unreadable). Returns JSON. |
-| `/api/finish` | POST | Yes | Validate staged config, write atomically, stop server. JSON request returns JSON; form request returns an HTML success page. Invalid sources return an HTML error page for browsers or a JSON error object for API clients (400). |
+| `/api/status` | GET | Yes | Staged sources (secrets redacted) plus the parsed contents of `<photos_dir>/sync-status.json` under `sync` (empty object if missing/unreadable). Returns JSON. |
+| `/api/finish` | POST | Yes | Validate staged config, write it atomically, stop server. JSON request returns JSON; form request returns an HTML success page. Invalid sources return an HTML error page for browsers or a JSON error object for API clients (400); a save failure returns 500 and leaves the server running so the user can retry. |
 
 ### Task 7.3: HTML Pages (Plain Forms)
 
@@ -406,7 +450,8 @@ Every HTML page shares the same structure:
 **Add a Dropbox source flow:**
 
 1. User navigates to `/sources/dropbox` → server returns menu bar + form HTML.
-2. User fills in access token, folder, interval.
+2. User fills in an access token (or refresh-token credentials), folder,
+   interval.
 3. User clicks "Save" → browser POSTs form data to `/api/sources/dropbox`.
 4. Server validates, saves to staging, responds `303` with `Location: /sources`.
 5. Browser loads `/sources`, which lists the staged sources. A "Finish" button

@@ -15,13 +15,12 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::admin_server::{AdminServer, AUTH_USERNAME};
-use crate::config::Config;
+use crate::config::{write_private_file, Config};
 use crate::control::ControlClient;
 use crate::import::MountEvent;
 use crate::qr;
 use std::collections::HashSet;
 use std::io;
-use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,60 +133,6 @@ fn photo_count(photos_dir: &Path) -> usize {
 /// Whether the index currently reports at least one photo.
 fn photos_available(photos_dir: &Path) -> bool {
     photo_count(photos_dir) > 0
-}
-
-/// Serialize `config` to TOML and atomically replace `path`.
-///
-/// The temporary file is created in the same directory so the final rename is
-/// atomic. It is created with mode 0600 (config may contain credentials) and
-/// removed if any step fails, leaving the original file untouched.
-pub(crate) fn save_config_atomic(path: &Path, config: &Config) -> io::Result<()> {
-    let toml_str = toml::to_string_pretty(config).map_err(io::Error::other)?;
-
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("config path has no file name: {}", path.display()),
-        )
-    })?;
-    let tmp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-
-    let result =
-        write_private_file(&tmp_path, &toml_str).and_then(|()| std::fs::rename(&tmp_path, path));
-
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-
-    result
-}
-
-/// Write `contents` to `path`, creating it with mode 0600.
-fn write_private_file(path: &Path, contents: &str) -> io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(path)?;
-
-    // Explicitly set the mode as well: the open mode is filtered through the
-    // process umask, and we always want private files to end up as 0600.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()
 }
 
 /// Human-readable contents of the setup-credentials fallback file.
@@ -315,7 +260,9 @@ impl ConfigEnvironment {
             .join(crate::admin_server::SYNC_STATUS_FILE);
 
         let server = Arc::new(
-            AdminServer::new(password.clone(), staged_sources)?.with_status_path(status_path),
+            AdminServer::new(password.clone(), staged_sources)?
+                .with_status_path(status_path)
+                .with_config_save(self.config_path.clone(), self.config.clone()),
         );
         let port = server.port();
 
@@ -490,8 +437,12 @@ impl ConfigEnvironment {
     }
 
     /// Leave config mode: stop the admin server and recover to the right
-    /// screen. If `save` is true, write the staged remote sources to
-    /// config.toml first.
+    /// screen.
+    ///
+    /// When `save` is true the admin server already wrote `config.toml` while
+    /// handling `POST /api/finish` — a failed write keeps the server running
+    /// and never sets `finished`, so it cannot reach here — so this only
+    /// mirrors the staged sources into the live config for the next session.
     fn leave_config_mode(&mut self, save: bool, fallback_ip: &str) {
         log::info!("Leaving config mode (save={save})");
 
@@ -500,9 +451,7 @@ impl ConfigEnvironment {
 
         if save {
             if let Some(sources) = staged {
-                if let Err(e) = self.save_staged_sources(sources) {
-                    log::error!("Failed to save config: {e}");
-                }
+                self.apply_staged_sources(sources);
             }
         }
 
@@ -528,17 +477,12 @@ impl ConfigEnvironment {
         }
     }
 
-    /// Persist `sources` and remember them so a later config session sees them.
-    fn save_staged_sources(
-        &mut self,
-        sources: Vec<crate::config::RemoteSourceConfig>,
-    ) -> io::Result<()> {
-        let mut config = self.config.clone();
-        config.remote_sources = sources;
-        save_config_atomic(&self.config_path, &config)?;
-        log::info!("Config saved to {}", self.config_path.display());
-        self.config = config;
-        Ok(())
+    /// Remember `sources` so a later config session stages them.
+    ///
+    /// The file itself is written by the admin server at Finish; config mode
+    /// must not write it a second time.
+    fn apply_staged_sources(&mut self, sources: Vec<crate::config::RemoteSourceConfig>) {
+        self.config.remote_sources = sources;
     }
 
     /// Send `RESUME` and report whether the display app accepted it.
@@ -914,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn saving_sources_updates_the_in_memory_config() {
+    fn applying_staged_sources_updates_the_in_memory_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let photos_dir = dir.path().join("photos");
@@ -930,99 +874,34 @@ mod tests {
             check_interval_seconds: 600,
         }];
 
-        env.save_staged_sources(staged).unwrap();
+        env.apply_staged_sources(staged);
 
-        // Both the file and the live config now see the new source, so a
-        // second config-mode session starts with it staged.
-        let loaded = Config::from_file(&path).unwrap();
-        assert_eq!(loaded.remote_sources.len(), 1);
-        assert_eq!(loaded.remote_sources[0].name, "Saved Dropbox");
+        // The live config now sees the new source, so a second config-mode
+        // session starts with it staged. Config mode does not write the file:
+        // the admin server already did that at Finish.
         assert_eq!(env.config.remote_sources.len(), 1);
         assert_eq!(env.config.remote_sources[0].name, "Saved Dropbox");
+        assert!(
+            !path.exists(),
+            "config mode must not write config.toml a second time"
+        );
     }
 
     #[test]
-    fn saving_an_empty_source_list_removes_all_sources() {
+    fn applying_an_empty_source_list_removes_all_sources() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
         let photos_dir = dir.path().join("photos");
         fs::create_dir(&photos_dir).unwrap();
         let config = sample_config(photos_dir);
-        let mut env =
-            ConfigEnvironment::new(config, &dir.path().join("control.sock"), path.clone());
-
-        env.save_staged_sources(Vec::new()).unwrap();
-
-        let loaded = Config::from_file(&path).unwrap();
-        assert!(loaded.remote_sources.is_empty());
-        assert!(env.config.remote_sources.is_empty());
-    }
-
-    #[test]
-    fn save_config_atomic_round_trips_and_sets_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let photos_dir = dir.path().join("photos");
-        fs::create_dir(&photos_dir).unwrap();
-        let config = sample_config(photos_dir);
-
-        save_config_atomic(&path, &config).unwrap();
-
-        let loaded = Config::from_file(&path).unwrap();
-        assert_eq!(loaded.photos_dir, config.photos_dir.canonicalize().unwrap());
-        assert_eq!(loaded.native_resolution, "1024x768");
-        assert_eq!(loaded.batch_delete_size, 10);
-        assert_eq!(loaded.remote_sources.len(), 1);
-        assert_eq!(loaded.remote_sources[0].source_type, "immich");
-        assert_eq!(loaded.remote_sources[0].name, "test-source");
-        assert_eq!(
-            loaded.remote_sources[0].params.get("url").unwrap(),
-            "https://example.test"
+        let mut env = ConfigEnvironment::new(
+            config,
+            &dir.path().join("control.sock"),
+            dir.path().join("config.toml"),
         );
 
-        #[cfg(unix)]
-        {
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        env.apply_staged_sources(Vec::new());
 
-        // The temporary file must not be left behind after a successful save.
-        let names: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert!(names
-            .iter()
-            .all(|name| !name.to_string_lossy().ends_with(".tmp")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn save_config_atomic_preserves_original_on_failure() {
-        // Root bypasses directory permissions, so this failure mode cannot be
-        // triggered when tests run as root (e.g. in some containers).
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "original config").unwrap();
-        let config = sample_config(dir.path().to_path_buf());
-
-        let mut perms = fs::metadata(dir.path()).unwrap().permissions();
-        perms.set_mode(0o500);
-        fs::set_permissions(dir.path(), perms).unwrap();
-
-        let result = save_config_atomic(&path, &config);
-
-        let mut perms = fs::metadata(dir.path()).unwrap().permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(dir.path(), perms).unwrap();
-
-        assert!(result.is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "original config");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(env.config.remote_sources.is_empty());
     }
 
     /// Build a config environment whose fallback file, screen file, and
