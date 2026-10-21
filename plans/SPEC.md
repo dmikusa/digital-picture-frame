@@ -161,8 +161,8 @@ events from the watcher thread. States:
 | `Normal` | Slideshow running. |
 | `FirstSync` | No photos yet; showing the first-sync screen and polling the index. |
 | `Importing { pending }` | One or more USB imports are running; showing "Importing photos...". |
-| `PendingConfigMode` | Config-mode entry failed (display app not ready); retrying every 2 seconds. |
-| `ConfigMode` | Setup QR on screen; admin HTTP server running. |
+| `PendingConfigMode` | Admin server could not be created; retrying every 2 seconds. |
+| `ConfigMode` | Setup QR on screen (retried if it cannot be shown); admin HTTP server running; fallback credentials file present. |
 
 Startup screen:
 
@@ -190,10 +190,25 @@ Transitions:
 - **First sync screen**: when photos appear, send `RESUME` and return to
   `Normal`.
 
+Every transition that stops the admin server also removes
+`/tmp/photo-frame-setup.txt`.
+
 Config-mode screens are rendered as JPEGs with `fontdue` text and a `qrcode`
 code at the configured native resolution, written to
 `/tmp/photo-frame-qr.jpg` or `/tmp/photo-frame-status.jpg`, and shown with
 `CLR` + `SHOW` on the control socket.
+
+Only a failure to create the admin server aborts config-mode entry. Once the
+server is running, a screen that cannot be rendered or shown is logged and
+retried every 2 seconds without stopping the server or changing the state away
+from `ConfigMode`.
+
+For as long as config mode is active, `/tmp/photo-frame-setup.txt` (mode 0600,
+owned by the service user) contains the primary `http://<ip>:<port>` URL, the
+`http://photo-frame.local:<port>` alternative, the username `photo-frame`, and
+the session password. This is the fallback when the QR screen cannot be shown.
+The file is removed when leaving config mode (`POST /api/finish`, USB removal,
+idle timeout) and on shutdown.
 
 ### 1.6 Admin UI and Setup QR
 
@@ -208,7 +223,8 @@ code at the configured native resolution, written to
   back to `127.0.0.1`. mDNS is optional; the IP URL works without it.
 - The admin server listens on `0.0.0.0` on the first free port in 8100–8199.
 - Username is `photo-frame`; the password is 8 random alphanumeric characters,
-  regenerated for every config session and shown on screen.
+  regenerated for every config session and shown on screen and in
+  `/tmp/photo-frame-setup.txt`.
 - Every route is behind HTTP Basic Auth. There are no unauthenticated callbacks.
 - Admin changes are staged in memory, seeded with the current sources. `Finish`
   validates every entry and atomically rewrites `config.toml` (temp file created

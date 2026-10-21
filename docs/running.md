@@ -30,3 +30,18 @@ Rotated logs are gzip-compressed at `/tmp/photo-frame.log.1.gz`,
 **Note:** systemd stdout/stderr is suppressed (`StandardOutput=null`) for
 both services. `journalctl -u photo-frame-manager` will be empty. All
 intentional log output goes to the tmpfs log file above.
+
+## Config mode fallback
+
+If the display app cannot show the setup QR screen, the manager keeps the admin
+server running. The URL, mDNS alternative, username (`photo-frame`), and the
+current rotating password are written to `/tmp/photo-frame-setup.txt` (mode
+0600) for as long as config mode is active.
+
+```bash
+cat /tmp/photo-frame-setup.txt
+```
+
+The file is removed when config mode exits: after **Finish**, on USB removal, on
+the 10-minute idle timeout, and on shutdown. See
+[config.md](config.md#setup-fallback-file).

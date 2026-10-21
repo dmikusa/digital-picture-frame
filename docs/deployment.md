@@ -81,9 +81,13 @@ Flow details:
   `<photos_dir>/sync-status.json` when the scheduler has written it. A missing
   file yields an empty `sync` object.
 
-If the display app has not created its control socket yet, config mode retries
-instead of exiting. Check `/tmp/photo-frame.log` if the setup screen never
-appears.
+If the display app has not created its control socket yet, or closes it, the QR
+screen cannot be shown. That no longer ends config mode: the admin server and its
+password stay live, the failure is logged, and the screen is retried. The same
+URL, mDNS alternative, username, and password are in
+`/tmp/photo-frame-setup.txt` (mode 0600) until config mode exits, so setup can be
+completed from a shell or another device. Check `/tmp/photo-frame.log` if the
+setup screen never appears.
 
 ### Optional: mDNS hostname
 

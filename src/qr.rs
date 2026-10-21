@@ -48,7 +48,7 @@ const STATUS_BODY_SIZE_RATIO: f32 = 0.04;
 /// the body line height.
 const STATUS_BODY_GAP: f32 = 1.5;
 /// Fallback file used by [`render_config_screen`].
-const DEFAULT_CONFIG_SCREEN_PATH: &str = "/tmp/photo-frame-qr.jpg";
+pub(crate) const DEFAULT_CONFIG_SCREEN_PATH: &str = "/tmp/photo-frame-qr.jpg";
 /// File used by [`render_status_screen`]. Distinct from the QR screen so a
 /// stale config screen is never shown as a status screen.
 const DEFAULT_STATUS_SCREEN_PATH: &str = "/tmp/photo-frame-status.jpg";
@@ -324,7 +324,7 @@ pub fn render_config_screen(
 ///
 /// Split out from [`render_config_screen`] so tests can each write to their
 /// own file instead of racing over the shared `/tmp` path.
-fn render_config_screen_to(
+pub(crate) fn render_config_screen_to(
     config: &Config,
     fallback_ip: &str,
     mdns_host: &str,

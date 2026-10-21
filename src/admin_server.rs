@@ -29,6 +29,10 @@ use tiny_http_fork::{Header, Method, Request, Response, Server, StatusCode};
 /// next to the photo index in `photos_dir`.
 pub const SYNC_STATUS_FILE: &str = "sync-status.json";
 
+/// Basic-auth username for the config-mode admin server. Shown on the setup
+/// screen and written to the fallback credentials file.
+pub const AUTH_USERNAME: &str = "photo-frame";
+
 // ---------------------------------------------------------------------------
 // Askama templates — compiled from templates/*.html at build time
 // ---------------------------------------------------------------------------
@@ -216,7 +220,7 @@ impl AdminServer {
                 let val = header.value.as_str();
                 let expected = format!(
                     "Basic {}",
-                    base64_encode(&format!("photo-frame:{}", self.password))
+                    base64_encode(&format!("{AUTH_USERNAME}:{}", self.password))
                 );
                 return val.trim() == expected;
             }

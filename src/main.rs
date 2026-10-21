@@ -340,5 +340,14 @@ fn main() {
     // The OS cleans up Unix sockets and file descriptors on process exit.
     std::thread::sleep(Duration::from_millis(200));
 
+    // The config-mode thread polls every 500 ms, so it may not have seen the
+    // flag yet. Remove the setup fallback here as well: it contains a password
+    // and must not outlive the process that owns it.
+    if let Err(e) = photo_frame_manager::config_mode::remove_setup_credentials(
+        std::path::Path::new(photo_frame_manager::config_mode::SETUP_CREDENTIALS_PATH),
+    ) {
+        log::warn!("Could not remove setup credentials on shutdown: {}", e);
+    }
+
     log::info!("Shutdown complete");
 }

@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::admin_server::AdminServer;
+use crate::admin_server::{AdminServer, AUTH_USERNAME};
 use crate::config::Config;
 use crate::control::ControlClient;
 use crate::import::MountEvent;
@@ -33,6 +33,16 @@ use std::time::{Duration, Instant};
 /// How long to wait before retrying a config-mode entry that could not reach
 /// the display app (for example, because it has not created its socket yet).
 const CONFIG_MODE_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// How long to wait before retrying a setup screen that could not be rendered
+/// or shown. Retrying never stops the admin server, so login stays possible.
+const SCREEN_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Fallback credentials file, written for as long as config mode is active.
+///
+/// The password only exists on the QR screen otherwise, so a display app that
+/// cannot show it would lock the user out of setup.
+pub const SETUP_CREDENTIALS_PATH: &str = "/tmp/photo-frame-setup.txt";
 
 /// How often the first-sync screen checks the index for newly synced photos.
 const FIRST_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -139,7 +149,7 @@ pub(crate) fn save_config_atomic(path: &Path, config: &Config) -> io::Result<()>
     ));
 
     let result =
-        write_config_tmp(&tmp_path, &toml_str).and_then(|()| std::fs::rename(&tmp_path, path));
+        write_private_file(&tmp_path, &toml_str).and_then(|()| std::fs::rename(&tmp_path, path));
 
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
@@ -149,7 +159,7 @@ pub(crate) fn save_config_atomic(path: &Path, config: &Config) -> io::Result<()>
 }
 
 /// Write `contents` to `path`, creating it with mode 0600.
-fn write_config_tmp(path: &Path, contents: &str) -> io::Result<()> {
+fn write_private_file(path: &Path, contents: &str) -> io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -161,7 +171,7 @@ fn write_config_tmp(path: &Path, contents: &str) -> io::Result<()> {
     let mut file = options.open(path)?;
 
     // Explicitly set the mode as well: the open mode is filtered through the
-    // process umask, and we always want config.toml to end up as 0600.
+    // process umask, and we always want private files to end up as 0600.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -172,6 +182,65 @@ fn write_config_tmp(path: &Path, contents: &str) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Human-readable contents of the setup-credentials fallback file.
+///
+/// It lists the same reachable URL and password that the QR screen shows, so
+/// the user can still finish setup when the screen cannot be displayed.
+pub(crate) fn setup_credentials_text(fallback_ip: &str, port: u16, password: &str) -> String {
+    format!(
+        "Photo Frame setup\n\
+         =================\n\
+         \n\
+         URL:      http://{fallback_ip}:{port}\n\
+         Also try: http://{mdns}:{port}\n\
+         Username: {username}\n\
+         Password: {password}\n\
+         \n\
+         This file is removed when config mode exits.\n",
+        mdns = qr::MDNS_HOST,
+        username = AUTH_USERNAME,
+    )
+}
+
+/// Write the fallback setup credentials to `path` with mode 0600.
+///
+/// Any existing file is removed first so a stale file left by a crashed run
+/// (possibly owned by a different user) cannot block the write or keep a
+/// password that no longer works.
+pub(crate) fn write_setup_credentials(
+    path: &Path,
+    fallback_ip: &str,
+    port: u16,
+    password: &str,
+) -> io::Result<()> {
+    remove_setup_credentials(path)?;
+    write_private_file(path, &setup_credentials_text(fallback_ip, port, password))
+}
+
+/// Remove the fallback credentials file, treating "already gone" as success.
+///
+/// Called when config mode stops. `main` also calls it directly on shutdown,
+/// because worker threads are not joined and may not reach their own cleanup.
+pub fn remove_setup_credentials(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A setup screen that still needs to be shown on the display.
+///
+/// Render or control-socket failures no longer abort config mode; they leave
+/// this pending record behind so the screen is retried while the admin server
+/// (and the credentials fallback file) keep working.
+struct PendingScreen {
+    fallback_ip: String,
+    port: u16,
+    password: String,
+    retry_at: Instant,
+}
+
 /// Owns the config-mode state machine.  Communicates with the USB-watcher via
 /// the shared `MountEvent` channel.
 pub struct ConfigEnvironment {
@@ -179,9 +248,14 @@ pub struct ConfigEnvironment {
     control: ControlClient,
     config: Config,
     config_path: PathBuf,
+    /// Where the fallback setup credentials are written while config mode runs.
+    credentials_path: PathBuf,
+    /// Where the setup QR screen is rendered before it is sent to the display.
+    screen_path: PathBuf,
     server: Option<Arc<AdminServer>>,
     server_handle: Option<JoinHandle<()>>,
     server_shutdown: Arc<AtomicBool>,
+    pending_screen: Option<PendingScreen>,
 }
 
 impl ConfigEnvironment {
@@ -195,17 +269,22 @@ impl ConfigEnvironment {
             control: ControlClient::new(control_socket_path),
             config,
             config_path,
+            credentials_path: PathBuf::from(SETUP_CREDENTIALS_PATH),
+            screen_path: PathBuf::from(qr::DEFAULT_CONFIG_SCREEN_PATH),
             server: None,
             server_handle: None,
             server_shutdown: Arc::new(AtomicBool::new(false)),
+            pending_screen: None,
         }
     }
 
-    /// Enter config mode: display the QR code and start the admin server.
+    /// Enter config mode: start the admin server, write the credentials
+    /// fallback, then try to display the QR code.
     ///
-    /// If the display app is not reachable yet, this returns an error without
-    /// leaving a listener behind. The caller retries through
-    /// [`ConfigState::PendingConfigMode`].
+    /// Only a failure to create the server is fatal here. A screen that cannot
+    /// be rendered or shown is logged and retried, but the state still becomes
+    /// [`ConfigState::ConfigMode`] so the user can log in using the URL and
+    /// password in the fallback file.
     fn enter_config_mode(&mut self, fallback_ip: &str) -> io::Result<()> {
         let password = qr::generate_password();
         let staged_sources = self.config.remote_sources.clone();
@@ -219,10 +298,6 @@ impl ConfigEnvironment {
         );
         let port = server.port();
 
-        let qr_path =
-            qr::render_config_screen(&self.config, fallback_ip, qr::MDNS_HOST, port, &password)
-                .map_err(io::Error::other)?;
-
         // Start accepting requests before showing the QR so the URL is live as
         // soon as someone scans it.
         self.server_shutdown.store(false, Ordering::Relaxed);
@@ -235,13 +310,31 @@ impl ConfigEnvironment {
         }));
         self.server = Some(server);
 
-        if let Err(e) = self
-            .control
-            .clear()
-            .and_then(|()| self.control.show(&qr_path))
-        {
-            self.stop_server();
-            return Err(e);
+        // Write the fallback before touching the display app. The password only
+        // exists on screen otherwise, so this file is the safety net when the
+        // QR screen cannot be shown.
+        match write_setup_credentials(&self.credentials_path, fallback_ip, port, &password) {
+            Ok(()) => log::info!(
+                "Setup credentials for http://{fallback_ip}:{port} written to {} (mode 0600)",
+                self.credentials_path.display()
+            ),
+            Err(e) => log::warn!(
+                "Could not write setup credentials to {}: {e}",
+                self.credentials_path.display()
+            ),
+        }
+
+        let pending = PendingScreen {
+            fallback_ip: fallback_ip.to_string(),
+            port,
+            password,
+            retry_at: Instant::now(),
+        };
+        if !self.show_setup_screen(&pending) {
+            self.pending_screen = Some(PendingScreen {
+                retry_at: Instant::now() + SCREEN_RETRY_DELAY,
+                ..pending
+            });
         }
 
         log::info!(
@@ -253,8 +346,91 @@ impl ConfigEnvironment {
         Ok(())
     }
 
-    /// Try to enter config mode, falling back to a retry when the display app
-    /// is not ready. Never leaves the state machine without a server retry.
+    /// Render and show the setup QR screen. Returns whether it was displayed.
+    ///
+    /// Failures are logged, never propagated: the admin server must stay
+    /// reachable even when the display app is not.
+    fn show_setup_screen(&mut self, screen: &PendingScreen) -> bool {
+        let qr_path = match qr::render_config_screen_to(
+            &self.config,
+            &screen.fallback_ip,
+            qr::MDNS_HOST,
+            screen.port,
+            &screen.password,
+            &self.screen_path,
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                log::warn!("Could not render setup screen: {e}");
+                return false;
+            }
+        };
+
+        if let Err(e) = self
+            .control
+            .clear()
+            .and_then(|()| self.control.show(&qr_path))
+        {
+            log::warn!(
+                "Could not display setup screen: {e}; setup is still available at \
+                 http://{}:{} (credentials: {})",
+                screen.fallback_ip,
+                screen.port,
+                self.credentials_path.display()
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// Retry a setup screen that could not be shown earlier, if it is due.
+    ///
+    /// The admin server and fallback file are left untouched, so this can run
+    /// while the user is logged in.
+    fn retry_setup_screen(&mut self) {
+        if !matches!(self.state, ConfigState::ConfigMode) {
+            return;
+        }
+        let Some(pending) = self.pending_screen.take() else {
+            return;
+        };
+        if Instant::now() < pending.retry_at {
+            self.pending_screen = Some(pending);
+            return;
+        }
+
+        // Re-create the fallback if it is missing (a transient write failure at
+        // entry, or something cleaned up /tmp). Without it the user is locked
+        // out whenever the screen also cannot be shown.
+        if !self.credentials_path.exists() {
+            match write_setup_credentials(
+                &self.credentials_path,
+                &pending.fallback_ip,
+                pending.port,
+                &pending.password,
+            ) {
+                Ok(()) => log::info!(
+                    "Restored setup credentials at {}",
+                    self.credentials_path.display()
+                ),
+                Err(e) => log::warn!(
+                    "Could not restore setup credentials {}: {e}",
+                    self.credentials_path.display()
+                ),
+            }
+        }
+
+        if !self.show_setup_screen(&pending) {
+            self.pending_screen = Some(PendingScreen {
+                retry_at: Instant::now() + SCREEN_RETRY_DELAY,
+                ..pending
+            });
+        }
+    }
+
+    /// Try to enter config mode, falling back to a retry when the admin server
+    /// cannot be created. Never leaves the state machine without a server retry.
     fn begin_config_mode(&mut self, fallback_ip: &str) {
         match self.enter_config_mode(fallback_ip) {
             Ok(()) => {}
@@ -271,13 +447,21 @@ impl ConfigEnvironment {
         }
     }
 
-    /// Stop the admin server, if one is running.
+    /// Stop the admin server and remove the fallback credentials, if any.
     fn stop_server(&mut self) {
         self.server_shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.server_handle.take() {
             let _ = handle.join();
         }
         self.server = None;
+        self.pending_screen = None;
+
+        if let Err(e) = remove_setup_credentials(&self.credentials_path) {
+            log::warn!(
+                "Could not remove setup credentials {}: {e}",
+                self.credentials_path.display()
+            );
+        }
     }
 
     /// Leave config mode: stop the admin server and recover to the right
@@ -519,6 +703,10 @@ pub fn run_config_mode_loop(
             }
         }
 
+        // Retry a setup screen that could not be shown earlier. This never
+        // stops the admin server, so the fallback file keeps working.
+        env.retry_setup_screen();
+
         // Retry config-mode entry after a transient display-app failure.
         if let ConfigState::PendingConfigMode { retry_at } = env.state {
             if Instant::now() >= retry_at {
@@ -749,5 +937,165 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "original config");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Build a config environment whose fallback file, screen file, and
+    /// control socket all live in `dir`, with a control client that fails fast.
+    fn test_env(dir: &Path, config: Config) -> ConfigEnvironment {
+        let mut env =
+            ConfigEnvironment::new(config, &dir.join("control.sock"), dir.join("config.toml"));
+        env.credentials_path = dir.join("setup.txt");
+        env.screen_path = dir.join("setup.jpg");
+        env.control = ControlClient::with_timeout(
+            &dir.join("missing-control.sock"),
+            Duration::from_millis(50),
+        );
+        env
+    }
+
+    #[test]
+    fn setup_credentials_file_lists_urls_and_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup.txt");
+
+        write_setup_credentials(&path, "192.168.1.208", 8100, "abc12345").unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("http://192.168.1.208:8100"),
+            "primary URL missing: {contents}"
+        );
+        assert!(
+            contents.contains("http://photo-frame.local:8100"),
+            "mDNS URL missing: {contents}"
+        );
+        assert!(
+            contents.contains("Username: photo-frame"),
+            "username missing: {contents}"
+        );
+        assert!(
+            contents.contains("Password: abc12345"),
+            "password missing: {contents}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_credentials_file_is_private_and_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup.txt");
+
+        // A stale, loosely-permissioned file must be replaced and tightened.
+        fs::write(&path, "stale").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_setup_credentials(&path, "10.0.0.5", 8100, "pw123456").unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("stale"));
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        remove_setup_credentials(&path).unwrap();
+        assert!(!path.exists());
+
+        // Removing an already-absent file is not an error.
+        remove_setup_credentials(&path).unwrap();
+    }
+
+    #[test]
+    fn config_mode_entry_survives_a_control_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let photos_dir = dir.path().join("photos");
+        fs::create_dir(&photos_dir).unwrap();
+        // One valid photo so leaving config mode resumes the slideshow.
+        fs::write(photos_dir.join("index-0-1.csv"), "").unwrap();
+
+        let mut env = test_env(dir.path(), sample_config(photos_dir));
+        let credentials = env.credentials_path.clone();
+
+        // The control socket is absent, so CLR/SHOW fail.
+        env.enter_config_mode("127.0.0.1").unwrap();
+
+        // Login still works: the server is up, the state is ConfigMode, and the
+        // fallback file has the URL and password the screen could not show.
+        assert_eq!(env.state, ConfigState::ConfigMode);
+        assert!(env.server.is_some(), "admin server must stay running");
+        assert!(
+            env.pending_screen.is_some(),
+            "a failed screen should be queued for retry"
+        );
+
+        let port = env.server.as_ref().unwrap().port();
+        let contents = fs::read_to_string(&credentials).unwrap();
+        assert!(contents.contains(&format!("http://127.0.0.1:{port}")));
+        assert!(contents.contains(&format!("http://{}:{port}", qr::MDNS_HOST)));
+        assert!(contents.contains(&format!("Username: {AUTH_USERNAME}")));
+        let password = contents
+            .lines()
+            .find_map(|line| line.strip_prefix("Password: "))
+            .expect("password line");
+        assert_eq!(password.len(), 8);
+        assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        env.leave_config_mode(false, "127.0.0.1");
+
+        assert!(
+            !credentials.exists(),
+            "leaving config mode removes the fallback file"
+        );
+        assert!(env.server.is_none());
+        assert!(env.pending_screen.is_none());
+        assert_eq!(env.state, ConfigState::Normal);
+    }
+
+    #[test]
+    fn failed_setup_screen_is_retried_without_stopping_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = test_env(dir.path(), sample_config(dir.path().to_path_buf()));
+
+        env.enter_config_mode("127.0.0.1").unwrap();
+        let port = env.server.as_ref().unwrap().port();
+        assert_eq!(env.state, ConfigState::ConfigMode);
+
+        // Make the queued retry due now.
+        env.pending_screen.as_mut().unwrap().retry_at = Instant::now();
+        env.retry_setup_screen();
+
+        assert_eq!(env.state, ConfigState::ConfigMode);
+        assert_eq!(
+            env.server.as_ref().map(|server| server.port()),
+            Some(port),
+            "the retry must not replace or stop the admin server"
+        );
+        let pending = env.pending_screen.as_ref().expect("retry stays queued");
+        assert!(
+            pending.retry_at > Instant::now(),
+            "the next retry should be delayed"
+        );
+        assert!(env.credentials_path.exists());
+
+        env.stop_server();
+    }
+
+    #[test]
+    fn retrying_the_setup_screen_restores_a_missing_fallback_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = test_env(dir.path(), sample_config(dir.path().to_path_buf()));
+
+        env.enter_config_mode("127.0.0.1").unwrap();
+        remove_setup_credentials(&env.credentials_path).unwrap();
+        assert!(!env.credentials_path.exists());
+
+        env.pending_screen.as_mut().unwrap().retry_at = Instant::now();
+        env.retry_setup_screen();
+
+        assert_eq!(env.state, ConfigState::ConfigMode);
+        assert!(
+            env.credentials_path.exists(),
+            "the retry should restore the fallback file"
+        );
+
+        env.stop_server();
     }
 }
