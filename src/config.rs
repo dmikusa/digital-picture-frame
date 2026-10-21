@@ -17,7 +17,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum AspectRatioMode {
@@ -157,6 +158,60 @@ impl Config {
     }
 }
 
+/// Serialize `config` to TOML and atomically replace `path`.
+///
+/// The temporary file is created in the same directory so the final rename is
+/// atomic. It is created with mode 0600 (config may contain credentials) and
+/// removed if any step fails, leaving the original file untouched.
+pub fn save_config_atomic(path: &Path, config: &Config) -> io::Result<()> {
+    let toml_str = toml::to_string_pretty(config).map_err(io::Error::other)?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("config path has no file name: {}", path.display()),
+        )
+    })?;
+    let tmp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    let result =
+        write_private_file(&tmp_path, &toml_str).and_then(|()| std::fs::rename(&tmp_path, path));
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    result
+}
+
+/// Write `contents` to `path`, creating it with mode 0600.
+pub(crate) fn write_private_file(path: &Path, contents: &str) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+
+    // Explicitly set the mode as well: the open mode is filtered through the
+    // process umask, and we always want private files to end up as 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
+}
+
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (w, h) = self.resolution();
@@ -181,6 +236,30 @@ impl fmt::Display for Config {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn sample_config(photos_dir: PathBuf) -> Config {
+        let mut params = HashMap::new();
+        params.insert("url".to_string(), "https://example.test".to_string());
+
+        Config {
+            photos_dir,
+            display_socket_path: PathBuf::from("/run/photo-frame/photo-frame.sock"),
+            control_socket_path: PathBuf::from("/run/photo-frame/control.sock"),
+            native_resolution: "1024x768".to_string(),
+            aspect_ratio_mode: AspectRatioMode::Fill,
+            batch_delete_size: 10,
+            log_max_size: 2048,
+            log_max_files: 3,
+            remote_sources: vec![RemoteSourceConfig {
+                source_type: "immich".to_string(),
+                name: "test-source".to_string(),
+                params,
+                check_interval_seconds: 3600,
+            }],
+        }
+    }
 
     #[test]
     fn test_parse_valid_config() {
@@ -309,5 +388,72 @@ native_resolution = "1024x768"
             config.control_socket_path,
             PathBuf::from("/run/photo-frame/control.sock")
         );
+    }
+
+    #[test]
+    fn save_config_atomic_round_trips_and_sets_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let photos_dir = dir.path().join("photos");
+        std::fs::create_dir(&photos_dir).unwrap();
+        let config = sample_config(photos_dir);
+
+        save_config_atomic(&path, &config).unwrap();
+
+        let loaded = Config::from_file(&path).unwrap();
+        assert_eq!(loaded.photos_dir, config.photos_dir.canonicalize().unwrap());
+        assert_eq!(loaded.native_resolution, "1024x768");
+        assert_eq!(loaded.batch_delete_size, 10);
+        assert_eq!(loaded.remote_sources.len(), 1);
+        assert_eq!(loaded.remote_sources[0].source_type, "immich");
+        assert_eq!(loaded.remote_sources[0].name, "test-source");
+        assert_eq!(
+            loaded.remote_sources[0].params.get("url").unwrap(),
+            "https://example.test"
+        );
+
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // The temporary file must not be left behind after a successful save.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names
+            .iter()
+            .all(|name| !name.to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_config_atomic_preserves_original_on_failure() {
+        // Root bypasses directory permissions, so this failure mode cannot be
+        // triggered when tests run as root (e.g. in some containers).
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "original config").unwrap();
+        let config = sample_config(dir.path().to_path_buf());
+
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let result = save_config_atomic(&path, &config);
+
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original config");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

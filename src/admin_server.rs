@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::config::RemoteSourceConfig;
+use crate::config::{Config, RemoteSourceConfig};
 use askama::Template;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -32,6 +32,13 @@ pub const SYNC_STATUS_FILE: &str = "sync-status.json";
 /// Basic-auth username for the config-mode admin server. Shown on the setup
 /// screen and written to the fallback credentials file.
 pub const AUTH_USERNAME: &str = "photo-frame";
+
+/// Where `POST /api/finish` writes the staged sources, and the config the
+/// staged sources are merged into. Without one, `finish` only stops the server.
+struct ConfigSaveTarget {
+    path: PathBuf,
+    base: Config,
+}
 
 // ---------------------------------------------------------------------------
 // Askama templates — compiled from templates/*.html at build time
@@ -76,6 +83,7 @@ pub struct AdminServer {
     finished: Arc<AtomicBool>,
     last_request: Arc<Mutex<Instant>>,
     status_path: Option<PathBuf>,
+    save_target: Option<ConfigSaveTarget>,
 }
 
 impl AdminServer {
@@ -92,6 +100,7 @@ impl AdminServer {
             finished: Arc::new(AtomicBool::new(false)),
             last_request: Arc::new(Mutex::new(Instant::now())),
             status_path: None,
+            save_target: None,
         })
     }
 
@@ -99,6 +108,20 @@ impl AdminServer {
     /// the status endpoint reports an empty `sync` object.
     pub fn with_status_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.status_path = Some(path.into());
+        self
+    }
+
+    /// Persist the staged sources to `path` when the user finishes setup.
+    ///
+    /// `base` supplies the settings that config mode does not edit; only its
+    /// `remote_sources` are replaced by the staged list. The write happens
+    /// inside `POST /api/finish`, so a failure is reported to the user and the
+    /// server keeps running instead of pretending the save succeeded.
+    pub fn with_config_save(mut self, path: impl Into<PathBuf>, base: Config) -> Self {
+        self.save_target = Some(ConfigSaveTarget {
+            path: path.into(),
+            base,
+        });
         self
     }
 
@@ -363,6 +386,23 @@ impl AdminServer {
             } else {
                 json_error(400, &message)
             };
+        }
+
+        // Write the config before reporting success. A failed write must leave
+        // the server running so the user can fix the problem and retry.
+        if let Some(target) = self.save_target.as_ref() {
+            let mut config = target.base.clone();
+            config.remote_sources = sources;
+            if let Err(e) = crate::config::save_config_atomic(&target.path, &config) {
+                let message = format!("Could not save config to {}: {e}", target.path.display());
+                log::error!("{message}");
+                return if html {
+                    html_error(500, &message)
+                } else {
+                    json_error(500, &message)
+                };
+            }
+            log::info!("Config saved to {}", target.path.display());
         }
 
         self.finished.store(true, Ordering::Relaxed);
@@ -836,6 +876,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(false)),
             last_request: Arc::new(Mutex::new(Instant::now())),
             status_path: Some(PathBuf::from("/nonexistent/sync-status.json")),
+            save_target: None,
         };
         assert_eq!(server.read_sync_status(), serde_json::json!({}));
 
@@ -869,6 +910,7 @@ mod tests {
             finished: Arc::new(AtomicBool::new(false)),
             last_request: Arc::new(Mutex::new(Instant::now())),
             status_path: Some(path),
+            save_target: None,
         };
         let status = server.read_sync_status();
         assert_eq!(status["sources"]["My Dropbox"]["last_sync"], 123);

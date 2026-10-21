@@ -22,7 +22,7 @@
 //! is stopped with its `Arc<AtomicBool>` shutdown flag.
 
 use photo_frame_manager::admin_server::AdminServer;
-use photo_frame_manager::config::RemoteSourceConfig;
+use photo_frame_manager::config::{AspectRatioMode, Config, RemoteSourceConfig};
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
 use std::collections::HashMap;
@@ -59,21 +59,56 @@ fn staged_source(source_type: &str, name: &str, params: &[(&str, &str)]) -> Remo
     }
 }
 
+/// A minimal valid config used as the base for `with_config_save`. Only
+/// `remote_sources` changes when the user finishes setup.
+fn base_config(photos_dir: &std::path::Path) -> Config {
+    Config {
+        photos_dir: photos_dir.to_path_buf(),
+        display_socket_path: PathBuf::from("/run/photo-frame/photo-frame.sock"),
+        control_socket_path: PathBuf::from("/run/photo-frame/control.sock"),
+        native_resolution: "1024x768".to_string(),
+        aspect_ratio_mode: AspectRatioMode::Fit,
+        batch_delete_size: 10,
+        log_max_size: 2048,
+        log_max_files: 3,
+        remote_sources: Vec::new(),
+    }
+}
+
 impl TestServer {
     fn start() -> Self {
         Self::start_with(Vec::new())
     }
 
     fn start_with(sources: Vec<RemoteSourceConfig>) -> Self {
-        Self::start_with_status(sources, None)
+        Self::start_full(sources, None, None)
     }
 
     fn start_with_status(sources: Vec<RemoteSourceConfig>, status_path: Option<PathBuf>) -> Self {
+        Self::start_full(sources, status_path, None)
+    }
+
+    fn start_with_config_save(
+        sources: Vec<RemoteSourceConfig>,
+        path: PathBuf,
+        base: Config,
+    ) -> Self {
+        Self::start_full(sources, None, Some((path, base)))
+    }
+
+    fn start_full(
+        sources: Vec<RemoteSourceConfig>,
+        status_path: Option<PathBuf>,
+        save_target: Option<(PathBuf, Config)>,
+    ) -> Self {
         let lock = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut server =
             AdminServer::new(PASSWORD.to_string(), sources).expect("create admin server");
         if let Some(path) = status_path {
             server = server.with_status_path(path);
+        }
+        if let Some((path, base)) = save_target {
+            server = server.with_config_save(path, base);
         }
         let server = Arc::new(server);
         let port = server.port();
@@ -305,6 +340,80 @@ fn finish_via_json_returns_json() {
     let body = response.text().expect("read finish JSON");
     assert!(body.contains(r#""ok":true"#), "finish body: {body}");
     assert!(s.server.finished());
+}
+
+#[test]
+fn finish_with_save_target_writes_config_and_sets_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let s = TestServer::start_with_config_save(
+        vec![staged_source(
+            "dropbox",
+            "Saved Dropbox",
+            &[("access_token", "sl.good"), ("folder", "/Photos")],
+        )],
+        config_path.clone(),
+        base_config(dir.path()),
+    );
+
+    let response = s.post_empty_form("/api/finish");
+
+    assert_eq!(response.status(), 200);
+    assert!(content_type(&response).starts_with("text/html"));
+    assert!(s.server.finished());
+
+    let saved = Config::from_file(&config_path).expect("saved config should parse");
+    assert_eq!(saved.remote_sources.len(), 1);
+    assert_eq!(saved.remote_sources[0].name, "Saved Dropbox");
+    assert_eq!(
+        saved.remote_sources[0].params.get("access_token"),
+        Some(&"sl.good".to_string())
+    );
+}
+
+#[test]
+fn finish_save_failure_returns_error_and_leaves_unfinished() {
+    let dir = tempfile::tempdir().unwrap();
+    // A parent directory that does not exist makes the atomic write fail
+    // without depending on file permissions (which root bypasses).
+    let config_path = PathBuf::from("/nonexistent-photo-frame-dir/config.toml");
+    let s = TestServer::start_with_config_save(
+        vec![staged_source(
+            "dropbox",
+            "Valid Dropbox",
+            &[("access_token", "sl.good")],
+        )],
+        config_path,
+        base_config(dir.path()),
+    );
+
+    let form = s.post_empty_form("/api/finish");
+    assert_eq!(form.status(), 500);
+    assert!(
+        content_type(&form).starts_with("text/html"),
+        "browser save errors must be HTML, got {}",
+        content_type(&form)
+    );
+    let body = form.text().expect("read error page");
+    assert!(body.contains("Could not save config"), "error page: {body}");
+    assert!(
+        !s.server.finished(),
+        "a failed save must not stop the server"
+    );
+
+    let json = s.post_json("/api/finish", "{}");
+    assert_eq!(json.status(), 500);
+    assert!(
+        content_type(&json).starts_with("application/json"),
+        "API save errors must be JSON, got {}",
+        content_type(&json)
+    );
+    let body = json.text().expect("read error JSON");
+    assert!(body.contains("Could not save config"), "error JSON: {body}");
+    assert!(!s.server.finished());
+
+    // The sources are still staged so the user can retry after fixing the path.
+    assert_eq!(s.server.take_sources().len(), 1);
 }
 
 #[test]
