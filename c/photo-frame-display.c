@@ -48,6 +48,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -64,6 +65,7 @@
 #include <gbm.h>
 
 #include "display_logic.h"
+#include "logger.h"
 
 #define EGL_PLATFORM_GBM_KHR 0x31D7
 
@@ -73,22 +75,28 @@
 
 #define SOCKET_PATH            "/run/photo-frame/photo-frame.sock"
 #define CONTROL_SOCKET_PATH    "/run/photo-frame/control.sock"
+/* tmpfs, so diagnostics never touch the SD card. */
+#define DISPLAY_LOG_PATH       "/tmp/photo-frame-display.log"
 #define HOLD_DURATION_SEC      5.0f
+/* Upper bound on waiting for an in-flight page flip before a SHOW. */
+#define FLIP_WAIT_TIMEOUT_MS   1000
 
 #define CHECK(cond, ...) do { \
     if (!(cond)) { \
-        fprintf(stderr, "ERROR at %s:%d: ", __FILE__, __LINE__); \
-        fprintf(stderr, __VA_ARGS__); \
-        fprintf(stderr, " (errno=%d, %s)\n", errno, strerror(errno)); \
-        exit(1); \
+        log_fatal(__FILE__, __LINE__, __VA_ARGS__); \
+        exit(1); /* unreachable; makes the exit path explicit to static analysis */ \
     } \
 } while(0)
 
 #define EGL_CHECK(val, ok, call) do { \
     if (!(ok)) { \
-        EGLint err = eglGetError(); \
+        (void)(val); \
+        EGLint _egl_err = eglGetError(); \
+        log_msg(LOG_ERROR, "Exiting at %s:%d: %s failed (eglGetError=0x%x)", \
+                __FILE__, __LINE__, call, _egl_err); \
         fprintf(stderr, "EGL ERROR at %s:%d: %s failed (eglGetError=0x%x)\n", \
-                __FILE__, __LINE__, call, err); \
+                __FILE__, __LINE__, call, _egl_err); \
+        log_close(); \
         exit(1); \
     } \
 } while(0)
@@ -133,10 +141,14 @@ struct app_state {
     int                  conn_fd;
     int                  epoll_fd;
     int                  socket_paused;
+    char                 sock_buf[4096];
+    size_t               sock_len;
 
     /* Control socket */
     int                  control_listen_fd;
     int                  control_conn_fd;
+    char                 control_buf[2048];
+    size_t               control_len;
     int                  paused;
     int                  show_image;
     char                 show_path[512];
@@ -151,6 +163,7 @@ struct app_state {
     struct frame_buffer  scanout_fb;
     struct frame_buffer  pending_fb;
     volatile int         flip_done;
+    volatile int         flip_pending;  /* page flip queued, not yet acked */
 
     /* Phase */
     enum {
@@ -172,11 +185,12 @@ struct app_state {
 
     /* Graceful shutdown */
     volatile sig_atomic_t running;
+    volatile sig_atomic_t term_signal;
 } g;
 
 static void signal_handler(int sig)
 {
-    (void)sig;
+    g.term_signal = sig;
     g.running = 0;
 }
 
@@ -196,8 +210,10 @@ static GLuint compile_shader(GLenum type, const char *src)
         glGetShaderiv(s, GL_INFO_LOG_LENGTH, &len);
         char *log = malloc(len);
         glGetShaderInfoLog(s, len, NULL, log);
+        log_msg(LOG_ERROR, "Exiting: shader compile error: %s", log);
         fprintf(stderr, "Shader compile error:\n%s\n", log);
         free(log);
+        log_close();
         exit(1);
     }
     return s;
@@ -216,8 +232,10 @@ static GLuint link_program(GLuint vs, GLuint fs)
         glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len);
         char *log = malloc(len);
         glGetProgramInfoLog(p, len, NULL, log);
+        log_msg(LOG_ERROR, "Exiting: program link error: %s", log);
         fprintf(stderr, "Program link error:\n%s\n", log);
         free(log);
+        log_close();
         exit(1);
     }
     return p;
@@ -229,25 +247,27 @@ static void page_flip_handler(int fd, unsigned int frame,
 {
     (void)fd; (void)frame; (void)sec; (void)usec;
     *(volatile int *)data = 1;
+    g.flip_pending = 0;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Image loading                                                              */
 /* -------------------------------------------------------------------------- */
 
-static void load_image_into_slot(int slot_idx, const char *path)
+static int load_image_into_slot(int slot_idx, const char *path)
 {
     if (g.slots[slot_idx].occupied) {
-        fprintf(stderr, "Warning: slot %d already occupied, overwriting\n", slot_idx);
+        log_msg(LOG_WARN, "Slot %d already occupied, overwriting", slot_idx);
     }
 
     int w, h, ch;
     unsigned char *data = stbi_load(path, &w, &h, &ch, 4);
     if (!data) {
+        log_msg(LOG_WARN, "IMG load failed: %s: %s", path, stbi_failure_reason());
         fprintf(stderr, "Failed to load %s: %s\n", path, stbi_failure_reason());
-        return;
+        return 0;
     }
-    printf("Loaded %s -> slot %d (%dx%d)\n", path, slot_idx, w, h);
+    log_msg(LOG_DEBUG, "Loaded %s -> slot %d (%dx%d)", path, slot_idx, w, h);
 
     glBindTexture(GL_TEXTURE_2D, g.slots[slot_idx].tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
@@ -257,6 +277,7 @@ static void load_image_into_slot(int slot_idx, const char *path)
     g.slots[slot_idx].w = w;
     g.slots[slot_idx].h = h;
     g.slots[slot_idx].occupied = 1;
+    return 1;
 }
 
 static void store_pending_image(const char *path)
@@ -269,10 +290,11 @@ static void store_pending_image(const char *path)
     int w, h, ch;
     unsigned char *data = stbi_load(path, &w, &h, &ch, 4);
     if (!data) {
+        log_msg(LOG_WARN, "IMG load failed (pending): %s: %s", path, stbi_failure_reason());
         fprintf(stderr, "Failed to load %s: %s\n", path, stbi_failure_reason());
         return;
     }
-    printf("Buffered %s as pending (%dx%d)\n", path, w, h);
+    log_msg(LOG_DEBUG, "Buffered %s as pending (%dx%d)", path, w, h);
 
     g.pending_pixels = data;
     g.pending_w = w;
@@ -294,12 +316,25 @@ static void upload_pending_to_slot(int slot_idx)
 
     stbi_image_free(g.pending_pixels);
     g.pending_pixels = NULL;
-    printf("Uploaded pending image to slot %d\n", slot_idx);
+    log_msg(LOG_DEBUG, "Uploaded pending image to slot %d", slot_idx);
 }
 
 /* -------------------------------------------------------------------------- */
 /* Socket protocol                                                            */
 /* -------------------------------------------------------------------------- */
+
+/* Close the manager connection and drop any partial command so a reconnect
+ * cannot inherit bytes from the previous session. */
+static void close_manager_conn(const char *reason)
+{
+    if (g.conn_fd < 0) return;
+    log_msg(LOG_INFO, "Closing manager connection (fd=%d): %s", g.conn_fd, reason);
+    close(g.conn_fd);
+    g.conn_fd = -1;
+    g.socket_paused = 0;
+    g.sock_len = 0;
+    g.sock_buf[0] = '\0';
+}
 
 static void send_ready(void)
 {
@@ -307,28 +342,29 @@ static void send_ready(void)
     const char msg[] = "READY\n";
     ssize_t n = write(g.conn_fd, msg, sizeof(msg) - 1);
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EPIPE) {
-        perror("write READY");
-        close(g.conn_fd);
-        g.conn_fd = -1;
+        log_msg(LOG_ERROR, "write READY failed: %s", strerror(errno));
+        fprintf(stderr, "write READY: %s\n", strerror(errno));
+        close_manager_conn("READY write error");
     } else if (n > 0) {
-        printf("Sent READY\n");
+        log_msg(LOG_DEBUG, "Sent READY");
     } else if (n < 0 && errno == EPIPE) {
-        printf("Manager disconnected before READY could be sent.\n");
-        close(g.conn_fd);
-        g.conn_fd = -1;
+        log_msg(LOG_INFO, "Manager disconnected before READY could be sent");
+        close_manager_conn("EPIPE while sending READY");
     }
 }
 
 static void handle_img_command(const char *path)
 {
-    printf("Received IMG: %s\n", path);
+    log_msg(LOG_DEBUG, "Received IMG: %s", path);
     int dest = select_image_destination(
         g.slots[0].occupied, g.slots[1].occupied, g.pending_pixels != NULL);
     switch (dest) {
         case 0: load_image_into_slot(0, path); break;
         case 1: load_image_into_slot(1, path); break;
         case 2: store_pending_image(path); break;
-        case 3: printf("Warning: both slots and pending buffer full, dropping %s\n", path); break;
+        case 3:
+            log_msg(LOG_WARN, "Both slots and pending buffer full, dropping %s", path);
+            break;
     }
 }
 
@@ -339,33 +375,51 @@ static int handle_img_cmd_wrapper(const char *path, void *ctx)
     return !(g.slots[0].occupied && g.slots[1].occupied && g.pending_pixels);
 }
 
+/* Close the control connection and drop any partial command. epoll removes
+ * closed descriptors automatically, but callers that replace a live connection
+ * delete it explicitly first. */
+static void close_control_conn(const char *reason)
+{
+    if (g.control_conn_fd < 0) return;
+    log_msg(LOG_INFO, "Closing control connection (fd=%d): %s",
+            g.control_conn_fd, reason);
+    close(g.control_conn_fd);
+    g.control_conn_fd = -1;
+    g.control_len = 0;
+    g.control_buf[0] = '\0';
+}
+
 static void handle_control_data(void)
 {
-    static char ctrl_buf[2048];
-    static size_t ctrl_len = 0;
+    if (g.control_conn_fd < 0) return;
 
-    ssize_t n = read(g.control_conn_fd, ctrl_buf + ctrl_len,
-                     sizeof(ctrl_buf) - ctrl_len - 1);
+    /* A single command longer than the buffer has no newline yet. Discarding
+     * is safer than calling read() with a zero-length buffer, which returns 0
+     * and used to be mistaken for EOF (closing a healthy connection). */
+    if (g.control_len >= sizeof(g.control_buf) - 1) {
+        log_msg(LOG_WARN, "Control command too long (%zu bytes), discarding buffer",
+                g.control_len);
+        g.control_len = 0;
+        g.control_buf[0] = '\0';
+    }
+
+    size_t space = sizeof(g.control_buf) - g.control_len - 1;
+    ssize_t n = read(g.control_conn_fd, g.control_buf + g.control_len, space);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return;
-        perror("control read");
-        close(g.control_conn_fd);
-        g.control_conn_fd = -1;
-        ctrl_len = 0;
+        log_msg(LOG_ERROR, "Control read failed: %s", strerror(errno));
+        close_control_conn("read error");
         return;
     }
     if (n == 0) {
-        printf("Control client disconnected.\n");
-        close(g.control_conn_fd);
-        g.control_conn_fd = -1;
-        ctrl_len = 0;
+        close_control_conn("client closed connection (EOF)");
         return;
     }
-    ctrl_len += n;
-    ctrl_buf[ctrl_len] = '\0';
+    g.control_len += (size_t)n;
+    g.control_buf[g.control_len] = '\0';
 
-    char *line_start = ctrl_buf;
+    char *line_start = g.control_buf;
     while (1) {
         char *nl = strchr(line_start, '\n');
         if (!nl) break;
@@ -375,7 +429,7 @@ static void handle_control_data(void)
         line_start = nl + 1;
 
         if (strcmp(cmd, "CLR") == 0) {
-            printf("Control: CLR (clear queue, pause)\n");
+            log_msg(LOG_INFO, "Control command: CLR (clear queue, pause)");
             g.paused = 1;
             g.show_image = 0;
             if (g.slots[0].occupied) { g.slots[0].occupied = 0; }
@@ -389,63 +443,72 @@ static void handle_control_data(void)
             }
             g.phase = PHASE_WAITING;
         } else if (strncmp(cmd, "SHOW ", 5) == 0) {
-            printf("Control: SHOW %s\n", cmd + 5);
+            log_msg(LOG_INFO, "Control command: SHOW %s", cmd + 5);
+            size_t path_len = strlen(cmd + 5);
+            if (path_len >= sizeof(g.show_path)) {
+                log_msg(LOG_WARN, "SHOW path truncated from %zu to %zu bytes",
+                        path_len, sizeof(g.show_path) - 1);
+            }
             strncpy(g.show_path, cmd + 5, sizeof(g.show_path) - 1);
             g.show_path[sizeof(g.show_path) - 1] = '\0';
             g.show_image = 1;
         } else if (strcmp(cmd, "RESUME") == 0) {
-            printf("Control: RESUME\n");
+            log_msg(LOG_INFO, "Control command: RESUME");
             g.paused = 0;
             g.show_image = 0;
         } else {
-            printf("Control: unknown command '%s'\n", cmd);
+            log_msg(LOG_WARN, "Unknown control command: '%s'", cmd);
         }
     }
 
-    size_t remaining = ctrl_len - (line_start - ctrl_buf);
+    size_t remaining = g.control_len - (size_t)(line_start - g.control_buf);
     if (remaining > 0) {
-        memmove(ctrl_buf, line_start, remaining);
+        memmove(g.control_buf, line_start, remaining);
     }
-    ctrl_len = remaining;
+    g.control_len = remaining;
+    g.control_buf[g.control_len] = '\0';
 }
 
 static void handle_socket_data(void)
 {
-    static char buf[4096];
-    static size_t len = 0;
+    if (g.conn_fd < 0) return;
 
-    ssize_t n = read(g.conn_fd, buf + len, sizeof(buf) - len);
+    /* A partial IMG line larger than the buffer: drop it instead of issuing a
+     * zero-length read, which returns 0 and looks like EOF. */
+    if (g.sock_len >= sizeof(g.sock_buf) - 1) {
+        log_msg(LOG_WARN, "Display socket line too long (%zu bytes), discarding buffer",
+                g.sock_len);
+        g.sock_len = 0;
+        g.sock_buf[0] = '\0';
+    }
+
+    ssize_t n = read(g.conn_fd, g.sock_buf + g.sock_len,
+                     sizeof(g.sock_buf) - g.sock_len - 1);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return;
-        perror("read socket");
-        printf("Manager disconnected (error).\n");
-        close(g.conn_fd);
-        g.conn_fd = -1;
-        g.socket_paused = 0;
-        len = 0;
+        log_msg(LOG_ERROR, "Display socket read failed: %s", strerror(errno));
+        fprintf(stderr, "read socket: %s\n", strerror(errno));
+        close_manager_conn("display socket read error");
         return;
     }
     if (n == 0) {
-        printf("Manager disconnected (EOF).\n");
-        close(g.conn_fd);
-        g.conn_fd = -1;
-        g.socket_paused = 0;
-        len = 0;
+        close_manager_conn("manager closed display socket (EOF)");
         return;
     }
-    len += n;
+    g.sock_len += (size_t)n;
 
     int paused = 0;
-    size_t consumed = parse_protocol_buffer(buf, len, handle_img_cmd_wrapper, NULL, &paused);
+    size_t consumed = parse_protocol_buffer(g.sock_buf, g.sock_len,
+                                            handle_img_cmd_wrapper, NULL, &paused);
     if (consumed > 0) {
-        memmove(buf, buf + consumed, len - consumed);
-        len -= consumed;
+        memmove(g.sock_buf, g.sock_buf + consumed, g.sock_len - consumed);
+        g.sock_len -= consumed;
     }
     if (paused && !g.socket_paused) {
         g.socket_paused = 1;
         epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, g.conn_fd, NULL);
-        printf("Socket paused (backpressure).\n");
+        log_msg(LOG_INFO, "Display socket paused (backpressure)");
     }
 }
 
@@ -464,7 +527,7 @@ static void render_frame(float mix, int from_slot, int to_slot)
     GLfloat verts[16];
 
     /* From image */
-    build_quad((float)g.slots[from_slot].w / (float)g.slots[from_slot].h,
+    build_quad(image_aspect_ratio(g.slots[from_slot].w, g.slots[from_slot].h),
                g.screen_aspect, verts);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
     glBindTexture(GL_TEXTURE_2D, g.slots[from_slot].tex);
@@ -472,7 +535,7 @@ static void render_frame(float mix, int from_slot, int to_slot)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     /* To image */
-    build_quad((float)g.slots[to_slot].w / (float)g.slots[to_slot].h,
+    build_quad(image_aspect_ratio(g.slots[to_slot].w, g.slots[to_slot].h),
                g.screen_aspect, verts);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
     glBindTexture(GL_TEXTURE_2D, g.slots[to_slot].tex);
@@ -480,6 +543,70 @@ static void render_frame(float mix, int from_slot, int to_slot)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     glDisable(GL_BLEND);
+}
+
+/* Release the old scanout buffer and make the just-presented pending buffer
+ * the one currently on screen. Safe to call when there is no pending buffer. */
+static void promote_pending_fb(void)
+{
+    if (!g.pending_fb.bo) return;
+
+    if (g.scanout_fb.bo) {
+        drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
+        gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+    }
+    g.scanout_fb = g.pending_fb;
+    g.pending_fb.bo    = NULL;
+    g.pending_fb.fb_id = 0;
+}
+
+/* Wait (bounded) for an in-flight page flip to be acknowledged by the kernel.
+ * Returns 0 when no flip is pending, -1 on timeout or error. */
+static int wait_for_pending_flip(int timeout_ms)
+{
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    drmEventContext evctx = {
+        .version = 2,
+        .page_flip_handler = page_flip_handler,
+    };
+
+    while (g.flip_pending) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000LL
+                             + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+        int remaining = timeout_ms - (int)elapsed_ms;
+        if (remaining <= 0) break;
+
+        struct pollfd pfd = { .fd = g.drm_fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, remaining);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                if (!g.running) return -1;
+                continue;
+            }
+            log_msg(LOG_ERROR, "poll during flip wait failed: %s", strerror(errno));
+            fprintf(stderr, "poll (flip wait): %s\n", strerror(errno));
+            return -1;
+        }
+        if (pr == 0) break;
+
+        if (drmHandleEvent(g.drm_fd, &evctx) != 0) {
+            log_msg(LOG_ERROR, "drmHandleEvent during flip wait failed: %s",
+                    strerror(errno));
+            fprintf(stderr, "drmHandleEvent (flip wait): %s\n", strerror(errno));
+            return -1;
+        }
+    }
+
+    if (g.flip_pending) {
+        log_msg(LOG_WARN, "Page flip still pending after %d ms", timeout_ms);
+        fprintf(stderr, "Warning: page flip still pending after %d ms\n", timeout_ms);
+        return -1;
+    }
+    log_msg(LOG_DEBUG, "Pending page flip drained");
+    return 0;
 }
 
 static void request_page_flip(void)
@@ -504,11 +631,12 @@ static void request_page_flip(void)
                           DRM_MODE_PAGE_FLIP_EVENT,
                           (void *)&g.flip_done);
     CHECK(ret == 0, "drmModePageFlip");
+    g.flip_pending = 1;
 }
 
 static void start_fade(int from_slot, int to_slot)
 {
-    printf("Starting fade %d -> %d\n", from_slot, to_slot);
+    log_msg(LOG_DEBUG, "Starting fade %d -> %d", from_slot, to_slot);
     g.fading        = 1;
     g.fade_from     = from_slot;
     g.fade_to       = to_slot;
@@ -523,15 +651,7 @@ static void start_fade(int from_slot, int to_slot)
 static void advance_fade(void)
 {
     /* Promote pending framebuffer to scanout on every flip completion */
-    if (g.pending_fb.bo) {
-        if (g.scanout_fb.bo) {
-            drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
-            gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
-        }
-        g.scanout_fb = g.pending_fb;
-        g.pending_fb.bo    = NULL;
-        g.pending_fb.fb_id = 0;
-    }
+    promote_pending_fb();
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -542,7 +662,7 @@ static void advance_fade(void)
 
     if (g.fade_progress >= 1.0f) {
         /* Fade complete */
-        printf("Fade complete. Now showing slot %d\n", g.fade_to);
+        log_msg(LOG_DEBUG, "Fade complete. Now showing slot %d", g.fade_to);
 
         int old_slot = g.current_slot;
         g.current_slot = g.fade_to;
@@ -561,9 +681,10 @@ static void advance_fade(void)
             ev.data.fd = g.conn_fd;
             int ret = epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.conn_fd, &ev);
             if (ret < 0 && errno != EEXIST) {
-                perror("epoll_ctl ADD (resume)");
+                log_msg(LOG_ERROR, "epoll_ctl ADD (resume) failed: %s", strerror(errno));
+                fprintf(stderr, "epoll_ctl ADD (resume): %s\n", strerror(errno));
             } else {
-                printf("Socket resumed.\n");
+                log_msg(LOG_INFO, "Display socket resumed");
                 handle_socket_data();
             }
         }
@@ -592,12 +713,122 @@ static void advance_fade(void)
                                   DRM_MODE_PAGE_FLIP_EVENT,
                                   (void *)&g.flip_done);
         CHECK(ret == 0, "drmModePageFlip (skip)");
+        g.flip_pending = 1;
         return;
     }
 
     /* Render next frame */
     render_frame(g.fade_progress, g.fade_from, g.fade_to);
     request_page_flip();
+}
+
+/* -------------------------------------------------------------------------- */
+/* Control-mode SHOW                                                          */
+/* -------------------------------------------------------------------------- */
+
+/* Draw the held image and put it on screen. Every failure is logged: the old
+ * scanout stays live and the process keeps running. Returns 0 on success. */
+static int handle_show_command(drmModeConnector *conn, drmModeModeInfo *mode)
+{
+    log_msg(LOG_INFO, "SHOW begin: %s", g.show_path);
+
+    /* A slideshow page flip may still be in flight. drmModeSetCrtc returns
+     * EBUSY until the kernel acknowledges it, so drain the event first. */
+    if (g.flip_pending) {
+        log_msg(LOG_DEBUG, "SHOW: waiting up to %d ms for pending page flip",
+                FLIP_WAIT_TIMEOUT_MS);
+        if (wait_for_pending_flip(FLIP_WAIT_TIMEOUT_MS) < 0) {
+            log_msg(LOG_WARN, "SHOW aborted: page flip still pending for %s",
+                    g.show_path);
+            fprintf(stderr, "Warning: skipping SHOW %s, page flip still pending\n",
+                    g.show_path);
+            return -1;
+        }
+    }
+    g.flip_done = 0;
+
+    /* Fold a completed flip into scanout so both buffers agree. */
+    promote_pending_fb();
+
+    if (!load_image_into_slot(0, g.show_path)) {
+        log_msg(LOG_WARN, "SHOW aborted: cannot load %s, keeping current frame",
+                g.show_path);
+        fprintf(stderr, "Warning: cannot show %s, keeping current frame\n",
+                g.show_path);
+        return -1;
+    }
+    g.current_slot = 0;
+    g.slots[1].occupied = 0;
+    log_msg(LOG_DEBUG, "SHOW: loaded %s (%dx%d)",
+            g.show_path, g.slots[0].w, g.slots[0].h);
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
+    glUniform1f(g.u_alpha_loc, 1.0f);
+    GLfloat verts[16];
+    build_quad(image_aspect_ratio(g.slots[0].w, g.slots[0].h),
+               g.screen_aspect, verts);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    if (!eglSwapBuffers(g.egl_dpy, g.egl_surf)) {
+        EGLint egl_err = eglGetError();
+        log_msg(LOG_ERROR, "SHOW: eglSwapBuffers failed (eglGetError=0x%x)", egl_err);
+        fprintf(stderr, "Warning: eglSwapBuffers failed for SHOW (eglGetError=0x%x)\n",
+                egl_err);
+        return -1;
+    }
+    log_msg(LOG_DEBUG, "SHOW: eglSwapBuffers ok");
+
+    struct gbm_bo *new_bo = gbm_surface_lock_front_buffer(g.gbm_surf);
+    if (!new_bo) {
+        log_msg(LOG_ERROR, "SHOW: gbm_surface_lock_front_buffer failed");
+        fprintf(stderr, "Warning: gbm_surface_lock_front_buffer failed for SHOW\n");
+        return -1;
+    }
+    log_msg(LOG_DEBUG, "SHOW: locked front buffer (%ux%u)",
+            gbm_bo_get_width(new_bo), gbm_bo_get_height(new_bo));
+
+    uint32_t new_fb = 0;
+    int ret = drmModeAddFB(g.drm_fd,
+                           gbm_bo_get_width(new_bo), gbm_bo_get_height(new_bo),
+                           24, 32, gbm_bo_get_stride(new_bo),
+                           gbm_bo_get_handle(new_bo).u32, &new_fb);
+    if (ret != 0) {
+        log_msg(LOG_ERROR, "SHOW: drmModeAddFB failed: %s", strerror(errno));
+        fprintf(stderr, "Warning: drmModeAddFB failed for SHOW: %s\n",
+                strerror(errno));
+        gbm_surface_release_buffer(g.gbm_surf, new_bo);
+        log_msg(LOG_DEBUG, "SHOW: released new buffer after AddFB failure");
+        return -1;
+    }
+    log_msg(LOG_DEBUG, "SHOW: drmModeAddFB ok (fb=%u)", new_fb);
+
+    ret = drmModeSetCrtc(g.drm_fd, g.crtc_id, new_fb, 0, 0,
+                         &conn->connector_id, 1, mode);
+    if (ret != 0) {
+        log_msg(LOG_ERROR, "SHOW: drmModeSetCrtc failed: %s", strerror(errno));
+        fprintf(stderr, "Warning: drmModeSetCrtc failed for SHOW: %s\n",
+                strerror(errno));
+        drmModeRmFB(g.drm_fd, new_fb);
+        gbm_surface_release_buffer(g.gbm_surf, new_bo);
+        log_msg(LOG_DEBUG, "SHOW: cleaned up new fb/buffer, old scanout kept");
+        return -1;
+    }
+
+    /* The new framebuffer is live; only now release the old scanout buffer. */
+    if (g.scanout_fb.bo) {
+        log_msg(LOG_DEBUG, "SHOW: releasing old scanout fb=%u",
+                g.scanout_fb.fb_id);
+        drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
+        gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+    }
+    g.scanout_fb.bo    = new_bo;
+    g.scanout_fb.fb_id = new_fb;
+
+    log_msg(LOG_INFO, "SHOW displayed: %s (fb=%u)", g.show_path, new_fb);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -608,9 +839,19 @@ int main(void)
 {
     memset(&g, 0, sizeof(g));
     g.running = 1;
+
+    /* stdout/stderr are suppressed by systemd; diagnostics go to tmpfs. */
+    if (log_open(DISPLAY_LOG_PATH) != 0) {
+        fprintf(stderr, "Warning: cannot open %s, logging to stderr\n",
+                DISPLAY_LOG_PATH);
+    }
+    log_msg(LOG_INFO, "Starting photo-frame-display (log %s)", DISPLAY_LOG_PATH);
+
     struct display_config cfg = read_display_config();
     g.fade_duration = cfg.fade_duration;
     g.skip_frames = cfg.skip_frames;
+    log_msg(LOG_INFO, "Display config: fade=%.1fs skip_frames=%d",
+            cfg.fade_duration, cfg.skip_frames);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -619,13 +860,16 @@ int main(void)
     sa.sa_flags = 0; /* do NOT restart syscalls */
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
+    log_msg(LOG_DEBUG, "Signal handlers installed for SIGTERM/SIGINT");
 
     /* ---- DRM/GBM/EGL setup --------------------------------------------- */
     g.drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     CHECK(g.drm_fd >= 0, "open /dev/dri/card0");
+    log_msg(LOG_INFO, "Opened /dev/dri/card0 (fd=%d)", g.drm_fd);
 
     g.gbm_dev = gbm_create_device(g.drm_fd);
     CHECK(g.gbm_dev, "gbm_create_device");
+    log_msg(LOG_DEBUG, "GBM device created");
 
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
@@ -638,6 +882,9 @@ int main(void)
     EGL_CHECK(ok, ok, "eglInitialize");
     ok = eglBindAPI(EGL_OPENGL_ES_API);
     EGL_CHECK(ok, ok, "eglBindAPI");
+    log_msg(LOG_INFO, "EGL initialized: %s",
+            eglQueryString(g.egl_dpy, EGL_VERSION) ?
+                eglQueryString(g.egl_dpy, EGL_VERSION) : "unknown");
 
     EGLConfig config;
     EGLint num_configs;
@@ -675,13 +922,15 @@ int main(void)
     if (!mode) mode = &conn->modes[0];
     g.mode_w = mode->hdisplay;
     g.mode_h = mode->vdisplay;
-    g.screen_aspect = (float)g.mode_w / (float)g.mode_h;
-    printf("Mode: %dx%d (aspect %.3f)\n", g.mode_w, g.mode_h, g.screen_aspect);
+    g.screen_aspect = image_aspect_ratio(g.mode_w, g.mode_h);
+    log_msg(LOG_INFO, "Mode: %dx%d (aspect %.3f)", g.mode_w, g.mode_h, g.screen_aspect);
 
     const char *sock_path_env = getenv("DISPLAY_SOCKET_PATH");
     const char *sock_path = sock_path_env ? sock_path_env : SOCKET_PATH;
     const char *ctrl_sock_path_env = getenv("CONTROL_SOCKET_PATH");
     const char *ctrl_sock_path = ctrl_sock_path_env ? ctrl_sock_path_env : CONTROL_SOCKET_PATH;
+    log_msg(LOG_INFO, "Display socket path: %s", sock_path);
+    log_msg(LOG_INFO, "Control socket path: %s", ctrl_sock_path);
 
     uint32_t crtc_id = 0;
     drmModeEncoder *enc = drmModeGetEncoder(g.drm_fd, conn->encoder_id);
@@ -704,14 +953,18 @@ int main(void)
     }
     CHECK(crtc_id, "no suitable CRTC");
     g.crtc_id = crtc_id;
-    printf("CRTC %u\n", g.crtc_id);
+    log_msg(LOG_INFO, "Using CRTC %u", g.crtc_id);
 
     g.saved_crtc = drmModeGetCrtc(g.drm_fd, g.crtc_id);
+    if (!g.saved_crtc) {
+        log_msg(LOG_WARN, "drmModeGetCrtc failed: %s", strerror(errno));
+    }
 
     g.gbm_surf = gbm_surface_create(g.gbm_dev, g.mode_w, g.mode_h,
                                     GBM_FORMAT_ARGB8888,
                                     GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT);
     CHECK(g.gbm_surf, "gbm_surface_create");
+    log_msg(LOG_DEBUG, "GBM surface created (%dx%d)", g.mode_w, g.mode_h);
 
     g.egl_surf = eglCreateWindowSurface(g.egl_dpy, config,
                                          (EGLNativeWindowType)g.gbm_surf, NULL);
@@ -793,7 +1046,7 @@ int main(void)
     CHECK(ret == 0, "bind %s", sock_path);
     ret = listen(g.listen_fd, 1);
     CHECK(ret == 0, "listen");
-    printf("Listening on %s\n", sock_path);
+    log_msg(LOG_INFO, "Display socket listening on %s", sock_path);
 
     int flags = fcntl(g.listen_fd, F_GETFL, 0);
     fcntl(g.listen_fd, F_SETFL, flags | O_NONBLOCK);
@@ -812,7 +1065,7 @@ int main(void)
     CHECK(ret == 0, "bind %s", ctrl_sock_path);
     ret = listen(g.control_listen_fd, 1);
     CHECK(ret == 0, "control listen");
-    printf("Control listening on %s\n", ctrl_sock_path);
+    log_msg(LOG_INFO, "Control socket listening on %s", ctrl_sock_path);
 
     flags = fcntl(g.control_listen_fd, F_GETFL, 0);
     fcntl(g.control_listen_fd, F_SETFL, flags | O_NONBLOCK);
@@ -824,13 +1077,19 @@ int main(void)
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = g.drm_fd;
-    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.drm_fd, &ev);
+    if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.drm_fd, &ev) != 0) {
+        log_msg(LOG_ERROR, "epoll_ctl ADD drm fd failed: %s", strerror(errno));
+    }
 
     ev.data.fd = g.listen_fd;
-    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.listen_fd, &ev);
+    if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.listen_fd, &ev) != 0) {
+        log_msg(LOG_ERROR, "epoll_ctl ADD display socket failed: %s", strerror(errno));
+    }
 
     ev.data.fd = g.control_listen_fd;
-    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.control_listen_fd, &ev);
+    if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.control_listen_fd, &ev) != 0) {
+        log_msg(LOG_ERROR, "epoll_ctl ADD control socket failed: %s", strerror(errno));
+    }
 
     /* ---- Main event loop ----------------------------------------------- */
     drmEventContext evctx = {
@@ -839,48 +1098,15 @@ int main(void)
     };
 
     signal(SIGPIPE, SIG_IGN);
-    printf("Waiting for 2 images via %s...\n", SOCKET_PATH);
+    log_msg(LOG_INFO, "Waiting for 2 images via %s", sock_path);
 
     while (1) {
         if (!g.running) break;
 
         /* Handle SHOW command from control socket (connector is accessible here) */
         if (g.show_image && g.paused) {
-            load_image_into_slot(0, g.show_path);
-            g.current_slot = 0;
-            g.slots[1].occupied = 0;
             g.show_image = 0;
-
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
-            glUniform1f(g.u_alpha_loc, 1.0f);
-            GLfloat verts[16];
-            build_quad((float)g.slots[0].w / (float)g.slots[0].h,
-                       g.screen_aspect, verts);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-            EGLBoolean ok_show = eglSwapBuffers(g.egl_dpy, g.egl_surf);
-            if (ok_show) {
-                if (g.scanout_fb.bo) {
-                    drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
-                    gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
-                }
-                g.scanout_fb.bo = gbm_surface_lock_front_buffer(g.gbm_surf);
-                CHECK(g.scanout_fb.bo, "lock front buffer (SHOW)");
-                uint32_t hnd = gbm_bo_get_handle(g.scanout_fb.bo).u32;
-                uint32_t pit = gbm_bo_get_stride(g.scanout_fb.bo);
-                uint32_t bw  = gbm_bo_get_width(g.scanout_fb.bo);
-                uint32_t bh  = gbm_bo_get_height(g.scanout_fb.bo);
-                int ret2 = drmModeAddFB(g.drm_fd, bw, bh, 24, 32,
-                                        pit, hnd, &g.scanout_fb.fb_id);
-                CHECK(ret2 == 0, "drmModeAddFB (SHOW)");
-                ret = drmModeSetCrtc(g.drm_fd, g.crtc_id, g.scanout_fb.fb_id,
-                                     0, 0, &conn->connector_id, 1, mode);
-                CHECK(ret == 0, "drmModeSetCrtc (SHOW)");
-            }
-            printf("Control SHOW rendered: %s\n", g.show_path);
+            handle_show_command(conn, mode);
         }
 
         int timeout = -1;
@@ -904,45 +1130,82 @@ int main(void)
                 if (!g.running) break;
                 continue;
             }
-            perror("epoll_wait");
+            log_msg(LOG_ERROR, "epoll_wait failed: %s", strerror(errno));
+            fprintf(stderr, "epoll_wait: %s\n", strerror(errno));
             break;
         }
 
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             if (fd == g.drm_fd) {
-                drmHandleEvent(g.drm_fd, &evctx);
+                if (drmHandleEvent(g.drm_fd, &evctx) != 0) {
+                    log_msg(LOG_ERROR, "drmHandleEvent failed: %s", strerror(errno));
+                }
             } else if (fd == g.listen_fd) {
                 int c = accept4(g.listen_fd, NULL, NULL, SOCK_CLOEXEC);
-                if (c >= 0) {
+                if (c < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        log_msg(LOG_WARN, "accept4(display socket) failed: %s",
+                                strerror(errno));
+                    }
+                } else {
                     if (g.conn_fd >= 0) {
-                        printf("New manager connection, closing old one\n");
-                        close(g.conn_fd);
                         epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, g.conn_fd, NULL);
+                        close_manager_conn("replaced by new manager connection");
                     }
                     g.conn_fd = c;
+                    g.sock_len = 0;
+                    g.sock_buf[0] = '\0';
                     int f = fcntl(g.conn_fd, F_GETFL, 0);
-                    fcntl(g.conn_fd, F_SETFL, f | O_NONBLOCK);
+                    if (f < 0) {
+                        log_msg(LOG_WARN, "fcntl(GETFL) on manager fd failed: %s",
+                                strerror(errno));
+                    } else {
+                        fcntl(g.conn_fd, F_SETFL, f | O_NONBLOCK);
+                    }
                     ev.events = EPOLLIN;
                     ev.data.fd = g.conn_fd;
-                    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.conn_fd, &ev);
-                    printf("Manager connected\n");
+                    if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.conn_fd, &ev) != 0) {
+                        log_msg(LOG_ERROR, "epoll_ctl ADD manager fd failed: %s",
+                                strerror(errno));
+                        close_manager_conn("epoll add failed");
+                    } else {
+                        log_msg(LOG_INFO, "Manager connected (fd=%d)", g.conn_fd);
+                    }
                 }
             } else if (fd == g.control_listen_fd) {
                 int cc = accept4(g.control_listen_fd, NULL, NULL, SOCK_CLOEXEC);
-                if (cc >= 0) {
+                if (cc < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        log_msg(LOG_WARN, "accept4(control socket) failed: %s",
+                                strerror(errno));
+                    }
+                } else {
                     if (g.control_conn_fd >= 0) {
-                        printf("New control connection, closing old one\n");
-                        close(g.control_conn_fd);
                         epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, g.control_conn_fd, NULL);
+                        close_control_conn("replaced by new control client");
                     }
                     g.control_conn_fd = cc;
+                    g.control_len = 0;
+                    g.control_buf[0] = '\0';
                     int f2 = fcntl(g.control_conn_fd, F_GETFL, 0);
-                    fcntl(g.control_conn_fd, F_SETFL, f2 | O_NONBLOCK);
+                    if (f2 < 0) {
+                        log_msg(LOG_WARN, "fcntl(GETFL) on control fd failed: %s",
+                                strerror(errno));
+                    } else {
+                        fcntl(g.control_conn_fd, F_SETFL, f2 | O_NONBLOCK);
+                    }
                     ev.events = EPOLLIN;
                     ev.data.fd = g.control_conn_fd;
-                    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.control_conn_fd, &ev);
-                    printf("Control client connected\n");
+                    if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD,
+                                  g.control_conn_fd, &ev) != 0) {
+                        log_msg(LOG_ERROR, "epoll_ctl ADD control fd failed: %s",
+                                strerror(errno));
+                        close_control_conn("epoll add failed");
+                    } else {
+                        log_msg(LOG_INFO, "Control client connected (fd=%d)",
+                                g.control_conn_fd);
+                    }
                 }
             } else if (fd == g.control_conn_fd) {
                 handle_control_data();
@@ -965,12 +1228,12 @@ int main(void)
         /* Waiting for initial images */
         if (g.phase == PHASE_WAITING) {
             if (g.slots[0].occupied && g.slots[1].occupied) {
-                printf("Both slots filled. Starting display.\n");
+                log_msg(LOG_INFO, "Both slots filled, starting display");
                 g.current_slot = 0;
 
                 /* Commit first frame synchronously */
                 GLfloat verts[16];
-                build_quad((float)g.slots[0].w / g.slots[0].h,
+                build_quad(image_aspect_ratio(g.slots[0].w, g.slots[0].h),
                            g.screen_aspect, verts);
                 glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
                 glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
@@ -991,13 +1254,14 @@ int main(void)
                 CHECK(ret == 0, "drmModeAddFB (init)");
 
                 if (drmSetMaster(g.drm_fd) < 0) {
-                    printf("Warning: drmSetMaster failed: %s\n", strerror(errno));
+                    log_msg(LOG_WARN, "drmSetMaster failed: %s", strerror(errno));
                 }
                 drmModeSetCrtc(g.drm_fd, g.crtc_id, 0, 0, 0, NULL, 0, NULL);
                 ret = drmModeSetCrtc(g.drm_fd, g.crtc_id, g.scanout_fb.fb_id,
                                      0, 0, &conn->connector_id, 1, mode);
                 CHECK(ret == 0, "drmModeSetCrtc (init)");
-                printf("First frame committed.\n");
+                log_msg(LOG_INFO, "First frame committed (fb=%u)",
+                        g.scanout_fb.fb_id);
 
                 g.phase = PHASE_HOLDING;
                 send_ready();
@@ -1030,8 +1294,22 @@ int main(void)
     }
 
     /* ---- Cleanup ------------------------------------------------------- */
+    if (g.term_signal == SIGTERM) {
+        log_msg(LOG_INFO, "Received SIGTERM, shutting down");
+    } else if (g.term_signal == SIGINT) {
+        log_msg(LOG_INFO, "Received SIGINT, shutting down");
+    } else {
+        log_msg(LOG_INFO, "Display loop exited, shutting down");
+    }
+
     if (g.pending_pixels) stbi_image_free(g.pending_pixels);
+    if (g.pending_fb.bo) {
+        log_msg(LOG_DEBUG, "Releasing pending fb=%u", g.pending_fb.fb_id);
+        drmModeRmFB(g.drm_fd, g.pending_fb.fb_id);
+        gbm_surface_release_buffer(g.gbm_surf, g.pending_fb.bo);
+    }
     if (g.scanout_fb.bo) {
+        log_msg(LOG_DEBUG, "Releasing scanout fb=%u", g.scanout_fb.fb_id);
         drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
         gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
     }
@@ -1040,6 +1318,7 @@ int main(void)
                        g.saved_crtc->x, g.saved_crtc->y,
                        &conn->connector_id, 1, &g.saved_crtc->mode);
         drmModeFreeCrtc(g.saved_crtc);
+        log_msg(LOG_DEBUG, "Restored saved CRTC");
     }
     eglDestroySurface(g.egl_dpy, g.egl_surf);
     eglDestroyContext(g.egl_dpy, g.egl_ctx);
@@ -1049,12 +1328,14 @@ int main(void)
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
     close(g.drm_fd);
-    if (g.conn_fd >= 0) close(g.conn_fd);
+    close_manager_conn("shutdown");
     close(g.listen_fd);
-    if (g.control_conn_fd >= 0) close(g.control_conn_fd);
+    close_control_conn("shutdown");
     close(g.control_listen_fd);
     close(g.epoll_fd);
     unlink(sock_path);
     unlink(ctrl_sock_path);
+    log_msg(LOG_INFO, "Clean shutdown complete");
+    log_close();
     return 0;
 }

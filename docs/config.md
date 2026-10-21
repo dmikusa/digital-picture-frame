@@ -139,14 +139,32 @@ a USB drive is inserted during an existing session.
 While a USB drive is being imported, the screen shows "Importing photos...".
 Inserting a USB drive during config mode stops the old admin server (and its
 password/port), imports the drive, then starts a fresh setup session. If the
-display app is not ready when config mode starts, entry is retried; the manager
-does not exit.
+admin server cannot be created, entry is retried; the manager does not exit. A
+display app that cannot show the QR screen never stops the admin server, and the
+setup details remain available in `/tmp/photo-frame-setup.txt` (see below).
 
 The QR code and the primary URL use the frame's detected LAN address
 (`http://<ip>:<port>`), so a phone on the same network can connect without any
 name-resolution setup. `http://photo-frame.local:<port>` is shown as an optional
 alternative. See [deployment.md](deployment.md#optional-mdns-hostname) for the
 optional mDNS configuration.
+
+### Setup fallback file
+
+The screen is only one way to get the setup URL and password. While config mode
+is active the manager also writes `/tmp/photo-frame-setup.txt` with mode 0600,
+owned by the service user. It contains the primary URL, the
+`http://photo-frame.local:<port>` alternative, the username (`photo-frame`), and
+the password for the current session. An info line is logged with the path when
+the file is written.
+
+If the display app cannot show the QR screen (for example because it closed the
+control socket), config mode stays active: the admin server keeps running, the
+failure is logged, and the manager retries the screen. If the fallback file goes
+missing while config mode is active, the next screen retry recreates it. Open the
+URL from the fallback file, or copy it off the frame, to finish setup. The file
+is removed when config mode exits — after **Finish**, on USB removal, on the idle
+timeout, and on shutdown.
 
 The admin session stages changes in memory. **Finish** validates them and
 atomically rewrites this file; leaving config mode (USB removal or the

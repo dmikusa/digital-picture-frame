@@ -56,6 +56,35 @@ static int test_build_quad(void)
     return 0;
 }
 
+static int test_image_aspect_ratio(void)
+{
+    // Valid dimensions divide normally
+    TEST_ASSERT(image_aspect_ratio(1920, 1080) > 1.77f);
+    TEST_ASSERT(image_aspect_ratio(1920, 1080) < 1.78f);
+    TEST_ASSERT(image_aspect_ratio(1080, 1920) > 0.56f);
+    TEST_ASSERT(image_aspect_ratio(1080, 1920) < 0.57f);
+
+    // Square image is 1.0
+    TEST_ASSERT(image_aspect_ratio(500, 500) == 1.0f);
+
+    // Zero and negative dimensions fall back instead of dividing by zero
+    TEST_ASSERT(image_aspect_ratio(0, 1080) == DEFAULT_ASPECT_RATIO);
+    TEST_ASSERT(image_aspect_ratio(1920, 0) == DEFAULT_ASPECT_RATIO);
+    TEST_ASSERT(image_aspect_ratio(0, 0) == DEFAULT_ASPECT_RATIO);
+    TEST_ASSERT(image_aspect_ratio(-1, 1080) == DEFAULT_ASPECT_RATIO);
+
+    // The fallback aspect ratio must not produce NaNs in build_quad
+    float v[16];
+    build_quad(image_aspect_ratio(0, 0), 16.0f / 9.0f, v);
+    TEST_ASSERT(v[0] > -1.0f && v[0] < 1.0f);
+    TEST_ASSERT(v[4] > -1.0f && v[4] < 1.0f);
+    TEST_ASSERT(v[1] == -1.0f);
+    TEST_ASSERT(v[13] == 1.0f);
+
+    printf("PASS: image_aspect_ratio\n");
+    return 0;
+}
+
 static int test_read_display_config(void)
 {
     // Save and clear env vars
@@ -178,6 +207,7 @@ int main(void)
 {
     int failures = 0;
     failures += test_build_quad();
+    failures += test_image_aspect_ratio();
     failures += test_read_display_config();
     failures += test_select_image_destination();
     failures += test_parse_protocol_buffer();

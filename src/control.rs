@@ -36,6 +36,19 @@ impl ControlClient {
         }
     }
 
+    /// Like [`ControlClient::new`] but with a shorter connect/write timeout.
+    ///
+    /// Only used by tests, which must not wait five seconds for a socket that
+    /// will never appear.
+    #[cfg(test)]
+    pub(crate) fn with_timeout(socket_path: &Path, timeout: Duration) -> Self {
+        ControlClient {
+            socket_path: socket_path.to_path_buf(),
+            stream: None,
+            timeout,
+        }
+    }
+
     fn connect(&mut self) -> io::Result<()> {
         if self.stream.is_some() {
             return Ok(());

@@ -22,6 +22,9 @@
 #define DEFAULT_FADE_DURATION  1.5f
 #define DEFAULT_SKIP_FRAMES    0
 
+/* Fallback when an image or mode has unusable dimensions (0 or negative). */
+#define DEFAULT_ASPECT_RATIO   1.0f
+
 struct display_config {
     float fade_duration;
     int skip_frames;
@@ -29,6 +32,10 @@ struct display_config {
 
 struct display_config read_display_config(void);
 void build_quad(float img_aspect, float screen_aspect, float *v);
+
+/* Aspect ratio (width / height) of an image, or DEFAULT_ASPECT_RATIO when
+ * either dimension is zero, negative, or not representable. */
+float image_aspect_ratio(int width, int height);
 
 /* Returns: 0 = slot 0, 1 = slot 1, 2 = pending, 3 = drop */
 int select_image_destination(int slot0_occupied, int slot1_occupied, int has_pending);
