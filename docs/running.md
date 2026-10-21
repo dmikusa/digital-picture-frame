@@ -28,8 +28,10 @@ Rotated logs are gzip-compressed at `/tmp/photo-frame.log.1.gz`,
 `/tmp/photo-frame.log.2.gz`, etc.
 
 **Note:** systemd stdout/stderr is suppressed (`StandardOutput=null`) for
-both services. `journalctl -u photo-frame-manager` will be empty. All
-intentional log output goes to the tmpfs log file above.
+both services so logging never writes to the SD card; `journalctl` stays empty.
+The manager logs to `/tmp/photo-frame.log`, the display app to
+`/tmp/photo-frame-display.log` (see below). Both live on tmpfs and are lost on
+reboot.
 
 ## Config mode fallback
 
@@ -45,3 +47,34 @@ cat /tmp/photo-frame-setup.txt
 The file is removed when config mode exits: after **Finish**, on USB removal, on
 the 10-minute idle timeout, and on shutdown. See
 [config.md](config.md#setup-fallback-file).
+
+## Display app log
+
+The display app writes diagnostics to `/tmp/photo-frame-display.log` rather
+than stdout/stderr. The service intentionally keeps
+`StandardOutput=null`/`StandardError=null` so logging never writes to the SD
+card. `/tmp` is a tmpfs, so the log lives in memory and is lost on reboot.
+
+```bash
+tail -f /tmp/photo-frame-display.log
+```
+
+Lines are UTC and timestamped:
+
+```text
+2026-10-21T12:34:56Z INFO Control command: SHOW /tmp/photo-frame-qr.jpg
+2026-10-21T12:34:56Z INFO SHOW displayed: /tmp/photo-frame-qr.jpg (fb=42)
+```
+
+The file is created with mode 0600 by the `photo-frame` service user and is
+flushed after every line; nothing is fsynced. It is capped at 256 KiB: when the
+next line would exceed that, the current file is renamed to
+`/tmp/photo-frame-display.log.1` (one backup, overwritten on the next rotation)
+and a fresh log starts. If the file cannot be opened, the app falls back to
+stderr, which systemd discards.
+
+The log covers startup (socket paths, DRM/EGL setup, fade/skip config), socket
+lifecycle and pause/resume, every control command (`CLR`/`SHOW`/`RESUME` and
+unknown commands), SHOW steps and failures, page-flip errors, fatal `CHECK`/EGL
+failures, and shutdown. Normal `IMG` loads are `DEBUG`; load failures and drops
+are `WARN`.

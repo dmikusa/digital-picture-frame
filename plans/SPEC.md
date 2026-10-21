@@ -286,6 +286,10 @@ See `docs/config.md` for the full reference and source parameters.
   `.1.gz`, `.2.gz`, and excess files are deleted. `log_max_files` controls how
   many rotated files are retained.
 - Format: `YYYY-MM-DDTHH:MM:SSZ <level> <message>`.
+- The C display app has its own minimal tmpfs logger writing to
+  `/tmp/photo-frame-display.log` (mode 0600, UTC timestamps, flushed per line).
+  It rotates once at 256 KiB to `.1` and keeps a single backup; if the file
+  cannot be opened it falls back to stderr. Nothing is fsynced.
 
 ### 1.10 Graceful Shutdown
 
