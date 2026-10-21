@@ -48,6 +48,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -74,6 +75,8 @@
 #define SOCKET_PATH            "/run/photo-frame/photo-frame.sock"
 #define CONTROL_SOCKET_PATH    "/run/photo-frame/control.sock"
 #define HOLD_DURATION_SEC      5.0f
+/* Upper bound on waiting for an in-flight page flip before a SHOW. */
+#define FLIP_WAIT_TIMEOUT_MS   1000
 
 #define CHECK(cond, ...) do { \
     if (!(cond)) { \
@@ -151,6 +154,7 @@ struct app_state {
     struct frame_buffer  scanout_fb;
     struct frame_buffer  pending_fb;
     volatile int         flip_done;
+    volatile int         flip_pending;  /* page flip queued, not yet acked */
 
     /* Phase */
     enum {
@@ -229,13 +233,14 @@ static void page_flip_handler(int fd, unsigned int frame,
 {
     (void)fd; (void)frame; (void)sec; (void)usec;
     *(volatile int *)data = 1;
+    g.flip_pending = 0;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Image loading                                                              */
 /* -------------------------------------------------------------------------- */
 
-static void load_image_into_slot(int slot_idx, const char *path)
+static int load_image_into_slot(int slot_idx, const char *path)
 {
     if (g.slots[slot_idx].occupied) {
         fprintf(stderr, "Warning: slot %d already occupied, overwriting\n", slot_idx);
@@ -245,7 +250,7 @@ static void load_image_into_slot(int slot_idx, const char *path)
     unsigned char *data = stbi_load(path, &w, &h, &ch, 4);
     if (!data) {
         fprintf(stderr, "Failed to load %s: %s\n", path, stbi_failure_reason());
-        return;
+        return 0;
     }
     printf("Loaded %s -> slot %d (%dx%d)\n", path, slot_idx, w, h);
 
@@ -257,6 +262,7 @@ static void load_image_into_slot(int slot_idx, const char *path)
     g.slots[slot_idx].w = w;
     g.slots[slot_idx].h = h;
     g.slots[slot_idx].occupied = 1;
+    return 1;
 }
 
 static void store_pending_image(const char *path)
@@ -464,7 +470,7 @@ static void render_frame(float mix, int from_slot, int to_slot)
     GLfloat verts[16];
 
     /* From image */
-    build_quad((float)g.slots[from_slot].w / (float)g.slots[from_slot].h,
+    build_quad(image_aspect_ratio(g.slots[from_slot].w, g.slots[from_slot].h),
                g.screen_aspect, verts);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
     glBindTexture(GL_TEXTURE_2D, g.slots[from_slot].tex);
@@ -472,7 +478,7 @@ static void render_frame(float mix, int from_slot, int to_slot)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     /* To image */
-    build_quad((float)g.slots[to_slot].w / (float)g.slots[to_slot].h,
+    build_quad(image_aspect_ratio(g.slots[to_slot].w, g.slots[to_slot].h),
                g.screen_aspect, verts);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
     glBindTexture(GL_TEXTURE_2D, g.slots[to_slot].tex);
@@ -480,6 +486,65 @@ static void render_frame(float mix, int from_slot, int to_slot)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     glDisable(GL_BLEND);
+}
+
+/* Release the old scanout buffer and make the just-presented pending buffer
+ * the one currently on screen. Safe to call when there is no pending buffer. */
+static void promote_pending_fb(void)
+{
+    if (!g.pending_fb.bo) return;
+
+    if (g.scanout_fb.bo) {
+        drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
+        gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+    }
+    g.scanout_fb = g.pending_fb;
+    g.pending_fb.bo    = NULL;
+    g.pending_fb.fb_id = 0;
+}
+
+/* Wait (bounded) for an in-flight page flip to be acknowledged by the kernel.
+ * Returns 0 when no flip is pending, -1 on timeout or error. */
+static int wait_for_pending_flip(int timeout_ms)
+{
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    drmEventContext evctx = {
+        .version = 2,
+        .page_flip_handler = page_flip_handler,
+    };
+
+    while (g.flip_pending) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000LL
+                             + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+        int remaining = timeout_ms - (int)elapsed_ms;
+        if (remaining <= 0) break;
+
+        struct pollfd pfd = { .fd = g.drm_fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, remaining);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                if (!g.running) return -1;
+                continue;
+            }
+            perror("poll (flip wait)");
+            return -1;
+        }
+        if (pr == 0) break;
+
+        if (drmHandleEvent(g.drm_fd, &evctx) != 0) {
+            perror("drmHandleEvent (flip wait)");
+            return -1;
+        }
+    }
+
+    if (g.flip_pending) {
+        fprintf(stderr, "Warning: page flip still pending after %d ms\n", timeout_ms);
+        return -1;
+    }
+    return 0;
 }
 
 static void request_page_flip(void)
@@ -504,6 +569,7 @@ static void request_page_flip(void)
                           DRM_MODE_PAGE_FLIP_EVENT,
                           (void *)&g.flip_done);
     CHECK(ret == 0, "drmModePageFlip");
+    g.flip_pending = 1;
 }
 
 static void start_fade(int from_slot, int to_slot)
@@ -523,15 +589,7 @@ static void start_fade(int from_slot, int to_slot)
 static void advance_fade(void)
 {
     /* Promote pending framebuffer to scanout on every flip completion */
-    if (g.pending_fb.bo) {
-        if (g.scanout_fb.bo) {
-            drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
-            gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
-        }
-        g.scanout_fb = g.pending_fb;
-        g.pending_fb.bo    = NULL;
-        g.pending_fb.fb_id = 0;
-    }
+    promote_pending_fb();
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -592,12 +650,97 @@ static void advance_fade(void)
                                   DRM_MODE_PAGE_FLIP_EVENT,
                                   (void *)&g.flip_done);
         CHECK(ret == 0, "drmModePageFlip (skip)");
+        g.flip_pending = 1;
         return;
     }
 
     /* Render next frame */
     render_frame(g.fade_progress, g.fade_from, g.fade_to);
     request_page_flip();
+}
+
+/* -------------------------------------------------------------------------- */
+/* Control-mode SHOW                                                          */
+/* -------------------------------------------------------------------------- */
+
+/* Draw the held image and put it on screen. Every failure is logged: the old
+ * scanout stays live and the process keeps running. Returns 0 on success. */
+static int handle_show_command(drmModeConnector *conn, drmModeModeInfo *mode)
+{
+    /* A slideshow page flip may still be in flight. drmModeSetCrtc returns
+     * EBUSY until the kernel acknowledges it, so drain the event first. */
+    if (g.flip_pending && wait_for_pending_flip(FLIP_WAIT_TIMEOUT_MS) < 0) {
+        fprintf(stderr, "Warning: skipping SHOW %s, page flip still pending\n",
+                g.show_path);
+        return -1;
+    }
+    g.flip_done = 0;
+
+    /* Fold a completed flip into scanout so both buffers agree. */
+    promote_pending_fb();
+
+    if (!load_image_into_slot(0, g.show_path)) {
+        fprintf(stderr, "Warning: cannot show %s, keeping current frame\n",
+                g.show_path);
+        return -1;
+    }
+    g.current_slot = 0;
+    g.slots[1].occupied = 0;
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
+    glUniform1f(g.u_alpha_loc, 1.0f);
+    GLfloat verts[16];
+    build_quad(image_aspect_ratio(g.slots[0].w, g.slots[0].h),
+               g.screen_aspect, verts);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    if (!eglSwapBuffers(g.egl_dpy, g.egl_surf)) {
+        fprintf(stderr, "Warning: eglSwapBuffers failed for SHOW (eglGetError=0x%x)\n",
+                eglGetError());
+        return -1;
+    }
+
+    struct gbm_bo *new_bo = gbm_surface_lock_front_buffer(g.gbm_surf);
+    if (!new_bo) {
+        fprintf(stderr, "Warning: gbm_surface_lock_front_buffer failed for SHOW\n");
+        return -1;
+    }
+
+    uint32_t new_fb = 0;
+    int ret = drmModeAddFB(g.drm_fd,
+                           gbm_bo_get_width(new_bo), gbm_bo_get_height(new_bo),
+                           24, 32, gbm_bo_get_stride(new_bo),
+                           gbm_bo_get_handle(new_bo).u32, &new_fb);
+    if (ret != 0) {
+        fprintf(stderr, "Warning: drmModeAddFB failed for SHOW: %s\n",
+                strerror(errno));
+        gbm_surface_release_buffer(g.gbm_surf, new_bo);
+        return -1;
+    }
+
+    ret = drmModeSetCrtc(g.drm_fd, g.crtc_id, new_fb, 0, 0,
+                         &conn->connector_id, 1, mode);
+    if (ret != 0) {
+        fprintf(stderr, "Warning: drmModeSetCrtc failed for SHOW: %s\n",
+                strerror(errno));
+        drmModeRmFB(g.drm_fd, new_fb);
+        gbm_surface_release_buffer(g.gbm_surf, new_bo);
+        return -1;
+    }
+
+    /* The new framebuffer is live; only now release the old scanout buffer. */
+    if (g.scanout_fb.bo) {
+        drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
+        gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
+    }
+    g.scanout_fb.bo    = new_bo;
+    g.scanout_fb.fb_id = new_fb;
+
+    printf("Control SHOW rendered: %s\n", g.show_path);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -675,7 +818,7 @@ int main(void)
     if (!mode) mode = &conn->modes[0];
     g.mode_w = mode->hdisplay;
     g.mode_h = mode->vdisplay;
-    g.screen_aspect = (float)g.mode_w / (float)g.mode_h;
+    g.screen_aspect = image_aspect_ratio(g.mode_w, g.mode_h);
     printf("Mode: %dx%d (aspect %.3f)\n", g.mode_w, g.mode_h, g.screen_aspect);
 
     const char *sock_path_env = getenv("DISPLAY_SOCKET_PATH");
@@ -846,41 +989,8 @@ int main(void)
 
         /* Handle SHOW command from control socket (connector is accessible here) */
         if (g.show_image && g.paused) {
-            load_image_into_slot(0, g.show_path);
-            g.current_slot = 0;
-            g.slots[1].occupied = 0;
             g.show_image = 0;
-
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
-            glUniform1f(g.u_alpha_loc, 1.0f);
-            GLfloat verts[16];
-            build_quad((float)g.slots[0].w / (float)g.slots[0].h,
-                       g.screen_aspect, verts);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-            EGLBoolean ok_show = eglSwapBuffers(g.egl_dpy, g.egl_surf);
-            if (ok_show) {
-                if (g.scanout_fb.bo) {
-                    drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
-                    gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);
-                }
-                g.scanout_fb.bo = gbm_surface_lock_front_buffer(g.gbm_surf);
-                CHECK(g.scanout_fb.bo, "lock front buffer (SHOW)");
-                uint32_t hnd = gbm_bo_get_handle(g.scanout_fb.bo).u32;
-                uint32_t pit = gbm_bo_get_stride(g.scanout_fb.bo);
-                uint32_t bw  = gbm_bo_get_width(g.scanout_fb.bo);
-                uint32_t bh  = gbm_bo_get_height(g.scanout_fb.bo);
-                int ret2 = drmModeAddFB(g.drm_fd, bw, bh, 24, 32,
-                                        pit, hnd, &g.scanout_fb.fb_id);
-                CHECK(ret2 == 0, "drmModeAddFB (SHOW)");
-                ret = drmModeSetCrtc(g.drm_fd, g.crtc_id, g.scanout_fb.fb_id,
-                                     0, 0, &conn->connector_id, 1, mode);
-                CHECK(ret == 0, "drmModeSetCrtc (SHOW)");
-            }
-            printf("Control SHOW rendered: %s\n", g.show_path);
+            handle_show_command(conn, mode);
         }
 
         int timeout = -1;
@@ -970,7 +1080,7 @@ int main(void)
 
                 /* Commit first frame synchronously */
                 GLfloat verts[16];
-                build_quad((float)g.slots[0].w / g.slots[0].h,
+                build_quad(image_aspect_ratio(g.slots[0].w, g.slots[0].h),
                            g.screen_aspect, verts);
                 glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
                 glBindTexture(GL_TEXTURE_2D, g.slots[0].tex);
@@ -1031,6 +1141,10 @@ int main(void)
 
     /* ---- Cleanup ------------------------------------------------------- */
     if (g.pending_pixels) stbi_image_free(g.pending_pixels);
+    if (g.pending_fb.bo) {
+        drmModeRmFB(g.drm_fd, g.pending_fb.fb_id);
+        gbm_surface_release_buffer(g.gbm_surf, g.pending_fb.bo);
+    }
     if (g.scanout_fb.bo) {
         drmModeRmFB(g.drm_fd, g.scanout_fb.fb_id);
         gbm_surface_release_buffer(g.gbm_surf, g.scanout_fb.bo);

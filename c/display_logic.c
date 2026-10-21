@@ -60,6 +60,14 @@ void build_quad(float img_aspect, float screen_aspect, float *v)
     v[12] = x1; v[13] = y1; v[14] = 1.0f; v[15] = 0.0f;
 }
 
+float image_aspect_ratio(int width, int height)
+{
+    if (width <= 0 || height <= 0) {
+        return DEFAULT_ASPECT_RATIO;
+    }
+    return (float)width / (float)height;
+}
+
 int select_image_destination(int slot0_occupied, int slot1_occupied, int has_pending)
 {
     if (!slot0_occupied) return 0;

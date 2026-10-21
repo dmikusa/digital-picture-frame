@@ -23,7 +23,7 @@
 #   make run      - build and run photo-frame-display
 
 CC      := gcc
-CFLAGS  := -Wall -Wextra -O2 -std=gnu11
+CFLAGS  := -Wall -Wextra -Werror -O2 -std=gnu11
 LDFLAGS :=
 
 # Display logic (no GL/DRM dependencies)
