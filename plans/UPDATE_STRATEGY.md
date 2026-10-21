@@ -11,8 +11,9 @@ It is a **living document**. Revise it when a phase lands, when the threat model
 (`plans/UPDATE_THREAT_MODEL.md`) changes, or when the owner answers an open
 question. Keep the comparison table and the requirements mapping current.
 
-Companion: `plans/UPDATE_THREAT_MODEL.md` holds the findings (`T-nn`) and the
-MUST/SHOULD/NICE requirements (`M`/`S`/`N`) referenced throughout.
+Companion: `plans/UPDATE_THREAT_MODEL.md` holds the findings (`T-S*`, `T-T*`,
+`T-R*`, `T-I*`, `T-D*`, `T-E*`) and the MUST/SHOULD/NICE requirements
+(`M1`–`M9`, `S1`–`S7`, `N1`–`N5`) referenced throughout.
 
 ---
 
@@ -57,46 +58,57 @@ the partition and bootloader work.
 
 ## 2. Requirements
 
-Distilled from `plans/UPDATE_THREAT_MODEL.md`. These are the acceptance criteria
-for any option; Section 12 maps each option against them.
+These are the acceptance criteria for any option, taken from Section 6 of
+`plans/UPDATE_THREAT_MODEL.md`. Section 11 maps each option against them.
 
 ### Must
 
-| ID | Requirement |
-|----|-------------|
-| M1 | Only owner-signed bundles install; verification fails closed. |
-| M2 | Every artifact's hash is verified against the signed manifest before use. |
-| M3 | A complete update installs from USB with no network. |
-| M4 | Photos, `config.toml`, `display.env`, index/cursors/status, and hostname/Wi-Fi/SSH identity survive. |
-| M5 | Two-phase install with automatic revert on failure; power loss is safe. |
-| M6 | No always-on listener; online checks are opt-in. |
-| M7 | Persistent, root-owned audit log of updates, separate from tmpfs logs. |
-| M8 | Monotonic sequence floor for anti-rollback, with limitations documented. |
-| M9 | Signature, product, arch, sequence, and hashes verified before any root action. |
-| M10 | Bundle extraction rejects traversal, symlinks, hardlinks, devices, and absolute paths. |
+| ID | Requirement | Source finding |
+|----|-------------|----------------|
+| M1 | Authenticated updates: every artifact is verified on-device against a key the update channel cannot obtain or replace; check before any privileged action; unsigned/invalid → refuse, log, no partial install. | T-S1, T-S2, T-T1, T-E1 |
+| M2 | Integrity covers the whole artifact set (binaries, units, and any scripts run as root), not just a manifest. | T-T1, T-E1 |
+| M3 | No root execution without verification; no "install then verify." | T-E1 |
+| M4 | Crash/power-fail safety and a rollback path: an interrupted or bad update must not brick the device, must not depend on network or display to recover, and must be able to boot the previous version or a recovery mode. | T-D1, T-D2, T-D3 |
+| M5 | Fail-closed: if verification, key handling, or version checks fail, keep running the current version. | T-S1, T-E1 |
+| M6 | Anti-rollback as far as the platform allows: reject versions below a persisted floor, and be explicit that a physical/SD attacker can defeat a software-only floor. | T-E6, T-D3 |
+| M7 | Preserve state: photos partition, `config.toml`, index/cursors/status, Wi-Fi/SSH config, and host keys survive; `config.toml` is never clobbered by a package default. | T-I1, T-D4 |
+| M8 | Least privilege for the update path; not reachable or triggerable by an unauthenticated LAN actor. | T-E4, T-D5, T-D6 |
+| M9 | Offline-capable: verification and install work from USB/local media with no internet; signing must not rely on an online OCSP/CA check. | T-S2, constraint |
 
 ### Should
 
-| ID | Requirement |
-|----|-------------|
-| S1 | Owner-initiated or owner-approved; no silent auto-update. |
-| S2 | Atomic installs; safe at every step against power loss. |
-| S3 | Key rotation and revocation without reflashing. |
-| S4 | Config schema versioning with forward migration. |
-| S5 | Least privilege for the updater and staging area. |
-| S6 | CI never holds the root/authority signing key. |
-| S7 | Health check covers both services, sockets, and index availability. |
-| S8 | Failures visible on the panel and in the audit log. |
+| ID | Requirement | Source finding |
+|----|-------------|----------------|
+| S1 | Explicit opt-in; no silent auto-update; checks and installs are owner-initiated or owner-approved. | T-I5, constraint |
+| S2 | Minimal, opt-out update checks with no device-identifying telemetry (no stable ID, coarse version only, no heartbeat). | T-I5 |
+| S3 | Signed metadata with a monotonic sequence and optional freshness date to defend against replay/freeze. | T-E6, T-S2 |
+| S4 | Audit log on persistent storage (not just tmpfs): version before/after, source, key id, result. | T-R1, T-R2 |
+| S5 | Key rotation and revocation with a documented offline process; support a new key without a reflash. | T-E2 |
+| S6 | Update-path sandboxing/atomicity: verify and stage separately, then swap; never write the running root in place. | T-D1, T-E1 |
+| S7 | Recovery tooling documented for the owner (offline image inspection, recover without losing photos). | T-D1, T-D2 |
 
 ### Nice
 
-| ID | Requirement |
-|----|-------------|
-| N1 | Opt-in online check with a minimal, privacy-preserving request. |
-| N2 | Panel notification when an automatic revert happens. |
-| N3 | Tamper-evident read-only root (dm-verity) for OS images. |
-| N4 | Release channels (stable/beta). |
-| N5 | UPS/capacitor for power-loss safety. |
+| ID | Requirement | Source finding |
+|----|-------------|----------------|
+| N1 | Reproducible builds and published hashes/SBOM so the owner can verify CI output. | B4, T-E1 |
+| N2 | Optional dm-verity / read-only root (tamper-evident, not tamper-proof, given no secure boot). | T-T2 |
+| N3 | Encrypted photos partition (LUKS, key off the SD card) to protect A1 on theft. | T-I4 |
+| N4 | Owner-run rollback command and a documented "hold" to pin a known-good version. | T-E6 |
+| N5 | Sign CI artifacts at build time with a key not exposed to the general build job, or publish checksums signed out-of-band. | T-S1, T-E2 |
+
+### Derived implementation controls
+
+A few controls the strategy relies on are not separate numbered requirements in
+the threat model. They implement M2/S6 (safe extraction) and M7 (config
+versioning):
+
+| Control | Derives from |
+|---------|--------------|
+| Bundle extraction rejects traversal, symlinks, hardlinks, devices, and absolute paths. | M2, S6 |
+| Config schema versioning (`config_version`) with forward migration. | M7 |
+| Health check covering both services, sockets, and index availability. | M4, S7 |
+| Failures visible on the panel and in the audit log. | M4, S4 |
 
 ---
 
@@ -164,16 +176,16 @@ payload/etc/photo-frame/display.env.example
 | `bundle_format` | Refuse formats the updater does not understand. |
 | `product`, `arch` | Refuse bundles for another device. |
 | `version` | Human-readable semver; used for the install dir name. |
-| `sequence` | Monotonic integer; the anti-rollback floor (M8). |
+| `sequence` | Monotonic integer; the anti-rollback floor (M6, S3). |
 | `min_version` | Refuse if the installed version is older than the bundle supports. |
-| `config_schema` | The config schema the app expects; drives migration (S4). |
-| `key_id` | Which trusted key signed it; enables rotation (S3). |
+| `config_schema` | The config schema the app expects; drives migration (M7, derived). |
+| `key_id` | Which trusted key signed it; enables rotation (S5). |
 | `artifacts[]` | Path, SHA-256, size, mode for every installed file (M2). |
 
 **Why a detached signature over the whole bundle** rather than a signature field
 inside the manifest: the signature must cover the manifest *and* the payload. A
 detached signature over the exact bundle bytes does that with no ambiguity, and
-it lets the device verify before it parses untrusted JSON (M1, M9).
+it lets the device verify before it parses untrusted JSON (M1, M3).
 
 ### 3.3 Signing
 
@@ -201,15 +213,15 @@ of this **before** touching the live install:
    `/var/lib/photo-frame/update/staging/` (0700), writing to `*.part` and
    renaming when complete. An interrupted copy is never a candidate.
 2. Verify the detached signature over the bundle bytes with the pinned key.
-   **Fail closed** on a missing/invalid signature (M1).
+   **Fail closed** on a missing/invalid signature (M1, M5).
 3. Parse `manifest.json`. Check `bundle_format`, `product`, `arch`,
-   `config_schema`, and `min_version` (M9).
+   `config_schema`, and `min_version` (M3).
 4. Compare `sequence` with the stored floor; refuse `<= floor` unless
-   `--force` is passed (M8).
+   `--force` is passed (M6).
 5. Verify each `artifacts[]` entry's SHA-256 and size against the payload (M2).
 6. Extract the payload into a **fresh** directory, rejecting absolute paths,
    `..`, symlinks, hardlinks, device nodes, and any entry outside the target
-   (M10). Set ownership to root and modes from the manifest.
+   (M2, S6). Set ownership to root and modes from the manifest.
 7. Only now proceed to install (Section 3.5).
 
 ### 3.5 Versioned installs and the flip
@@ -295,7 +307,7 @@ corrupt rootfs or boot partition, which Option A does not touch.
 3. The panel shows: "Update v0.2.0 (seq 7) ready. Remove and re-insert with
    `apply` to install." The owner adds an empty `photo-frame-update/apply` file
    (or uses the config-mode button) to approve. Presence of a valid bundle alone
-   is **not** approval (S1, T-10).
+   is **not** approval (S1, T-S1).
 4. On approval the updater verifies and installs. The panel shows progress and
    the final result.
 5. If anything fails, nothing is applied and the panel explains why.
@@ -308,7 +320,7 @@ awkward: it prevents a planted drive from installing silently.
 - **Config-mode button:** add an "Update" section to the admin UI that accepts an
   uploaded bundle (or a LAN URL) and triggers the same verified install. This
   reuses the existing rotating-password session and disappears with config mode,
-  so it adds no permanent exposure (M6).
+  so it adds no permanent exposure (M8).
 - **CLI/SSH:** `photo-frame-update install /path/to/bundle` or
   `photo-frame-update install https://host/bundle` for an owner on the LAN. The
   download is verified identically.
@@ -319,9 +331,9 @@ awkward: it prevents a planted drive from installing silently.
   `photo-frame-update check`.
 - The check does one HTTPS `GET` of a static manifest from an owner-controlled
   URL, compares `version`/`sequence`, and if newer shows a panel message and
-  writes `last-result.json`. It **does not download or install** (S1, N1).
+  writes `last-result.json`. It **does not download or install** (S1, S2).
 - Request is minimal: no device ID, no telemetry, a fixed `User-Agent`. Privacy
-  impact (T-19) is that the endpoint operator (the owner) sees the device IP and
+  impact (T-I5) is that the endpoint operator (the owner) sees the device IP and
   poll timing. Document it.
 - Installing from the online source requires the same explicit approval and the
   same signature verification as USB.
@@ -336,7 +348,7 @@ Option A never touches:
   live file is never overwritten),
 - hostname, Wi-Fi config, SSH host/user keys.
 
-The app must read configs written by older versions (S4): add
+The app must read configs written by older versions (M7): add
 `config_version = 1` to `config.toml`, migrate forward on load, and refuse to run
 if the file's schema is newer than the binary supports, with a clear panel
 message.
@@ -352,7 +364,7 @@ message.
 | Disk full | Refuse after a pre-flight space check; no changes |
 | Power loss mid-copy/extract | Nothing installed; staging is incomplete and ignored |
 | Power loss mid-flip | Atomic symlink rename leaves old or new; boot guard decides |
-| New version fails health check | Automatic revert to previous; panel message (N2) |
+| New version fails health check | Automatic revert to previous; panel message (M4, S4) |
 | New version cannot start at all | Boot guard reverts on the next boot |
 | Revert target missing | Boot guard falls back to the newest confirmed version; the original `.deb` install is seeded as `versions/<base>-0000` |
 | Corrupt rootfs/boot partition | Out of scope for A; recover via Option B or reflash |
@@ -507,15 +519,15 @@ updates are required.
 
 | Task | Why |
 |------|-----|
-| Sign release artifacts and publish a signed manifest | Prerequisite for any update (M1, M2, S6). |
-| Add `config_version` to `config.toml` + migration | Enables forward-compatible config changes (S4). |
+| Sign release artifacts and publish a signed manifest | Prerequisite for any update (M1, M2, N5). |
+| Add `config_version` to `config.toml` + migration | Enables forward-compatible config changes (M7). |
 | Add the versioned install layout (`/opt/photo-frame/versions`, `current`) and seed `versions/<base>-0000` from the current `.deb` | Makes the flip possible without a partition change. |
-| Add `/var/lib/photo-frame/update/` (sequence, pending, confirmed, audit) | Update state and audit (M7, M8). |
-| Add `photo-frame-boot-guard.service` | Rollback safety (M5). |
+| Add `/var/lib/photo-frame/update/` (sequence, pending, confirmed, audit) | Update state and audit (M6, S4). |
+| Add `photo-frame-boot-guard.service` | Rollback safety (M4). |
 | Add `/run/photo-frame/healthy` from the manager | Health check signal (S7). |
-| Keep `display.env`/`config.toml` as conffiles; ship defaults as `.example` | State preservation (M4). |
-| Publish a **two-tier** signing setup (offline root key + CI build key) | CI usefulness without the root key (S6). |
-| Phase 0 hardening (Section 11) | The update mechanism should not rest on unhardened primitives (T-03/04/05/15). |
+| Keep `display.env`/`config.toml` as conffiles; ship defaults as `.example` | State preservation (M7). |
+| Publish a **two-tier** signing setup (offline root key + CI build key) | CI usefulness without the root key (S5, N5). |
+| Phase 0 hardening (Section 12) | The update mechanism should not rest on unhardened primitives (T-T3, T-T5, T-E4, T-D5, T-D6). |
 
 ### 5.2 Interfaces and reservations to fix now
 
@@ -559,8 +571,8 @@ These are cheap now and expensive later:
 | Transport | Works offline | Required | Privacy impact |
 |-----------|---------------|----------|----------------|
 | Offline USB | Yes | FAT stick, signed bundle + signature, `photo-frame-update/` marker and `apply` file | None. No network. |
-| LAN / local (config-mode upload, SSH, `scp`) | Yes (LAN only) | Owner device on the same LAN; existing admin session or SSH; verified bundle | LAN only; credentials cross the LAN as today (T-02). |
-| Online check (opt-in) | No | Internet + owner-controlled HTTPS endpoint; timer enabled | Endpoint sees device IP and poll timing; no device ID (T-19). |
+| LAN / local (config-mode upload, SSH, `scp`) | Yes (LAN only) | Owner device on the same LAN; existing admin session or SSH; verified bundle | LAN only; credentials cross the LAN as today (T-S3, T-I2). |
+| Online check (opt-in) | No | Internet + owner-controlled HTTPS endpoint; timer enabled | Endpoint sees device IP and poll timing; no device ID (T-I5). |
 | Online install (opt-in) | No | Same as check, plus explicit approval and signature verification | As above; payload downloaded from the owner's endpoint. |
 | SD reflash | Yes | A computer + card reader | N/A. **Fallback only**; loses state. Not an update path. |
 
@@ -577,7 +589,7 @@ and ignore expiry/trust paths. Both are acceptable; pick one and document it.
 
 ### 7.2 Keys
 
-Two tiers, so CI can build without holding the root key (S6):
+Two tiers, so CI can build without holding the root key (S5, N5):
 
 | Key | Where | Signs | Compromise impact |
 |-----|-------|-------|-------------------|
@@ -617,12 +629,13 @@ publishing. CI then holds no signing key at all.
 
 - Store a monotonic `sequence` in `/var/lib/photo-frame/update/sequence`
   (root-owned). Refuse bundles with `sequence <= floor` unless explicitly forced.
-- **Limits (documented, per T-08/T-16/A1):** the floor lives on the same SD
-  card. An attacker with physical access can edit it and reinstall an older
-  validly signed bundle. A full reflash resets it. The floor therefore stops
-  network/MITM downgrades and accidental downgrades, **not** physical attacks.
-- Do **not** use timestamps for the floor: there is no RTC and the clock can be
-  wrong (A2, T-16).
+- **Limits (documented, per T-E6/T-D3 and assumption A-4):** the floor lives on
+  the same SD card. An attacker with physical access can edit it and reinstall
+  an older validly signed bundle. A full reflash resets it. The floor therefore
+  stops network/MITM downgrades and accidental downgrades, **not** physical
+  attacks.
+- Do **not** use timestamps for the floor: the device clock is not a trust
+  anchor (see `plans/UPDATE_THREAT_MODEL.md` §7, anti-rollback).
 
 ---
 
@@ -678,7 +691,7 @@ step that can brick the device, so the design must avoid it.
 | Wi-Fi | `/etc/wpa_supplicant` (or DietPi config) | Preserved | Preserved via state partition |
 | SSH identity | `/etc/ssh`, `authorized_keys` | Preserved | Preserved via state partition |
 
-**Config schema versioning (S4):** add `config_version = 1` to `config.toml`.
+**Config schema versioning (M7):** add `config_version = 1` to `config.toml`.
 On load: if the file version is older, migrate forward and rewrite atomically; if
 newer than the binary supports, refuse to run with a clear panel/log message.
 Migration functions must be idempotent and covered by tests.
@@ -691,7 +704,7 @@ Migration functions must be idempotent and covered by tests.
 
 | Method | How | Approval |
 |--------|-----|----------|
-| USB marker | `photo-frame-update/` dir with a signed bundle; then add `apply` | Explicit second physical step (S1, T-10) |
+| USB marker | `photo-frame-update/` dir with a signed bundle; then add `apply` | Explicit second physical step (S1, T-S1) |
 | Config-mode button | Upload/URL in the admin UI | Owner is in the authenticated session |
 | CLI/SSH | `photo-frame-update install <path|url>` | Owner runs it |
 | Online check | `photo-frame-update check` or an opt-in timer | Notification only; install still needs approval |
@@ -702,7 +715,7 @@ Migration functions must be idempotent and covered by tests.
 - "Verifying update…"
 - "Applying update… the frame may restart."
 - "Updated to vX."
-- "Update failed: <reason>. Reverted to vN." (N2)
+- "Update failed: <reason>. Reverted to vN." (M4, S4)
 - "Update rejected: bad signature." / "wrong device" / "not newer".
 
 These use the existing control socket (`CLR`/`SHOW`) and status-screen rendering
@@ -715,7 +728,7 @@ in `src/qr.rs` / `src/config_mode.rs`, so no new display protocol is needed.
   `/api/status` alongside sync status.
 - A line in the persistent audit log.
 
-### 10.4 Audit log (M7)
+### 10.4 Audit log (S4)
 
 `/var/lib/photo-frame/update/audit.log`, root-owned, mode 0600, on persistent
 storage (not tmpfs). One line per attempt:
@@ -734,34 +747,32 @@ tmpfs operational logs in `/tmp/photo-frame.log`, which do not survive a reboot.
 
 | Req | Option A | Option B | Option C |
 |-----|----------|----------|----------|
-| M1 authenticity | Satisfied (pinned key, fail closed) | Satisfied (signed image/manifest) | Satisfied |
-| M2 integrity | Satisfied (per-artifact hashes) | Satisfied (image hash + dm-verity) | Satisfied |
-| M3 offline | Satisfied (USB) | Satisfied (USB image) | Satisfied |
-| M4 state preservation | Satisfied by construction | Satisfied via state partition | Satisfied |
-| M5 rollback | Satisfied (health check + boot guard) | Satisfied (U-Boot/recovery kernel) | Satisfied |
-| M6 no permanent exposure | Satisfied (config mode only; opt-in check) | Satisfied | Satisfied |
-| M7 audit log | Satisfied | Satisfied | Satisfied |
-| M8 anti-rollback floor | Satisfied (sequence; physical limits documented) | Satisfied (same; dm-verity detects tamper) | Satisfied |
-| M9 verify before privilege | Satisfied | Satisfied | Satisfied |
-| M10 safe extraction | Satisfied | Satisfied (image apply) | Satisfied |
+| M1 authenticated updates | Satisfied (pinned key, fail closed) | Satisfied (signed image/manifest) | Satisfied |
+| M2 whole-artifact integrity | Satisfied (per-artifact hashes) | Satisfied (image hash + dm-verity) | Satisfied |
+| M3 no root action before verify | Satisfied | Satisfied | Satisfied |
+| M4 crash/power-fail + rollback | Satisfied (health check + boot guard) | Satisfied (U-Boot/recovery kernel) | Satisfied |
+| M5 fail-closed | Satisfied | Satisfied | Satisfied |
+| M6 anti-rollback floor | Satisfied (sequence; physical limits documented) | Satisfied (same; dm-verity detects tamper) | Satisfied |
+| M7 state preservation | Satisfied by construction | Satisfied via state partition | Satisfied |
+| M8 least privilege / not LAN-triggerable | Satisfied (root updater, narrow staging, config-mode only) | Satisfied | Satisfied |
+| M9 offline-capable | Satisfied (USB) | Satisfied (USB image) | Satisfied |
 | S1 owner approval | Satisfied (explicit step) | Satisfied | Satisfied |
-| S2 atomicity | Satisfied on ext4; no FAT writes | Satisfied if `config.txt` is not rewritten | Satisfied |
-| S3 rotation/revocation | Satisfied (key set + signed statements) | Satisfied | Satisfied |
-| S4 config schema | Satisfied (`config_version`) | Satisfied | Satisfied |
-| S5 least privilege | Satisfied (root updater, narrow staging) | Satisfied | Satisfied |
-| S6 CI without root key | Satisfied (two-tier) | Satisfied | Satisfied |
-| S7 health check | Satisfied | Satisfied (watchdog + boot_ok) | Satisfied |
-| S8 visible failures | Satisfied | Satisfied | Satisfied |
-| N1 opt-in online | Satisfied | Satisfied | Satisfied |
-| N2 revert notice | Satisfied | Satisfied | Satisfied |
-| N3 dm-verity | Not applicable (no OS image) | Satisfied | Satisfied (Phase 2) |
-| N4 channels | Optional | Optional | Optional |
-| N5 UPS | N/A | N/A | N/A |
+| S2 minimal opt-out checks | Satisfied (opt-in timer, no device ID) | Satisfied | Satisfied |
+| S3 signed metadata + sequence | Satisfied | Satisfied | Satisfied |
+| S4 persistent audit | Satisfied | Satisfied | Satisfied |
+| S5 key rotation/revocation | Satisfied (key set + signed statements) | Satisfied | Satisfied |
+| S6 sandboxing/atomicity | Satisfied on ext4; no FAT writes | Satisfied if `config.txt` is not rewritten | Satisfied |
+| S7 recovery tooling | Satisfied (runbook + seeded previous version) | Satisfied (recovery partition) | Satisfied |
+| N1 reproducible builds/hashes | Optional (Phase 0) | Optional | Optional |
+| N2 dm-verity | Not applicable (no OS image) | Satisfied | Satisfied (Phase 2) |
+| N3 encrypted photos | Optional (separate) | Optional (separate) | Optional (separate) |
+| N4 rollback command / hold | Satisfied (CLI) | Satisfied | Satisfied |
+| N5 sign CI artifacts | Satisfied (two-tier) | Satisfied | Satisfied |
 
 Option A fails none of the MUST requirements. Its only material gap versus
 Option B is that it cannot patch the OS/kernel/dependencies (not a MUST) and
-that its rollback is userspace rather than bootloader-level (M5 is still met
-because the kernel is unchanged).
+that its rollback is userspace rather than bootloader-level (M4 is still met
+because the kernel is unchanged, so the boot guard always runs).
 
 ---
 
@@ -769,18 +780,20 @@ because the kernel is unchanged).
 
 ### Phase 0 — Current-state hardening (prerequisite)
 
-These are the findings the update mechanism must not rest on (T-01…T-06,
-T-15).
+These are the findings the update mechanism must not rest on (T-T3, T-T5,
+T-E1, T-E4, T-D5, T-D6).
 
 | Task | Finding |
 |------|---------|
-| Publish signed release artifacts + a signed manifest; adopt the two-tier key split | T-06, S6 |
-| Systemd sandboxing: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictAddressFamilies=`, `SystemCallFilter=@system-service`, and explicit `ReadWritePaths=` for the photos dir, `/run/photo-frame`, `/etc/photo-frame` | T-15 |
-| Admin API hardening: constant-time credential comparison (replace `==` in `check_auth`), request-size limits, and a simple rate limit/lockout | T-01 |
-| ImageMagick sandboxing: a hardened `policy.xml` (disable Ghostscript, MVG/MSL, SVG, PDF, and unused coders; set resource limits), run under a restricted profile/namespace | T-04, T-14 |
-| Fix `token_uri` SSRF: ignore `token_uri` for service accounts or restrict it to the Google token host; reject private/loopback/link-local targets and `http://` | T-05 |
-| Add `config_version` and migration | S4 |
+| Publish signed release artifacts + a signed manifest; adopt the two-tier key split | T-S1, T-E1, T-E2, N5 |
+| Systemd sandboxing: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictAddressFamilies=`, `SystemCallFilter=@system-service`, and explicit `ReadWritePaths=` for the photos dir, `/run/photo-frame`, `/etc/photo-frame` | T-E4 |
+| Admin API hardening: constant-time credential comparison (replace `==` in `check_auth`), CSRF protection (Origin/Referer check), request-size limits, and a simple rate limit/lockout | T-D5, T-D6 |
+| ImageMagick sandboxing: a hardened `policy.xml` (disable Ghostscript, MVG/MSL, SVG, PDF, and unused coders; set resource limits), run under a restricted profile/namespace | T-T3, T-E3 |
+| Fix `token_uri` SSRF: ignore `token_uri` for service accounts or restrict it to the Google token host; reject private/loopback/link-local targets and `http://` | T-T5 |
+| Harden `/tmp` files: `O_NOFOLLOW`/ownership checks on the PID lock and setup file | T-T6 |
+| Add `config_version` and migration | M7 |
 | Add the versioned install layout and seed `versions/<base>-0000` | Phase 1 prerequisite |
+| Publish artifact hashes/SBOM and move toward reproducible builds | N1 |
 
 ### Phase 1 — Option A app updates
 
@@ -792,12 +805,13 @@ T-15).
 | P1.4 Manager writes `/run/photo-frame/healthy` | Health signal |
 | P1.5 USB marker + `apply` flow via the `/media` watcher | Offline install |
 | P1.6 Config-mode "Update" page (upload/URL) | LAN install |
-| P1.7 Optional `photo-frame-update check` + disabled timer | Online check (N1) |
-| P1.8 Panel messages via the control socket | UX (S8, N2) |
-| P1.9 Audit log + `last-result.json` + `/api/status` surfacing | M7, S8 |
-| P1.10 Key pinning, `key_id`, rotation/revocation statements | S3 |
-| P1.11 Tests: signature failure, hash mismatch, traversal, power-loss simulation, revert, wrong arch, downgrade refusal | M1–M10 |
+| P1.7 Optional `photo-frame-update check` + disabled timer | Online check (S1, S2) |
+| P1.8 Panel messages via the control socket | UX (M4, S4) |
+| P1.9 Audit log + `last-result.json` + `/api/status` surfacing | S4 |
+| P1.10 Key pinning, `key_id`, rotation/revocation statements | S5 |
+| P1.11 Tests: signature failure, hash mismatch, traversal, power-loss simulation, revert, wrong arch, downgrade refusal | M1–M9 |
 | P1.12 Docs: owner update runbook, key custody, USB layout | Docs |
+| P1.13 Owner-initiated rollback/hold command (`photo-frame-update rollback` / `hold`) | N4 |
 
 ### Phase 2 — Option B OS image A/B (only if needed)
 
@@ -806,9 +820,9 @@ T-15).
 | P2.1 Finalize partition plan; move state to a state partition | Layout |
 | P2.2 Add U-Boot with `bootcount`/`altbootcmd` (or a recovery kernel) | Boot fallback |
 | P2.3 Adopt RAUC; produce signed `.raucb` images | OS updates |
-| P2.4 dm-verity read-only roots + writable state/tmpfs overlay | N3 |
-| P2.5 Watchdog + `boot_ok` marking | S7 |
-| P2.6 Migration of `/etc/photo-frame` and identity files | M4 |
+| P2.4 dm-verity read-only roots + writable state/tmpfs overlay | N2 |
+| P2.5 Watchdog + `boot_ok` marking | M4, S7 |
+| P2.6 Migration of `/etc/photo-frame` and identity files | M7 |
 | P2.7 Recovery partition + rescue docs | Recovery |
 
 ---
@@ -832,7 +846,8 @@ T-15).
    B and grow the boot FAT to ≥ 256 MB?
 8. **State relocation:** acceptable to move `/etc/photo-frame` to a dedicated
    state partition before Option B?
-9. **Release channels:** is a stable/beta split wanted (N4)?
+9. **Release channels:** is a stable/beta split wanted? (Not in the threat
+   model's requirement list; a product decision.)
 10. **How much update automation is acceptable**, given that silent
     auto-update is undesirable and owner approval is required (S1)?
 

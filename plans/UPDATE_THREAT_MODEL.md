@@ -1,30 +1,21 @@
 # Photo Frame — Update & Device Threat Model
 
-> **Provenance note.** The source threat-model report supplied with this task
-> contained only a placeholder (`[THREAT MODEL REPORT] / PASTE_HERE`). This
-> document is a reconstruction built from the current architecture
-> (`plans/SPEC.md`, `plans/SYNC_SOURCES.md`, `docs/deployment.md`,
-> `packaging/`, `.github/workflows/`) and the owner's stated constraints. It is
-> written to be accurate and useful, but it is **not** a transcription of the
-> original report. If the original report becomes available, replace the body
-> below and keep this note until the two agree.
-
 ## How to use this document
 
 This is the security baseline that `plans/UPDATE_STRATEGY.md` is derived from.
 Use it in three ways:
 
-1. **As a requirements source.** Section 8 distills the findings into
-   MUST / SHOULD / NICE requirements. The strategy document maps each update
-   option against that list.
+1. **As a requirements source.** Section 6 defines the prioritized
+   MUST / SHOULD / NICE requirements (`M1`–`M9`, `S1`–`S7`, `N1`–`N5`). The
+   strategy document maps each update option against that list.
 2. **As a review checklist.** Before shipping an update mechanism or a new
-   network-facing feature, check the relevant findings (Section 6) and confirm
-   the mitigation or record an accepted risk.
-3. **As a scoping tool.** Each finding has an ID (`T-nn`), a severity, and a
-   gap. Turn accepted gaps into issues; do not silently drop them.
+   network-facing feature, check the relevant finding (`T-*`) and confirm the
+   mitigation or record an accepted risk.
+3. **As a scoping tool.** Each finding has an ID, an impact, and a gap. Turn
+   accepted gaps into issues; do not silently drop them.
 
-Severity is qualitative and considers this specific device (a single household
-photo frame on a home LAN, often offline, with no hardware root of trust):
+Severity in this document is qualitative and relative to a **consumer photo
+frame on a home LAN**:
 
 | Severity | Meaning |
 |----------|---------|
@@ -44,256 +35,504 @@ around it change. Update it whenever any of the following happen:
 - The OS, kernel, bootloader, or partition layout changes.
 - A finding is mitigated, accepted, or invalidated.
 
-Record changes in the revision history at the end. Do not delete findings that
-were mitigated; mark them mitigated with the commit or issue that closed them.
+Do not delete findings that were mitigated; mark them mitigated with the commit
+or issue that closed them. Keep the revision history at the end current.
 
 ---
 
-## 1. Scope and system description
+**Scope.** A Raspberry Pi Zero 2 W running DietPi, two systemd services
+(`photo-frame-display`, `photo-frame-manager`) as the `photo-frame` user, a
+dedicated ext4 photos partition, a LAN-only plain-HTTP admin server, USB/cloud
+photo import, and **no update mechanism** today. This document is input for an
+update-planning agent; it does not choose a final update design.
 
-A Raspberry Pi Zero 2 W running DietPi (Debian bookworm based, arm64) driving a
-DRM/GBM/EGL photo frame. Two systemd services run as a dedicated `photo-frame`
-user:
+**Method.** Assets → trust boundaries/flows → actors → STRIDE threats →
+existing mitigations/gaps → prioritized requirements → design implications.
+Findings are grounded in the files listed in the brief. Severity is relative to
+a consumer photo frame on a home LAN.
 
-- `photo-frame-display` — C app, owns `/run/photo-frame/` and the image/control
-  Unix sockets, renders photos and config/status screens.
-- `photo-frame-manager` — Rust app, streams photo paths over the image socket,
-  watches `/media` for USB imports, syncs Dropbox and Google Drive folders,
-  and runs the config-mode admin HTTP server.
+---
 
-State lives on three places:
+## 1. Assets
 
-- **Photos + index + sync state**: a dedicated ext4 partition mounted at
-  `/var/lib/photo-frame/photos` (`noatime,lazytime`), plus
-  `sync-cursors.json` and `sync-status.json`.
-- **Config + secrets**: `/etc/photo-frame/config.toml` (mode 0600, owned by
-  `photo-frame`) and `/etc/photo-frame/display.env` (0644, root).
-- **Ephemeral**: `/tmp/photo-frame.log`, `/tmp/photo-frame-display.log`, and
-  `/tmp/photo-frame-setup.txt` on tmpfs.
+| # | Asset | Why it matters | Where it lives |
+|---|-------|----------------|----------------|
+| A1 | **Photos** (the family's library) | Irreplaceable, private | `/var/lib/photo-frame/photos` (ext4 partition), index CSVs |
+| A2 | **Cloud credentials** — Dropbox static/refresh tokens, app secret; Google API keys, OAuth refresh tokens/client secrets | Account takeover, data exfiltration | `/etc/photo-frame/config.toml` (0600, `photo-frame`-owned) |
+| A3 | **Google service-account private key** (RS256) | Impersonation of the service account; can mint `drive.readonly` tokens | `config.toml` `service_account_json` (plaintext) |
+| A4 | **Update signing private key(s)** (future) | Root of trust for the whole device; compromise = arbitrary code as root | *Not present today*; must be offline |
+| A5 | **Device availability / recoverability** | A frame that won't boot is a support burden and may need physical reflash | boot FAT partition, root ext4, services |
+| A6 | **Update integrity** | A malicious update is arbitrary root code and persistent | update channel + local verification path |
+| A7 | **User trust** | Owner must believe the device isn't exfiltrating photos or phoning home | whole system; update-check behavior |
+| A8 | **Config-mode setup password** | Grants write access to `config.toml` (A2/A3) and network reachability of the admin API | screen QR, `/tmp/photo-frame-setup.txt` (0600) |
+| A9 | **Photo index + cursors/status** | Losing them loses the library mapping or re-downloads everything | `photos_dir/*.csv`, `sync-cursors.json`, `sync-status.json` |
+| A10 | **Display/control sockets** | Same-user control of the panel | `/run/photo-frame/*.sock` (0700 dir) |
 
-The device is usually **not network-facing**. The admin server listens on
-`0.0.0.0` only while config mode is active (USB-triggered or first boot), on a
-random port in 8100–8199, behind per-session HTTP Basic Auth with an 8-character
-password, and shuts down on finish, USB removal, or a 10-minute idle timeout.
-Outbound connections happen only when remote sources are configured.
+---
 
-In scope: the running device, its data, its credentials, and the proposed
-update mechanism. Out of scope: the owner's phone/laptop, the cloud providers'
-own security, and physical destruction of the device.
+## 2. Trust boundaries and data flows
 
-## 2. Trust boundaries and assumptions
+```
+[Internet]  --HTTPS(provider TLS)--> [manager: remote sync] --> photos dir
+[LAN host]  --HTTP(plain, Basic)--> [admin server 0.0.0.0:8100-8199] --> config.toml
+[USB drive] --auto-mount /media--> [usb watcher] --ImageMagick--> photos dir
+[Owner/CI]  --GitHub Actions--> [unsigned .deb] --dpkg -i (root)--> device
+[Owner]     --physical/SD--> [boot FAT + root ext4]
+[manager]   --Unix sockets (0700)--> [C display app] --stb_image--> panel
+[remote sync] --outbound only--> cloud providers
+```
 
-| Boundary | Trusted side | Untrusted side |
-|----------|--------------|----------------|
-| Home LAN | The device | Any LAN host, including guests/IoT |
-| USB media | The device | Any inserted drive and its filesystem contents |
-| Cloud folders | The device | Files placed in the synced folder by anyone |
-| SD card / boot media | — | Anyone with physical access |
-| Update artifacts | Device's pinned public key | Everything else (bundles, mirrors, CI) |
-| CI / dependencies | — | Upstream crates, actions, ImageMagick |
+Boundaries, and what crosses them:
 
-Assumptions, stated explicitly:
+- **B1 USB ↔ device.** Untrusted filesystem image and untrusted file contents.
+  Auto-mount is performed by `usbmount`/`dietpi-drive_manager`/`udisks2` (often
+  as root); the app scans `/media` and shells out to ImageMagick. No signature,
+  no allowlist, no sandbox.
+- **B2 LAN ↔ admin server.** Plain HTTP, Basic Auth, binds `0.0.0.0`, 8-char
+  password. Credentials and session content are exposed to any LAN sniffer.
+- **B3 Device ↔ internet (cloud).** Outbound `reqwest`/native-tls only.
+  Certificate verification is on (no pinning). Downloaded bytes are **not**
+  content-verified.
+- **B4 Build/CI ↔ device.** `.deb` artifacts are produced by GitHub Actions and
+  installed with `sudo dpkg -i`; no signature, no checksum published. Trust is
+  entirely "whatever is on the GitHub release."
+- **B5 Physical/SD.** Root ext4 is unencrypted; boot FAT is unauthenticated and
+  editable. Physical access is effectively root.
+- **B6 Admin/control Unix sockets.** 0700 dir owned by `photo-frame`; both
+  services run as the same user, so any code running as `photo-frame` (e.g., an
+  ImageMagick RCE) can drive them.
+- **B7 Update boundary (future).** Not yet defined. Whatever channel is chosen
+  (USB, HTTPS, local file) crosses B1/B3/B4/B5 and needs its own authenticity,
+  freshness, and rollback controls.
 
-- **A1.** There is no hardware root of trust: the Pi has no secure boot, no
-  TPM/secure element, and no EEPROM bootloader (`tryboot` is a Pi 4/5 feature).
-  Anyone with physical SD access can replace the boot chain.
-- **A2.** There is no real-time clock on the Zero 2 W. Time comes from the
-  network or a fake-hwclock file and can be wrong or attacker-influenced.
-- **A3.** The owner is trusted and is the only signer of updates. The owner's
-  devices and network are not assumed to be free of malware.
-- **A4.** Cloud providers are assumed honest but their content is not trusted.
-- **A5.** The device is single-tenant and low-value to a targeted attacker, but
-  a good target for opportunistic scanning on a shared or guest network.
+---
 
-## 3. Assets
+## 3. Threat actors
 
-| Asset | Why it matters | Where |
-|-------|----------------|-------|
-| Photos | Personal/private, irreplaceable | Photos partition |
-| Photo index, cursors, status | Rebuild cost; opaque cursors lose sync position | Photos partition |
-| Dropbox tokens / app secret | Read access to the owner's Dropbox | `config.toml` |
-| Google service-account private key | Long-lived, high-value; can read shared folders | `config.toml` |
-| Google OAuth refresh token + client secret | Read access to the owner's Drive | `config.toml` |
-| Admin session password | LAN access to the config UI | tmpfs + panel |
-| Device identity | Hostname, Wi-Fi PSK, SSH host/user keys | rootfs `/etc` |
-| System integrity | Binaries, units, boot chain, update log | rootfs, boot FAT, state |
-| Update signing key | Forges trusted updates if leaked | Offline, off-device |
+| Actor | Capability | Motivation |
+|-------|-----------|------------|
+| **LAN network attacker** | Sniff/inject plain HTTP; reach admin server; CSRF victim browsers; ARP/DNS spoofing | Steal config credentials, add a remote source, pivot to cloud accounts |
+| **Malicious/compromised USB** | Crafted filesystem, crafted JPEG/HEIC, BadUSB-style device classes (HID/NIC) | RCE as `photo-frame`, credential theft, persistent tampering |
+| **Cloud-account / provider compromise** | Upload malicious images to the synced folder; tamper with listings | RCE via image decoder, feed unwanted content, exfiltrate via `token_uri` |
+| **Supply-chain / CI compromise** | Modify a workflow, dependency, action, or the published `.deb` | Ship a backdoored root package to every device |
+| **Malicious update server / MITM** | Serve a valid-but-old or forged update, replay, or downgrade | Persistent root compromise or DoS |
+| **Signing-key thief** | Forge legitimate-looking updates | Full trust compromise; hardest to detect |
+| **Stolen device / SD-card attacker** | Read/write root and boot partitions | Read photos/secrets; inject `init=/bin/sh`; brick |
+| **Local user (SSH/other process as `photo-frame`)** | Read secrets, write `config.toml`, hit sockets, race `/tmp` files | Escalate to config/cloud access |
+| **Careless owner** | Power-cut during update, install from the wrong place | Self-inflicted bricking/rollback |
 
-## 4. Threat actors
+---
 
-- **Opportunistic LAN attacker** — scans, probes the admin port, tries default
-  or guessed credentials, sniffs cleartext HTTP.
-- **Malicious/curious insider or guest** — on the same Wi-Fi; may share the
-  synced cloud folder.
-- **Cloud-content attacker** — can write to a synced folder; supplies crafted
-  image files.
-- **Malicious USB author** — leaves a crafted drive (images, filesystem, or a
-  planted "update" bundle).
-- **Physical attacker** — has the SD card or the device; can modify, downgrade,
-  or clone it.
-- **Supply-chain attacker** — compromises a crate, GitHub Action, or packaged
-  dependency; or a maintainer token.
-- **Owner as the signer** — not an adversary, but a key-loss risk.
+## 4. Threats (STRIDE-structured)
 
-## 5. Attack surface inventory
+### 4.1 Spoofing
 
-| Surface | Exposure | Notes |
-|---------|----------|-------|
-| Admin HTTP server (`0.0.0.0:8100–8199`) | LAN, config mode only | Basic Auth, plain HTTP, rotating password |
-| Image/control Unix sockets | Local, same user | `IMG`, `CLR`/`SHOW`/`RESUME` |
-| ImageMagick (`magick`/`convert`) | Spawned per import | Parses attacker-supplied images |
-| Outbound HTTPS (Dropbox, Drive, token_uri) | Internet | TLS via native-tls |
-| USB mounts under `/media` | Any inserted drive | Photo scan + conversion |
-| `config.toml` writer | Local | Atomic temp+rename, service-user owned |
-| Update path (proposed) | USB / LAN / optional online | None today; designed here |
-| CI → GitHub Releases | Internet | Unsigned `.deb` artifacts today |
+- **T-S1 (update authenticity bypass).** Today there is no update channel, so
+  "spoofing an update" means "installing a forged `.deb`." An attacker who can
+  place a file where the owner will `dpkg -i` it, or who can compromise the
+  GitHub release, becomes root. *No signing exists.*
+- **T-S2 (malicious/compromised update server).** If a future updater fetches
+  over HTTPS and trusts the transport alone, a server compromise (or a
+  CA/`native-tls` trust-store compromise) yields arbitrary root payloads.
+  Certificate pinning is absent.
+- **T-S3 (admin-server impersonation).** Plain HTTP + Basic Auth over the LAN:
+  an attacker can capture the 8-char password from a single request (base64, not
+  encryption). The QR also embeds the password in cleartext
+  (`http://photo-frame:<pw>@<ip>:<port>`), so a photo of the screen is a
+  credential.
+- **T-S4 (cloud API impersonation).** A stolen service-account key (A3) lets an
+  attacker mint tokens; a stolen Dropbox refresh triple is long-lived account
+  access.
 
-## 6. Threat findings
+### 4.2 Tampering
 
-The table is the summary; notes follow for the findings that drive the update
-strategy. "Gap" means a known missing control, not necessarily a defect to fix
-now.
+- **T-T1 (update payload tampering / MITM).** No signature or checksum on
+  artifacts; any MITM or malicious mirror can swap the payload. Requirement:
+  detached signature over the artifact, verified on-device before install.
+- **T-T2 (boot tampering).** The boot FAT partition is unauthenticated. An SD
+  attacker can replace `kernel8.img`, edit `config.txt` (`init=/bin/sh`,
+  `arm_64bit`, `os_prefix`), or add a malicious initramfs. There is **no Pi
+  Zero 2 W secure boot** (confirmed: Raspberry Pi's own `rpi-sb-provisioner`
+  states "No secure-boot support" for Zero 2 W), so firmware/kernel integrity
+  cannot be hardware-anchored on this board.
+- **T-T3 (image-decoder RCE).** Untrusted USB/cloud images are passed to
+  `ImageMagick` (`convert_image`, `src/import/usb.rs:573-619`) as the
+  `photo-frame` user, with no sandbox, no seccomp/AppArmor, no rlimits beyond
+  `nice(10)`. ImageMagick has a long history of memory-corruption and
+  delegate-based RCE (e.g., ImageTragick). The C app's `stb_image` JPEG decode
+  is a second parser, though it normally only sees ImageMagick-normalized JPEGs.
+- **T-T4 (filesystem-parser attack).** Auto-mounting an attacker filesystem
+  exercises kernel ext4/vfat/exfat parsers (and USB gadget descriptors). Kernel
+  bugs → root. Mitigation is kernel hygiene, not app code.
+- **T-T5 (config tampering → SSRF).** `config.toml` is writable by
+  `photo-frame`, and the sync scheduler hot-reloads it on mtime/size change
+  (`ConfigReloader`, `src/import/remote.rs:204-256`).
+  `service_account_json.token_uri` is attacker-controlled and used as the
+  token-exchange URL (`docs/config.md:111`), so write access to config yields
+  **SSRF to arbitrary internal/loopback URLs** plus JWT exfiltration. Anyone who
+  obtains the admin password can do this through the API.
+- **T-T6 (state tampering via `/tmp`).** The PID lock `/tmp/photo-frame.lock` is
+  opened with create/truncate and no `O_NOFOLLOW`/ownership check
+  (`src/main.rs:54-72`); `/tmp/photo-frame-setup.txt` and the QR/status JPEGs
+  live in world-writable `/tmp`. A local attacker can pre-create symlinks or
+  files to interfere (truncation, DoS) or read stale data.
 
-| ID | Threat | Vector | Impact | Existing mitigation | Gap | Severity |
-|----|--------|--------|--------|---------------------|-----|----------|
-| T-01 | Admin API credential guessing / timing | LAN brute force; non-constant-time compare | Full config-UI access; read/write cloud credentials | Per-session 8-char password, idle timeout, all routes authed | `==` compare, no rate limit, no lockout | Medium |
-| T-02 | Cleartext admin transport | LAN sniffing/MITM | Password + cloud secrets exposed; staged config altered | Config mode only, short-lived | No TLS | Medium |
-| T-03 | Credentials at rest | Physical SD access; root/service-user read | Long-lived Dropbox/Google access | 0600 file, 0750 dir, API redaction | No encryption, no keystore | High |
-| T-04 | ImageMagick code execution | Crafted image via USB or cloud | RCE as `photo-frame` → credentials + persistence | Extension filter, `nice(10)` | No policy.xml hardening, no sandbox | High |
-| T-05 | `token_uri` SSRF / secret redirect | Malicious `service_account_json` | Device POSTs a signed assertion to an arbitrary host; LAN probe | Scheme check only | No host allowlist; `http://` allowed | Medium |
-| T-06 | Supply chain | Crate/action/dependency compromise; unsigned releases | Forged or backdoored binary delivered as trusted | Pinned action SHAs, `--locked`, pinned CVE-fixed fork, zizmor | Unsigned artifacts, no provenance/attestation | High |
-| T-07 | Unsigned update installed | Malicious bundle over USB/network | Arbitrary root code execution | None (no updater yet) | Must be signature-gated | Critical |
-| T-08 | Downgrade / replay | Reinstall an older validly signed bundle | Reintroduces fixed vulnerabilities | None | No monotonic sequence floor | High |
-| T-09 | Physical boot-chain substitution | SD access; replace binaries/boot files | Full control, undetectable | None | No secure/verified boot, no dm-verity | High (accepted, A1) |
-| T-10 | Malicious USB auto-update | Planted "update" drive | Root code execution | None | Auto-detection must require signature + owner action | High |
-| T-11 | Archive/filesystem traversal | Crafted tar/filesystem in import or update | Overwrite files, plant units | Canonicalize on import | Future extractor must reject `..`, symlinks, abs paths, devices | Medium |
-| T-12 | Secret leakage in logs/artifacts | Log lines, setup file, support bundles | Credential exposure | 0600 files, redaction, "never log key" | No automated log secret scanning | Low |
-| T-13 | Resource exhaustion / photo loss | Admin flood; huge import; ENOSPC rotation | DoS; owner's photos deleted | Idle timeout, serialized imports, rotation | No rate limit; rotation deletes data | Medium |
-| T-14 | Malicious cloud content | Write access to synced folder | Feeds T-04 | Read-only scopes | Image sandboxing | Medium |
-| T-15 | Service-user config tampering | Post-exploit rewrite of `config.toml` | Persistence, new exfil sources | Atomic write | Config dir owned by the service user | Medium |
-| T-16 | Time/clock manipulation | No RTC; spoofed NTP/hwclock | Misleading audit timestamps; timestamp-based rollback checks bypassed | — | Anti-rollback must be sequence-based, not time-based | Low |
-| T-17 | Signing-key compromise | Leaked offline key or CI build key | Forged trusted updates | — | No rotation/revocation plan | Critical |
-| T-18 | Failed update bricks device | Power loss, bad build, no rollback | Device down; reflash loses state | None | No two-phase/rollback | High |
-| T-19 | Update-check privacy | Online check | Reveals device existence/IP/timing | — | Must be opt-in and minimal | Low |
+### 4.3 Repudiation
 
-### Findings that shape the update design
+- **T-R1 (no update audit trail).** With no update mechanism there is also no
+  record of what was installed, when, by whom, or from where. A future design
+  must log update attempts and results; note logs currently live on **tmpfs**
+  (`/tmp/photo-frame.log`), so they vanish on reboot and are unsuitable as the
+  sole audit record.
+- **T-R2 (sync actions unlogged long-term).** `sync-status.json` is overwritten
+  per attempt and lives on the photos partition; there is no append-only
+  history.
 
-**T-07 / T-10 — the update channel is the crown jewel.** A naive updater is the
-single highest-impact feature that could be added, because it turns a
-low-interaction device into a root code-execution target. Every bundle must be
-verified against a **pinned owner key** before any privileged action, and USB
-auto-detection must never install without both a valid signature and an explicit
-owner action.
+### 4.4 Information disclosure
 
-**T-08 / T-16 — anti-rollback must be sequence-based.** Because there is no RTC
-and no hardware root of trust, a monotonic counter stored on the device can only
-defeat network/MITM downgrades and accidental downgrades. A physical attacker
-can edit the counter on the same SD card. This limitation must be documented,
-not hidden.
+- **T-I1 (config secrets).** `config.toml` (A2/A3) is 0600 under a 0750 dir,
+  which is reasonable, but it is readable by any process as `photo-frame` —
+  including a compromised manager or an ImageMagick RCE. It is also plaintext
+  at rest on an unencrypted SD card.
+- **T-I2 (admin credential sniffing).** B2: any LAN host can capture Basic Auth
+  over HTTP. No HSTS/TLS exists.
+- **T-I3 (QR/screen disclosure).** The password is rendered in the QR URL and
+  printed on screen (`src/qr.rs`), and mirrored to
+  `/tmp/photo-frame-setup.txt`. Shoulder-surfing or a camera gets a working
+  credential for the session.
+- **T-I4 (photo privacy).** Photos are unencrypted at rest and readable by
+  removing the SD card.
+- **T-I5 (update-check telemetry).** Any online update check leaks device IP,
+  current version, update cadence, and presence/absence of the device to the
+  update server. The owner explicitly does not necessarily want auto-updates; an
+  always-on check is a privacy regression.
+- **T-I6 (error strings).** Sync errors are surfaced through `/api/status` and
+  logs; provider error bodies could echo sensitive detail. Redaction exists for
+  known param names only (`SENSITIVE_PARAMS`, `src/admin_server.rs:476-485`); an
+  unknown-named secret would not be redacted.
 
-**T-09 / A1 — physical access is a full compromise.** Without secure boot, an
-attacker with the SD card can replace the boot chain, the kernel, the binaries,
-and the anti-rollback counter. No update design on this board can prevent that;
-the goal is tamper-**evidence** (signed artifacts, dm-verity where used) and
-recoverability, not tamper-**proofness**.
+### 4.5 Denial of service / bricking
 
-**T-18 — two-phase with automatic revert is mandatory.** App-only updates must
-have a userspace boot guard that reverts if the new version fails its health
-check, because there is no hardware A/B fallback. OS image updates need a
-bootloader or recovery kernel to get the same guarantee.
+- **T-D1 (power loss mid-update).** The Zero 2 W has no battery/UPS; a power cut
+  during a kernel/boot-partition write can leave an unbootable device with no
+  recovery path. FAT boot files are not atomically replaced (rename on vfat is
+  not crash-safe in the same way as ext4).
+- **T-D2 (bad update, no rollback).** If a future update replaces the root
+  filesystem or kernel in place, a bad build crash-loops and there is no second
+  slot. `Restart=on-failure` on both units will happily loop forever on a bad
+  binary.
+- **T-D3 (no A/B or watchdog on this board).** The Pi 4/CM4
+  `tryboot`/`autoboot.txt` one-shot A/B mechanism is an EEPROM-bootloader
+  feature. Zero 2 W boots via GPU ROM → `bootcode.bin` → `start.elf` →
+  `kernel8.img` from the FAT partition with no EEPROM, so there is **no native
+  boot-retry/fallback**. Any A/B design must add a bootloader (U-Boot/initramfs)
+  or do a userspace file swap with a separate watchdog — both are weaker than a
+  hardware-anchored scheme.
+- **T-D4 (storage exhaustion).** Photos fill the partition; an update that
+  stages a full image on the same SD card could run out of space mid-write
+  (`ENOSPC` handling exists only for photos).
+- **T-D5 (admin-server brute force/DoS).** No rate limiting or lockout on Basic
+  Auth; `check_auth` uses a non-constant-time string compare
+  (`src/admin_server.rs:240-252`). The 10-minute idle timeout and per-session
+  rotation limit the window, but a LAN attacker can hammer it and also reset the
+  idle timer on every request (`last_request` is updated in `handle_request`),
+  keeping the server alive.
+- **T-D6 (CSRF on admin API).** No CSRF token, no Origin/Referer check. A
+  malicious page on the same LAN can issue cross-origin form posts
+  (`application/x-www-form-urlencoded` is a CORS "simple request") to
+  `/api/finish` or `/api/sources/dropbox`; the browser will attach cached Basic
+  Auth. The response is unreadable to the attacker, but the side effect (adding
+  a source, saving config) happens.
+- **T-D7 (update-channel DoS).** A malicious update server can refuse to serve,
+  serve an oversized/slow payload, or claim no updates — availability risk for
+  opt-in updates. `http.rs` bounds retries/backoff (30 s cap) and timeout
+  (120 s), which helps.
 
-**T-03 / T-04 / T-05 / T-15 — the credential blast radius.** A code-execution
-bug in ImageMagick, or a redirect via `token_uri`, runs as the same user that
-owns `config.toml`, so it reaches all cloud credentials. Hardening these is a
-prerequisite for trusting any update mechanism (see Phase 0 in the strategy).
+### 4.6 Elevation of privilege
 
-**T-02 / T-01 — the admin server is the only network listener.** It must stay
-config-mode-only, and update checks must not create a second always-on listener.
+- **T-E1 (unsigned update → root).** `dpkg -i` runs `postinst` as root
+  (`packaging/deb-scripts/postinst`); a malicious `.deb` owns the device. This is
+  the single highest-impact update threat.
+- **T-E2 (signing-key compromise).** An attacker with A4 can sign arbitrary
+  updates that verify correctly. Key custody, rotation, and revocation dominate
+  the update design.
+- **T-E3 (ImageMagick → `photo-frame`).** RCE in the converter yields secrets
+  (A2/A3), config write (T-T5), socket control, and persistence via
+  `config.toml`/cron-like vectors. Not root by itself, but combined with any
+  local root bug it is a stepping stone; and `photo-frame` can already read all
+  cloud credentials.
+- **T-E4 (service hardening gap).** Neither unit sets `NoNewPrivileges`,
+  `ProtectSystem`/`ProtectHome`, `PrivateTmp`, `PrivateDevices`,
+  `ProtectKernel*`, `RestrictAddressFamilies`, `SystemCallFilter`,
+  `CapabilityBoundingSet`, or `ReadWritePaths`. The manager can write all of
+  `/etc/photo-frame` and the photos partition. There is no `sudo` exposure
+  (shell is `/bin/false`), which is good.
+- **T-E5 (display fallback to root).** `docs/deployment.md:140-159` documents
+  running the display service as `root` if `video` group access fails. That turns
+  a display-app memory-safety bug (parsing rendered JPEGs / DRM ioctls) into
+  root.
+- **T-E6 (rollback abuse).** Because a valid signature stays valid forever, a
+  remote attacker who can influence update selection could pin the device to an
+  old, vulnerable-but-signed release. Anti-rollback needs a persistent,
+  monotonic version floor (and note a physical attacker can reset any floor
+  stored on the SD card).
 
-## 7. Update-channel threats (specific)
+---
 
-These extend the general findings for the mechanism the strategy proposes.
+## 5. Existing mitigations and gaps
 
-| Threat | Description | Required control |
-|--------|-------------|------------------|
-| Forged bundle | Attacker crafts a bundle | Detached signature over the bundle by the pinned owner key; fail closed |
-| Tampered artifact | Valid manifest, swapped binary | Per-artifact SHA-256 in the signed manifest, verified before install |
-| Manifest swap | Attacker replaces manifest + signature | Signature covers the manifest and the payload hash; manifest names `key_id` |
-| Replay / downgrade | Older signed bundle reinstalled | Monotonic `sequence` floor stored root-owned; reject `<= installed` |
-| Wrong device/arch | arm64 bundle on another board, or wrong product | `product` + `arch` fields checked before install |
-| Min-version bypass | Bundle assumes a newer config/ABI than installed | `min_version` (and `config_schema`) checked; refuse with a clear error |
-| Partial write / power loss | Install interrupted | Verify whole file before use; atomic symlink flip; pending/confirmed markers; boot guard |
-| Path traversal in bundle | Tar entries escape the install dir | Reject absolute paths, `..`, symlinks, hardlinks, devices; extract into a fresh dir |
-| Bundle bombs / disk fill | Huge bundle fills the card | Check free space for bundle + unpacked size; cap member count/size |
-| Auto-install from USB | Dropped drive installs silently | Require signature **and** an explicit owner marker/action |
-| Online check privacy | Endpoint learns about the device | Opt-in, static minimal GET, no device ID, documented |
-| CI key theft | Build key used to forge releases | Root/authority key stays offline; CI key cannot sign the root manifest |
+**What is already done well**
 
-## 8. Security requirements
+- Both services run as a dedicated non-root `photo-frame` user with
+  `/bin/false`; no sudo.
+- `config.toml` is 0600 in a 0750 `photo-frame`-owned directory; atomic writes
+  use a 0600 temp file + `rename` (`src/config.rs:166-213`).
+- Setup credentials file is 0600 and removed on every config-mode exit and on
+  shutdown (`src/config_mode.rs`, `src/main.rs:346-350`).
+- Config-mode password is per-session, random 8-char alphanumeric, and the
+  server is stopped on USB removal/timeout.
+- Admin API redacts known credential parameter names; error messages avoid
+  echoing key material (tests assert this).
+- Remote sync is outbound-only with bounded retries/backoff and a total request
+  timeout; TLS cert verification is on (native-tls), and `cargo build --locked`
+  plus SHA-pinned GitHub Actions reduce CI drift.
+- `/run/photo-frame` is 0700 and owned by the display unit; `umask(077)` in the
+  C app as defense in depth.
+- Downloads stage to a hidden `.sync-tmp` with `safe_filename()` traversal
+  protection.
+- `tiny_http_fork =0.12.8` is a CVE-fixed fork pinned deliberately.
+- The QR encodes the password to make setup one-scan and offline-friendly (a
+  usability/safety tradeoff).
 
-Distilled from the findings above. The strategy document maps options A/B/C
-against this list. "MUST" is a release gate for the update feature.
+**Gaps that matter for updates and current exposure**
 
-### MUST
+- **No artifact signing or checksums anywhere** in `build.yml`; releases are
+  unsigned and `GITHUB_TOKEN` with `contents: write` can publish them.
+- **No update mechanism at all** → no rollback, no A/B, no boot integrity, no
+  version floor, no audit.
+- **No secure boot / no hardware root of trust on Zero 2 W**; boot FAT is
+  unauthenticated.
+- **No OS-level sandboxing** for ImageMagick or the services; the converter
+  processes untrusted input as the credential-owning user.
+- **Plain HTTP admin API** with no TLS, no CSRF protection, no rate limiting,
+  non-constant-time auth compare.
+- **No content verification** of cloud-downloaded images; provider/MITM
+  compromise feeds the same ImageMagick surface.
+- **`token_uri` SSRF** via writable `config.toml`.
+- **Logs on tmpfs** and overwritten status files → weak auditability.
+- **`/tmp` files** with no symlink/ownership hardening.
+- **No anti-rollback primitive** and no place an attacker can't reset it.
 
-| ID | Requirement | Source |
-|----|-------------|--------|
-| M1 | Authenticity: only bundles signed by the owner's pinned key install; verification fails closed. | T-06, T-07, T-17 |
-| M2 | Integrity: every installed artifact's hash is verified against the signed manifest before use. | T-07 |
-| M3 | Offline capability: a full update is installable from USB with no network. | Constraint |
-| M4 | State preservation: photos, `config.toml`, `display.env`, index/cursors/status, hostname/Wi-Fi/SSH identity survive an update. | T-13, constraint |
-| M5 | Two-phase + rollback: a failed update reverts automatically without reflashing; power loss is safe. | T-18 |
-| M6 | No permanent exposure: update checks never create an always-on listener; online checks are opt-in. | T-02, T-19 |
-| M7 | Audit logging: a persistent, root-owned record of every update attempt and result, separate from tmpfs logs. | T-16 |
-| M8 | Anti-rollback floor: a monotonic sequence prevents accidental/network downgrade, with its limits documented. | T-08, T-16 |
-| M9 | Verify before privilege: signature, arch, product, sequence, and hashes are checked before any root action. | T-07 |
-| M10 | Extract safely: no path traversal, symlinks, hardlinks, devices, or writes outside the install dir. | T-11 |
+---
 
-### SHOULD
+## 6. Security requirements for an update design (prioritized)
 
-| ID | Requirement | Source |
-|----|-------------|--------|
-| S1 | Owner approval per install; no silent auto-update. | Constraint |
-| S2 | Atomicity: installs are safe against power loss at every step. | T-18 |
-| S3 | Key rotation and revocation without reflashing. | T-17 |
-| S4 | Config schema versioning with forward migration. | T-16, M4 |
-| S5 | Least privilege for the updater and its staging area. | T-15 |
-| S6 | CI never holds the root/authority key; builds are attestable. | T-06 |
-| S7 | Health check covers both services, sockets, and index availability. | M5 |
-| S8 | Update failures are visible on the panel and in the audit log. | M7 |
+### Must
 
-### NICE
+1. **M1 — Authenticated updates.** Every update artifact is verified on-device
+   against a public key that is not obtainable or replaceable by the update
+   channel itself. Signature check happens *before* any privileged action;
+   unsigned/invalid → refuse, log, no partial install.
+2. **M2 — Integrity covers the whole artifact set** (binaries, systemd units,
+   any scripts executed as root), not just a manifest.
+3. **M3 — No root execution without verification.** `postinst`-equivalent
+   actions must run only after verification; no "install then verify."
+4. **M4 — Crash/power-fail safety and a rollback path.** An interrupted or bad
+   update must not brick the device; there must be a way to boot the previous
+   working version or a recovery mode, and the device must not depend on a
+   network or display to recover.
+5. **M5 — Fail-closed.** If verification, signature-key handling, or version
+   checks fail, the system keeps running the current version rather than
+   proceeding.
+6. **M6 — Anti-rollback (as far as the platform allows).** Reject versions below
+   a persisted floor. Be explicit that a physical/SD attacker can defeat a
+   software-only floor.
+7. **M7 — Preserve state.** Photos partition, `config.toml`,
+   index/cursors/status, Wi-Fi/SSH config, and host keys survive updates;
+   `config.toml` is never clobbered by a package's default (`.deb` `conffiles`
+   behavior must be preserved or superseded).
+8. **M8 — Least privilege for the update path.** The updater should not run as
+   root beyond the minimum, and must not be reachable/triggerable by an
+   unauthenticated LAN actor.
+9. **M9 — Offline-capable.** Verification and installation must work with
+   USB/local media and no internet (device is often offline), so signing cannot
+   rely on an online OCSP/CA check.
 
-| ID | Requirement | Source |
-|----|-------------|--------|
-| N1 | Optional online check with a minimal, privacy-preserving request. | T-19 |
-| N2 | Panel notification when an automatic revert happens. | M5 |
-| N3 | Tamper-evident read-only root (dm-verity) for OS images. | T-09 |
-| N4 | Release channels (stable/beta). | — |
-| N5 | Power-loss safety aided by a small UPS/capacitor. | S2 |
+### Should
 
-## 9. Residual risk and accepted limitations
+10. **S1 — Explicit opt-in, no silent auto-update.** Checks and installs are
+    owner-initiated or owner-approved; no background install.
+11. **S2 — Minimal, opt-out update checks with no device-identifying
+    telemetry** (no stable unique ID; coarse version only; no per-device
+    heartbeat). Default to no check if the owner hasn't opted in.
+12. **S3 — Signed metadata + expiry/sequence.** A signed manifest with a
+    monotonic sequence number and optional freshness date defends against replay
+    and freeze attacks.
+13. **S4 — Audit log on persistent storage** (not just tmpfs): version
+    before/after, source, signature key id, result.
+14. **S5 — Key rotation and revocation** with a documented offline process;
+    support a new key without a reflash.
+15. **S6 — Update-path sandboxing / atomicity**: verify and stage in a separate
+    location, then swap; never write the running root in place.
+16. **S7 — Recovery tooling** documented for the owner (how to inspect/verify an
+    image offline, how to recover a failed device without losing photos).
 
-- **Physical access is a full compromise (A1, T-09).** No control on this board
-  prevents a determined attacker with the SD card from replacing the boot chain
-  or rolling back the anti-rollback counter. Accept and document; mitigate with
-  tamper-evidence where practical.
-- **No hardware keystore (T-03).** Cloud credentials remain readable by anyone
-  who can read the card or reach the service user. Accept for a household
-  device; reduce blast radius via Phase 0 hardening.
-- **The service user owns its config (T-15).** Config mode must write
-  `config.toml`, so the service user owns it. A post-exploit attacker can
-  persist. Reduce by sandboxing and by limiting what the service user can reach.
-- **Unsigned OS/dependency packages today (T-06).** The `.deb` is not signed and
-  is fetched from GitHub Releases. Add signed releases in Phase 0.
-- **Time is untrusted (A2, T-16).** Never base a security decision on the
-  device clock.
+### Nice
 
-## 10. Revision history
+17. **N1 — Reproducible builds** and published hashes/SBOM for the `.deb`/image,
+    so the owner can independently verify CI output.
+18. **N2 — Optional dm-verity / read-only root** to detect root-filesystem
+    tampering (given no secure boot, it's tamper-evident, not tamper-proof).
+19. **N3 — Encrypted photos partition** (LUKS with a key stored away from the SD
+    card) to protect A1 on theft — separate from updates but interacts with
+    recovery.
+20. **N4 — Rollback command** the owner can run intentionally, and a documented
+    "hold" to pin a known-good version.
+21. **N5 — Sign the CI artifacts at build time** with a key not exposed to the
+    general-purpose build job, or at minimum publish checksums signed by A4
+    out-of-band.
+
+---
+
+## 7. Design implications
+
+**Key management**
+
+- A4 must be **offline** (hardware token or air-gapped machine), used only to
+  sign releases; the build/CI environment should not hold it. If CI must sign,
+  use a protected environment/key with audit and no ability to exfiltrate, and
+  treat that as a distinct high-value asset.
+- The device needs the **verification public key** in a location the update
+  channel cannot rewrite (e.g., baked into the rootfs and additionally pinned in
+  a root-owned, immutable file; ideally in a partition the updater mounts
+  read-only). On Zero 2 W there is no OTP/secure-boot anchor, so this is a
+  software trust anchor — call that out honestly.
+- Plan **key rotation/revocation** from day one: support N trusted keys with key
+  IDs, and a signed "revoke key X" mechanism, plus an owner recovery path if the
+  key is lost (likely: reflash).
+
+**Signing format**
+
+- Prefer a **detached signature over the exact bytes distributed** (e.g.,
+  minisign/Ed25519 or GPG detached over the `.deb`/image), plus a **signed
+  manifest** containing version, monotonic sequence, target arch, artifact hash,
+  and a min-version floor. Keep it simple enough to verify offline with minimal
+  trusted code (a small verifier, not the full manager).
+- Include arch (`arm64`) and a device/product identifier so an amd64 `.deb`
+  can't be installed by mistake (also a safety, not just security, control).
+
+**Offline verification**
+
+- Verification must not require network. USB-based updates should be verified
+  with the same code path as network updates. Consider requiring the owner to
+  confirm the update on the device screen (but note the display may be the thing
+  that's broken — provide a headless/SSH path).
+
+**Rollback / boot integrity (the hard part on Zero 2 W)**
+
+- There is **no `tryboot`/`autoboot.txt` and no secure boot** on this board; the
+  firmware reads a fixed `kernel8.img`/`config.txt` from unauthenticated FAT.
+  Options, all with caveats:
+  - *Userspace swap + watchdog*: write a new root/kernel to a second location,
+    flip a root-owned "boot slot" marker, reboot, and have a userspace watchdog
+    mark the boot good within N seconds or revert. Weakness: the marker and FAT
+    files are writable by root/SD, FAT writes aren't atomic, and a power cut
+    during the flip is dangerous. Must make the flip a single atomic rename on
+    ext4 where possible.
+  - *Add a bootloader/initramfs* (U-Boot or a minimal initramfs on the FAT
+    partition) to implement real A/B and optionally dm-verity. This adds boot
+    complexity and its own attack surface, but it is the only way to get a
+    genuine boot-time rollback and verify the rootfs.
+  - *Recovery partition / initramfs fallback*: a small, rarely-changed recovery
+    image that can restore a known-good slot; essential given T-D1.
+- **Anti-rollback** needs a monotonic counter. A signed "min sequence" stored on
+  the root ext4 works against remote attackers (they can't write it) but not
+  physical ones; there is no OTP/eFuse counter readily usable here. State this
+  limitation explicitly rather than implying rollback protection against SD
+  access.
+
+**Partition layout**
+
+- Current layout is boot FAT + root ext4 + photos ext4 (created manually,
+  `PARTUUID` in fstab). A/B needs at least a second root slot; the card is small
+  and the root was deliberately kept ~900 MB. Consider: boot FAT, root A, root
+  B, photos, and possibly a small persistent state partition. Photos and
+  `/etc/photo-frame` must be outside the slots (or symlinked/mounted) so an
+  update never touches them. Watch total card size and T-D4.
+
+**Preserving state/config**
+
+- `config.toml` is service-owned and rewritten by config mode; a package/image
+  update must not overwrite it, and the `.deb` `conffiles` behavior (documented
+  in `docs/deployment.md:186`) must be preserved or replaced with an equivalent
+  merge policy. Preserve `sync-cursors.json`, `sync-status.json`, the index
+  CSVs, `display.env`, and system identity (hostname, Wi-Fi, SSH host keys)
+  across updates. Define what happens if the new version needs a config
+  migration (schema/version field in `config.toml`).
+
+**Opt-in vs auto-update**
+
+- The owner does not necessarily want auto-updates and may be offline. Design
+  for **owner-initiated updates** (USB or a manual command), with an optional,
+  minimal, opt-in check. Do not run a background installer as root. If a check
+  is offered, make it privacy-preserving (no stable device ID, no heartbeat, no
+  version history beyond a single request).
+
+**Logging / audit**
+
+- Move the update audit trail off tmpfs to persistent storage (root partition or
+  a dedicated state area), recording: timestamp, from-version, to-version,
+  artifact hash, key ID, source, and result. Keep the existing tmpfs logs for
+  operational noise. Ensure the audit record is not trivially rewritable by a
+  compromised `photo-frame` process (root-owned, append-only where possible).
+
+---
+
+## 8. Assumptions and open questions for the planning agent
+
+- **A-1:** Confirm the exact DietPi/Zero 2 W boot flow in use (no EEPROM, no
+  `tryboot`) before committing to an A/B design; the report assumes the classic
+  ROM → `bootcode.bin`/`start.elf` → `kernel8.img` flow and no secure boot.
+- **A-2:** Decide whether updates target **only the app**
+  (`photo-frame-manager`/`photo-frame-display` + units) or the **whole
+  OS/kernel**. App-only updates are far easier to make safe and can reuse the
+  existing `.deb` path; OS/kernel updates force the boot-integrity/rollback
+  problem.
+- **A-3:** Decide the **transport**: signed artifacts on USB (works offline,
+  needs physical access) vs HTTPS pull (convenient, needs a server and privacy
+  controls). They are not mutually exclusive; verification should be identical.
+- **A-4:** Confirm whether the owner is willing to accept a **software-only
+  trust anchor** (public key in rootfs) given there is no secure boot, and
+  document the residual physical-attack risk.
+- **A-5:** Decide the **failure policy**: if an update fails verification
+  mid-stream, does the device stay on the current version silently or surface an
+  error on the panel/`/api/status`?
+- **A-6:** Any update design should also address the **pre-existing** exposure
+  (plain-HTTP admin API, ImageMagick sandboxing, `token_uri` SSRF, systemd
+  hardening), because an unsigned/malicious update is not the only path to
+  root-adjacent compromise on this device.
+
+---
+
+**Bottom line.** The update problem here is dominated by one hard fact: the Pi
+Zero 2 W has no hardware root of trust and no native A/B/rollback, so update
+integrity must be **signed and verified in userspace**, and rollback/boot
+integrity must be engineered (userspace swap + watchdog or an added
+bootloader/initramfs) with an explicit acknowledgement that a physical SD
+attacker can bypass all of it. Authenticity and fail-closed behavior are
+must-haves; anti-rollback and offline verification are must/should; opt-in,
+privacy-preserving checks and persistent audit are should/nice. The current
+device already has meaningful exposure (unsigned artifacts, plain-HTTP admin
+API, unsandboxed ImageMagick on untrusted input, writable-config SSRF) that an
+update design should not ignore.
+
+---
+
+## 9. Revision history
 
 | Date | Change | Author |
 |------|--------|--------|
-| 2026-10-21 | Initial reconstruction (source report was a placeholder). | opencode |
+| 2026-10-21 | Initial report; consumed by `plans/UPDATE_STRATEGY.md`. | — |
 
 ---
 
