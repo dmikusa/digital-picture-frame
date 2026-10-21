@@ -19,6 +19,7 @@ use crate::index::{self, IndexWriter};
 use crc32fast::Hasher;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
@@ -539,6 +540,35 @@ fn build_dest_path(src_path: &Path, photos_dir: &Path, mtime: SystemTime, seq: u
     dest
 }
 
+/// Build the ImageMagick argument list for resizing `src` into `dest`.
+///
+/// `-auto-orient` comes first so EXIF rotation is applied to the pixels before
+/// resizing; otherwise a phone photo keeps its sideways orientation.
+fn convert_args(
+    src: &Path,
+    dest: &Path,
+    width: u32,
+    height: u32,
+    mode: &AspectRatioMode,
+) -> Vec<OsString> {
+    let mut args = vec![src.as_os_str().to_owned(), OsString::from("-auto-orient")];
+
+    if matches!(mode, AspectRatioMode::Fill) {
+        args.push(OsString::from("-resize"));
+        args.push(OsString::from(format!("{}x{}^", width, height)));
+        args.push(OsString::from("-gravity"));
+        args.push(OsString::from("center"));
+        args.push(OsString::from("-extent"));
+        args.push(OsString::from(format!("{}x{}", width, height)));
+    } else {
+        args.push(OsString::from("-resize"));
+        args.push(OsString::from(format!("{}x{}", width, height)));
+    }
+
+    args.push(dest.as_os_str().to_owned());
+    args
+}
+
 /// Convert an image using ImageMagick.
 fn convert_image(
     src: &Path,
@@ -558,18 +588,7 @@ fn convert_image(
     };
 
     let mut cmd = Command::new(magick_cmd);
-    cmd.arg(src);
-    if matches!(mode, AspectRatioMode::Fill) {
-        cmd.arg("-resize")
-            .arg(format!("{}x{}^", width, height))
-            .arg("-gravity")
-            .arg("center")
-            .arg("-extent")
-            .arg(format!("{}x{}", width, height));
-    } else {
-        cmd.arg("-resize").arg(format!("{}x{}", width, height));
-    }
-    cmd.arg(dest);
+    cmd.args(convert_args(src, dest, width, height, mode));
 
     unsafe {
         cmd.pre_exec(|| {
@@ -904,6 +923,29 @@ mod tests {
         index::init_index(tmpdir.path()).unwrap();
 
         assert_eq!(rotate_for_space(tmpdir.path(), 5).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_convert_args_places_auto_orient_before_resize() {
+        for mode in [AspectRatioMode::Fit, AspectRatioMode::Fill] {
+            let args = convert_args(Path::new("in.jpg"), Path::new("out.jpg"), 800, 600, &mode);
+
+            let auto = args
+                .iter()
+                .position(|arg| arg == "-auto-orient")
+                .expect("auto-orient must be present");
+            let resize = args
+                .iter()
+                .position(|arg| arg == "-resize")
+                .expect("resize must be present");
+            assert!(
+                auto < resize,
+                "auto-orient must precede resize for {mode:?}: {args:?}"
+            );
+
+            assert_eq!(args.first().unwrap(), &OsString::from("in.jpg"));
+            assert_eq!(args.last().unwrap(), &OsString::from("out.jpg"));
+        }
     }
 
     #[test]
