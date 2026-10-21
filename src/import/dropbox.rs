@@ -30,6 +30,9 @@ const TOKEN_URL: &str = "https://api.dropboxapi.com/oauth2/token";
 /// Safety valve: `has_more` is server-controlled, so cap the number of pages
 /// one sync check will follow rather than trusting it to terminate.
 const MAX_PAGES: usize = 1_000;
+/// Cursors are stored as `dbx:<provider cursor>` so a stored value can be told
+/// apart from a legacy Unix-timestamp cursor.
+const CURSOR_PREFIX: &str = "dbx:";
 /// Access tokens are refreshed a little before they expire so one cannot lapse
 /// in flight.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
@@ -87,7 +90,6 @@ struct FileEntry {
     path_lower: Option<String>,
     name: Option<String>,
     size: Option<u64>,
-    server_modified: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -239,6 +241,49 @@ impl DropboxSource {
 
         parse_list_result(send_request(request)?, "list_folder/continue")
     }
+
+    /// List the whole folder from scratch, following pagination, and return a
+    /// fresh `dbx:` cursor.
+    fn full_listing(&mut self) -> io::Result<(Vec<RemotePhoto>, String)> {
+        let args = ListFolderArgs {
+            path: self.folder.clone(),
+            recursive: true,
+        };
+        let args_json = serde_json::to_string(&args).map_err(io::Error::other)?;
+        let result = self.list_folder(&args_json)?;
+        self.drain_pages(result)
+    }
+
+    /// Continue from a stored Dropbox cursor, following pagination.
+    fn continue_listing(&mut self, stored: &str) -> io::Result<(Vec<RemotePhoto>, String)> {
+        let result = self.list_folder_continue(stored)?;
+        self.drain_pages(result)
+    }
+
+    /// Consume every page starting at `result` and return the images plus the
+    /// final `dbx:` cursor.
+    fn drain_pages(
+        &mut self,
+        mut result: ListFolderResult,
+    ) -> io::Result<(Vec<RemotePhoto>, String)> {
+        let mut photos = Vec::new();
+        let mut pages = 1usize;
+
+        loop {
+            collect_photos(&result.entries, &mut photos);
+
+            if !result.has_more {
+                return Ok((photos, format!("{CURSOR_PREFIX}{}", result.cursor)));
+            }
+            if pages >= MAX_PAGES {
+                return Err(io::Error::other(format!(
+                    "Dropbox list_folder exceeded {MAX_PAGES} pages"
+                )));
+            }
+            result = self.list_folder_continue(&result.cursor)?;
+            pages += 1;
+        }
+    }
 }
 
 fn send_request(request: RequestBuilder) -> io::Result<reqwest::blocking::Response> {
@@ -257,38 +302,28 @@ impl RemotePhotoSource for DropboxSource {
     }
 
     fn list_changes(&mut self, cursor: Option<&str>) -> io::Result<(Vec<RemotePhoto>, String)> {
-        let last_sync = cursor.and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
-
-        let args = ListFolderArgs {
-            path: self.folder.clone(),
-            recursive: true,
-        };
-        let args_json = serde_json::to_string(&args).map_err(io::Error::other)?;
-
-        let mut latest = last_sync;
-        let mut photos = Vec::new();
-
-        // `files/list_folder` returns at most one page. Follow `has_more`
-        // with `files/list_folder/continue` until every page is consumed,
-        // otherwise folders larger than one page never fully import.
-        let mut result = self.list_folder(&args_json)?;
-        let mut pages = 1usize;
-        loop {
-            collect_photos(&result.entries, last_sync, &mut latest, &mut photos);
-
-            if !result.has_more {
-                break;
+        // A provider cursor means "continue from here". Anything else (no
+        // cursor, or a legacy Unix-timestamp cursor) needs a full listing to
+        // catch up, including files older than the old timestamp filter.
+        if let Some(stored) = cursor
+            .and_then(|value| value.strip_prefix(CURSOR_PREFIX))
+            .filter(|stored| !stored.is_empty())
+        {
+            match self.continue_listing(stored) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // Dropbox invalidates cursors (reset, path removed), and a
+                    // transient failure leaves us here too. Re-list from
+                    // scratch rather than retrying a cursor that may be dead.
+                    log::warn!(
+                        "Dropbox cursor could not be used ({}); falling back to a full listing",
+                        e
+                    );
+                }
             }
-            if pages >= MAX_PAGES {
-                return Err(io::Error::other(format!(
-                    "Dropbox list_folder exceeded {MAX_PAGES} pages"
-                )));
-            }
-            result = self.list_folder_continue(&result.cursor)?;
-            pages += 1;
         }
 
-        Ok((photos, latest.to_string()))
+        self.full_listing()
     }
 
     fn download(&mut self, remote_id: &str, dest: &Path) -> io::Result<()> {
@@ -378,12 +413,7 @@ fn refresh_access_token(
     })
 }
 
-fn collect_photos(
-    entries: &[FileEntry],
-    last_sync: u64,
-    latest: &mut u64,
-    photos: &mut Vec<RemotePhoto>,
-) {
+fn collect_photos(entries: &[FileEntry], photos: &mut Vec<RemotePhoto>) {
     for entry in entries {
         if entry.tag != "file" {
             continue;
@@ -391,18 +421,6 @@ fn collect_photos(
         let path_lower = entry.path_lower.as_deref().unwrap_or("");
         if !is_image(path_lower) {
             continue;
-        }
-
-        let modified = entry
-            .server_modified
-            .as_deref()
-            .and_then(crate::import::remote::parse_iso8601)
-            .unwrap_or(0);
-        if modified <= last_sync {
-            continue;
-        }
-        if modified > *latest {
-            *latest = modified;
         }
 
         photos.push(RemotePhoto {
@@ -500,8 +518,8 @@ mod tests {
 
         let names: Vec<&str> = photos.iter().map(|p| p.filename.as_str()).collect();
         assert_eq!(names, vec!["a.jpg", "b.jpg"]);
-        // The timestamp cursor reflects the newest page, not just page one.
-        assert_eq!(cursor, "1704153600");
+        // The provider cursor reflects the last page, not just page one.
+        assert_eq!(cursor, "dbx:cursor-page-3");
 
         let requests = server.requests();
         assert_eq!(requests.len(), 2, "expected two list requests");
@@ -528,8 +546,9 @@ mod tests {
         });
 
         let mut source = test_source(&server);
-        let (photos, _cursor) = source.list_changes(None).unwrap();
+        let (photos, cursor) = source.list_changes(None).unwrap();
         assert_eq!(photos.len(), 1);
+        assert_eq!(cursor, "dbx:cursor-page-2");
         assert_eq!(server.request_count(), 1);
     }
 
@@ -556,7 +575,37 @@ mod tests {
     }
 
     #[test]
-    fn test_list_changes_skips_entries_at_or_before_cursor() {
+    fn test_list_changes_with_provider_cursor_continues_without_relisting() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.ends_with("/files/list_folder/continue") {
+                TestReply::json(format!(
+                    r#"{{"entries":[{}],"cursor":"cursor-next","has_more":false}}"#,
+                    entry("new.jpg", "2024-05-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(500)
+            }
+        });
+
+        let mut source = test_source(&server);
+        let (photos, cursor) = source.list_changes(Some("dbx:stored-cursor")).unwrap();
+
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].filename, "new.jpg");
+        assert_eq!(cursor, "dbx:cursor-next");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "a provider cursor must not re-list");
+        assert!(requests[0].url.ends_with("/files/list_folder/continue"));
+        assert!(
+            requests[0].body.contains("stored-cursor"),
+            "continue should send the stored cursor, got: {}",
+            requests[0].body
+        );
+    }
+
+    #[test]
+    fn test_list_changes_legacy_timestamp_does_full_listing() {
         let server = TestServer::start(|req, _idx| {
             if req.url.ends_with("/files/list_folder") {
                 TestReply::json(format!(
@@ -570,11 +619,43 @@ mod tests {
         });
 
         let mut source = test_source(&server);
-        let (photos, cursor) = source
-            .list_changes(Some("1704240000")) // 2024-01-03T00:00:00Z
-            .unwrap();
-        assert!(photos.is_empty(), "entries at the cursor must be skipped");
-        assert_eq!(cursor, "1704240000");
+        // A legacy numeric cursor must not filter entries: the provider cursor
+        // returned here is what prevents re-imports on the next sync.
+        let (photos, cursor) = source.list_changes(Some("1704240000")).unwrap();
+
+        let names: Vec<&str> = photos.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(names, vec!["old.jpg", "new.jpg"]);
+        assert_eq!(cursor, "dbx:c");
+        assert!(server.requests()[0].url.ends_with("/files/list_folder"));
+    }
+
+    #[test]
+    fn test_list_changes_falls_back_to_full_listing_when_cursor_rejected() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.ends_with("/files/list_folder/continue") {
+                // Dropbox returns 409 for a reset or otherwise invalid cursor.
+                TestReply::new(409, r#"{"error_summary":"reset/..."}"#)
+            } else if req.url.ends_with("/files/list_folder") {
+                TestReply::json(format!(
+                    r#"{{"entries":[{}],"cursor":"fresh","has_more":false}}"#,
+                    entry("after-reset.jpg", "2024-06-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = test_source(&server);
+        let (photos, cursor) = source.list_changes(Some("dbx:stale")).unwrap();
+
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].filename, "after-reset.jpg");
+        assert_eq!(cursor, "dbx:fresh");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "continue then a full listing");
+        assert!(requests[0].url.ends_with("/files/list_folder/continue"));
+        assert!(requests[1].url.ends_with("/files/list_folder"));
     }
 
     #[test]
