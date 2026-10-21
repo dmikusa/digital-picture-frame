@@ -22,19 +22,47 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const API_BASE: &str = "https://api.dropboxapi.com/2";
 const CONTENT_BASE: &str = "https://content.dropboxapi.com/2";
+const TOKEN_URL: &str = "https://api.dropboxapi.com/oauth2/token";
 /// Safety valve: `has_more` is server-controlled, so cap the number of pages
 /// one sync check will follow rather than trusting it to terminate.
 const MAX_PAGES: usize = 1_000;
+/// Access tokens are refreshed a little before they expire so one cannot lapse
+/// in flight.
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+/// Dropbox access tokens last four hours; used when the token response omits
+/// `expires_in`.
+const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 14_400;
 
 pub struct DropboxSource {
     client: Client,
-    access_token: String,
+    auth: Auth,
     folder: String,
     api_base: String,
     content_base: String,
+    token_url: String,
+}
+
+/// How the source authenticates against the Dropbox API.
+enum Auth {
+    /// A long-lived access token supplied directly in the config.
+    Static(String),
+    /// A refresh token exchanged for short-lived access tokens on demand.
+    Refresh {
+        refresh_token: String,
+        app_key: String,
+        app_secret: String,
+        token: Option<CachedToken>,
+    },
+}
+
+struct CachedToken {
+    access_token: String,
+    /// Refresh once this instant passes.
+    refresh_at: Instant,
 }
 
 #[derive(Serialize)]
@@ -78,30 +106,134 @@ impl DropboxSource {
     ) -> Self {
         DropboxSource {
             client: http::build_client().expect("test HTTP client"),
-            access_token,
+            auth: Auth::Static(access_token),
             folder,
             api_base,
             content_base,
+            token_url: TOKEN_URL.to_string(),
         }
     }
 
-    fn list_folder(&self, args_json: &str) -> io::Result<ListFolderResult> {
+    /// Resolve credentials and open the API roots. Tests use this with mock
+    /// roots so the whole connect path (including token refresh) is exercised.
+    pub(crate) fn connect_to(
+        config: &HashMap<String, String>,
+        api_base: &str,
+        content_base: &str,
+        token_url: &str,
+    ) -> io::Result<Self> {
+        let folder = config
+            .get("folder")
+            .cloned()
+            .unwrap_or_else(|| "/Photos".to_string());
+
+        let auth = if let Some(access_token) = config
+            .get("access_token")
+            .filter(|token| !token.trim().is_empty())
+        {
+            Auth::Static(access_token.clone())
+        } else if let Some(refresh_token) = config
+            .get("refresh_token")
+            .filter(|token| !token.trim().is_empty())
+        {
+            let app_key = config.get("app_key").cloned().ok_or_else(|| {
+                io::Error::other("Missing 'app_key' for Dropbox refresh-token auth")
+            })?;
+            let app_secret = config.get("app_secret").cloned().ok_or_else(|| {
+                io::Error::other("Missing 'app_secret' for Dropbox refresh-token auth")
+            })?;
+            Auth::Refresh {
+                refresh_token: refresh_token.clone(),
+                app_key,
+                app_secret,
+                token: None,
+            }
+        } else {
+            return Err(io::Error::other(
+                "Dropbox source requires 'access_token' or \
+                 'refresh_token'+'app_key'+'app_secret'",
+            ));
+        };
+
+        let client = http::build_client()?;
+        let mut source = DropboxSource {
+            client,
+            auth,
+            folder,
+            api_base: api_base.to_string(),
+            content_base: content_base.to_string(),
+            token_url: token_url.to_string(),
+        };
+
+        // Validate the credentials. For refresh-token auth this also fetches
+        // the first access token, so a bad refresh token fails immediately
+        // instead of during a sync.
+        let authorization = source.authorization()?;
+        let request = source
+            .client
+            .post(format!("{}/users/get_current_account", source.api_base))
+            .header(AUTHORIZATION, authorization);
+        let resp = send_request(request)?;
+
+        if !resp.status().is_success() {
+            return Err(io::Error::other(format!(
+                "Dropbox authentication failed: {}",
+                resp.status()
+            )));
+        }
+
+        Ok(source)
+    }
+
+    /// The `Authorization` header for a request, refreshing a short-lived
+    /// access token when it is missing or near expiry.
+    fn authorization(&mut self) -> io::Result<String> {
+        match &mut self.auth {
+            Auth::Static(token) => Ok(bearer(token)),
+            Auth::Refresh {
+                refresh_token,
+                app_key,
+                app_secret,
+                token,
+            } => {
+                let valid = token
+                    .as_ref()
+                    .map(|cached| cached.refresh_at > Instant::now())
+                    .unwrap_or(false);
+                if !valid {
+                    *token = Some(refresh_access_token(
+                        &self.client,
+                        &self.token_url,
+                        refresh_token,
+                        app_key,
+                        app_secret,
+                    )?);
+                }
+                let cached = token.as_ref().expect("token was just refreshed");
+                Ok(bearer(&cached.access_token))
+            }
+        }
+    }
+
+    fn list_folder(&mut self, args_json: &str) -> io::Result<ListFolderResult> {
+        let authorization = self.authorization()?;
         let request = self
             .client
             .post(format!("{}/files/list_folder", self.api_base))
-            .header(AUTHORIZATION, bearer(&self.access_token))
+            .header(AUTHORIZATION, authorization)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(args_json.to_string());
 
         parse_list_result(send_request(request)?, "list_folder")
     }
 
-    fn list_folder_continue(&self, cursor: &str) -> io::Result<ListFolderResult> {
+    fn list_folder_continue(&mut self, cursor: &str) -> io::Result<ListFolderResult> {
+        let authorization = self.authorization()?;
         let body = serde_json::json!({ "cursor": cursor }).to_string();
         let request = self
             .client
             .post(format!("{}/files/list_folder/continue", self.api_base))
-            .header(AUTHORIZATION, bearer(&self.access_token))
+            .header(AUTHORIZATION, authorization)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
 
@@ -121,37 +253,7 @@ fn send_request(request: RequestBuilder) -> io::Result<reqwest::blocking::Respon
 
 impl RemotePhotoSource for DropboxSource {
     fn connect(config: &HashMap<String, String>) -> io::Result<Self> {
-        let access_token = config
-            .get("access_token")
-            .cloned()
-            .ok_or_else(|| io::Error::other("Missing 'access_token' for Dropbox source"))?;
-        let folder = config
-            .get("folder")
-            .cloned()
-            .unwrap_or_else(|| "/Photos".to_string());
-
-        let client = http::build_client()?;
-
-        // Validate the token
-        let request = client
-            .post(format!("{API_BASE}/users/get_current_account"))
-            .header(AUTHORIZATION, bearer(&access_token));
-        let resp = send_request(request)?;
-
-        if !resp.status().is_success() {
-            return Err(io::Error::other(format!(
-                "Dropbox authentication failed: {}",
-                resp.status()
-            )));
-        }
-
-        Ok(DropboxSource {
-            client,
-            access_token,
-            folder,
-            api_base: API_BASE.to_string(),
-            content_base: CONTENT_BASE.to_string(),
-        })
+        Self::connect_to(config, API_BASE, CONTENT_BASE, TOKEN_URL)
     }
 
     fn list_changes(&mut self, cursor: Option<&str>) -> io::Result<(Vec<RemotePhoto>, String)> {
@@ -195,10 +297,11 @@ impl RemotePhotoSource for DropboxSource {
         };
         let args_json = serde_json::to_string(&args).map_err(io::Error::other)?;
 
+        let authorization = self.authorization()?;
         let request = self
             .client
             .post(format!("{}/files/download", self.content_base))
-            .header(AUTHORIZATION, bearer(&self.access_token))
+            .header(AUTHORIZATION, authorization)
             .header("Dropbox-API-Arg", &args_json);
         let resp = send_request(request)?;
 
@@ -224,6 +327,55 @@ fn parse_list_result(
         )));
     }
     resp.json().map_err(io::Error::other)
+}
+
+/// Exchange a refresh token for a short-lived access token.
+fn refresh_access_token(
+    client: &Client,
+    token_url: &str,
+    refresh_token: &str,
+    app_key: &str,
+    app_secret: &str,
+) -> io::Result<CachedToken> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", app_key),
+        ("client_secret", app_secret),
+    ];
+    let request = client.post(token_url).form(&params);
+    let resp = send_request(request)?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // The body explains the failure (bad secret, revoked token). Truncate
+        // it so a hostile server cannot flood the logs.
+        let detail: String = resp.text().unwrap_or_default().chars().take(300).collect();
+        return Err(io::Error::other(format!(
+            "Dropbox token refresh failed: {status} {detail}"
+        )));
+    }
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        #[serde(default)]
+        expires_in: u64,
+    }
+
+    let token: TokenResponse = resp.json().map_err(io::Error::other)?;
+    let lifetime = Duration::from_secs(if token.expires_in == 0 {
+        DEFAULT_TOKEN_LIFETIME_SECS
+    } else {
+        token.expires_in
+    });
+    // Never refresh later than `lifetime - margin`; for very short-lived test
+    // tokens use half the lifetime so there is still a usable window.
+    let margin = TOKEN_REFRESH_MARGIN.min(lifetime / 2);
+    Ok(CachedToken {
+        access_token: token.access_token,
+        refresh_at: Instant::now() + lifetime.saturating_sub(margin),
+    })
 }
 
 fn collect_photos(
@@ -296,6 +448,24 @@ mod tests {
             server.base_url.clone(),
             server.base_url.clone(),
         )
+    }
+
+    fn refresh_config() -> HashMap<String, String> {
+        [
+            ("refresh_token".to_string(), "refresh-me".to_string()),
+            ("app_key".to_string(), "key".to_string()),
+            ("app_secret".to_string(), "secret".to_string()),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn token_request_count(server: &TestServer) -> usize {
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.url.ends_with("/oauth2/token"))
+            .count()
     }
 
     #[test]
@@ -386,24 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn test_download_streams_bytes_to_destination() {
-        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 97) as u8).collect();
-        let expected = payload.clone();
-        let server = TestServer::start(move |_req, _idx| TestReply::new(200, payload.clone()));
-
-        let mut source = test_source(&server);
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("photo.jpg");
-
-        source.download("/photos/a.jpg", &dest).unwrap();
-
-        assert_eq!(std::fs::read(&dest).unwrap(), expected);
-        let requests = server.requests();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].url.ends_with("/files/download"));
-    }
-
-    #[test]
     fn test_list_changes_skips_entries_at_or_before_cursor() {
         let server = TestServer::start(|req, _idx| {
             if req.url.ends_with("/files/list_folder") {
@@ -423,5 +575,190 @@ mod tests {
             .unwrap();
         assert!(photos.is_empty(), "entries at the cursor must be skipped");
         assert_eq!(cursor, "1704240000");
+    }
+
+    #[test]
+    fn test_connect_with_static_token_validates_lists_and_downloads() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.ends_with("/users/get_current_account") {
+                TestReply::json(r#"{"account_id":"dbid:test"}"#)
+            } else if req.url.ends_with("/files/list_folder") {
+                TestReply::json(format!(
+                    r#"{{"entries":[{}],"cursor":"c1","has_more":false}}"#,
+                    entry("a.jpg", "2024-01-01T00:00:00Z")
+                ))
+            } else if req.url.ends_with("/files/download") {
+                TestReply::new(200, b"photo-bytes".to_vec())
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let config: HashMap<String, String> =
+            [("access_token".to_string(), "static-token".to_string())]
+                .into_iter()
+                .collect();
+
+        let mut source = DropboxSource::connect_to(
+            &config,
+            &server.base_url,
+            &server.base_url,
+            &format!("{}/oauth2/token", server.base_url),
+        )
+        .expect("connect with a static token");
+
+        let (photos, _cursor) = source.list_changes(None).unwrap();
+        assert_eq!(photos.len(), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("photo.jpg");
+        source.download("/photos/a.jpg", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"photo-bytes");
+
+        // A static token is never exchanged: every call carries it directly.
+        assert_eq!(token_request_count(&server), 0);
+        for request in server.requests() {
+            assert_eq!(
+                request.header("Authorization"),
+                Some("Bearer static-token"),
+                "expected the static token on {}",
+                request.url
+            );
+        }
+    }
+
+    #[test]
+    fn test_refresh_token_flow_obtains_and_uses_bearer_token() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.ends_with("/oauth2/token") {
+                TestReply::json(r#"{"access_token":"fresh-token","expires_in":3600}"#)
+            } else if req.url.ends_with("/users/get_current_account") {
+                TestReply::json(r#"{"account_id":"dbid:test"}"#)
+            } else if req.url.ends_with("/files/list_folder") {
+                TestReply::json(format!(
+                    r#"{{"entries":[{}],"cursor":"c1","has_more":false}}"#,
+                    entry("a.jpg", "2024-01-01T00:00:00Z")
+                ))
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = DropboxSource::connect_to(
+            &refresh_config(),
+            &server.base_url,
+            &server.base_url,
+            &format!("{}/oauth2/token", server.base_url),
+        )
+        .expect("connect with a refresh token");
+
+        let (photos, _cursor) = source.list_changes(None).unwrap();
+        assert_eq!(photos.len(), 1);
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3, "token, account check, list");
+        let token_request = &requests[0];
+        assert!(token_request.url.ends_with("/oauth2/token"));
+        assert!(
+            token_request.body.contains("grant_type=refresh_token"),
+            "got: {}",
+            token_request.body
+        );
+        assert!(token_request.body.contains("refresh_token=refresh-me"));
+        assert!(token_request.body.contains("client_id=key"));
+        assert!(token_request.body.contains("client_secret=secret"));
+
+        // The API calls use the freshly minted token, not the refresh token.
+        for request in &requests[1..] {
+            assert_eq!(
+                request.header("Authorization"),
+                Some("Bearer fresh-token"),
+                "expected the refreshed token on {}",
+                request.url
+            );
+        }
+    }
+
+    #[test]
+    fn test_refresh_token_renews_near_expiry() {
+        let server = TestServer::start(|req, _idx| {
+            if req.url.ends_with("/oauth2/token") {
+                TestReply::json(r#"{"access_token":"short-token","expires_in":1}"#)
+            } else if req.url.ends_with("/users/get_current_account") {
+                TestReply::json(r#"{"account_id":"dbid:test"}"#)
+            } else if req.url.ends_with("/files/list_folder") {
+                TestReply::json(r#"{"entries":[],"cursor":"c","has_more":false}"#)
+            } else {
+                TestReply::status(404)
+            }
+        });
+
+        let mut source = DropboxSource::connect_to(
+            &refresh_config(),
+            &server.base_url,
+            &server.base_url,
+            &format!("{}/oauth2/token", server.base_url),
+        )
+        .unwrap();
+
+        source.list_changes(None).unwrap();
+        assert_eq!(token_request_count(&server), 1);
+
+        // expires_in=1 leaves a 500 ms usable window; wait it out.
+        std::thread::sleep(Duration::from_millis(700));
+        source.list_changes(None).unwrap();
+
+        assert_eq!(
+            token_request_count(&server),
+            2,
+            "an expired token must be refreshed"
+        );
+    }
+
+    #[test]
+    fn test_refresh_credentials_missing_produce_clear_errors() {
+        let none = HashMap::new();
+        let err = DropboxSource::connect(&none)
+            .err()
+            .expect("no credentials must fail");
+        assert!(err.to_string().contains("access_token"), "{err}");
+
+        let no_key: HashMap<String, String> =
+            [("refresh_token".to_string(), "refresh-me".to_string())]
+                .into_iter()
+                .collect();
+        let err = DropboxSource::connect(&no_key)
+            .err()
+            .expect("missing app_key must fail");
+        assert!(err.to_string().contains("app_key"), "{err}");
+
+        let no_secret: HashMap<String, String> = [
+            ("refresh_token".to_string(), "refresh-me".to_string()),
+            ("app_key".to_string(), "key".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let err = DropboxSource::connect(&no_secret)
+            .err()
+            .expect("missing app_secret must fail");
+        assert!(err.to_string().contains("app_secret"), "{err}");
+    }
+
+    #[test]
+    fn test_download_streams_bytes_to_destination() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 97) as u8).collect();
+        let expected = payload.clone();
+        let server = TestServer::start(move |_req, _idx| TestReply::new(200, payload.clone()));
+
+        let mut source = test_source(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("photo.jpg");
+
+        source.download("/photos/a.jpg", &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), expected);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.ends_with("/files/download"));
     }
 }
