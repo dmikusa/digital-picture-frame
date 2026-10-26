@@ -60,10 +60,11 @@ pub fn append_audit(path: &Path, record: &AuditRecord) -> Result<()> {
     }
 
     let mut line = format!(
-        "{} action={} from={} to={} sequence={} key_id={} source={} result={}",
+        "{} action={} from={} to={} version={} sequence={} key_id={} source={} result={}",
         Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
         sanitize(record.action),
         record.from.map(sanitize).unwrap_or_else(|| "-".to_string()),
+        record.to.map(sanitize).unwrap_or_else(|| "-".to_string()),
         record.to.map(sanitize).unwrap_or_else(|| "-".to_string()),
         record
             .sequence
@@ -151,6 +152,7 @@ mod tests {
         assert!(text.contains("action=install"));
         assert!(text.contains("from=0.1.0"));
         assert!(text.contains("to=0.2.1"));
+        assert!(text.contains("version=0.2.1"));
         assert!(text.contains("sequence=42"));
         assert!(text.contains("key_id=test-2026"));
         assert!(text.contains("result=success"));

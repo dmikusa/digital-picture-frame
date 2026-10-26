@@ -377,6 +377,13 @@ pub fn activate(paths: &Paths, version: &str) -> Result<()> {
             version
         )));
     }
+    if !paths.release_dir(version).is_dir() {
+        return Err(UpdateError::State(format!(
+            "release {} is not installed in {}",
+            version,
+            paths.releases_dir().display()
+        )));
+    }
     fs::create_dir_all(&paths.root).map_err(|e| {
         UpdateError::Io(format!("failed to create {}: {}", paths.root.display(), e))
     })?;
@@ -647,6 +654,12 @@ pub fn guard(
 /// Keep `current`, `previous`, and the four most recently installed releases.
 pub fn gc(paths: &Paths) -> Result<GcReport> {
     let state = State::load(&paths.state_file())?;
+    if !paths.releases_dir().is_dir() {
+        return Ok(GcReport {
+            removed: Vec::new(),
+            kept: Vec::new(),
+        });
+    }
     let mut releases = scan_releases(paths)?;
     releases.sort_by(|left, right| {
         right
@@ -1634,6 +1647,22 @@ mod tests {
         for version in ["0.0.3", "0.0.4"] {
             assert!(!env.paths.release_dir(version).exists(), "{} kept", version);
         }
+    }
+
+    #[test]
+    fn test_gc_on_empty_root() {
+        let env = test_env();
+        let report = gc(&env.paths).unwrap();
+        assert!(report.removed.is_empty());
+        assert!(report.kept.is_empty());
+    }
+
+    #[test]
+    fn test_activate_rejects_missing_release() {
+        let env = test_env();
+        let err = activate(&env.paths, "0.1.0").unwrap_err();
+        assert!(matches!(err, UpdateError::State(_)), "{err:?}");
+        assert!(!env.paths.current_link().exists());
     }
 
     #[test]
