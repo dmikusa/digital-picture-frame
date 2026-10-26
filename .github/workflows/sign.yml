@@ -1,0 +1,86 @@
+name: Sign Release Checksums
+
+# Manual only: this workflow needs the `release-signing` environment and its
+# UPDATE_SIGNING_KEY secret to be configured first, so it must never run on
+# push or pull_request. Setup, key custody, and rotation are documented in
+# docs/updates.md.
+#
+# It downloads each `*.sha256` asset from an existing release, signs the exact
+# bytes with the offline-style Ed25519 key held in the environment secret, and
+# uploads the `<bundle>.sha256.sig` envelope next to it. photo-frame-update
+# fetches `<bundle>.sha256` and `<bundle>.sha256.sig` from the same location.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sign (for example v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    environment: release-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check OpenSSL supports raw Ed25519 signing
+        run: |
+          if ! command -v openssl >/dev/null 2>&1 ||
+            ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends openssl
+          fi
+          openssl version
+          openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'
+
+      - name: Download checksum assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --pattern '*.sha256' --dir dist
+          ls -l dist
+
+      - name: Sign checksum assets
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          UPDATE_SIGNING_KEY_ID: ${{ secrets.UPDATE_SIGNING_KEY_ID }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          checksums=(dist/*.sha256)
+          if [ "${#checksums[@]}" -eq 0 ]; then
+            echo "error: the release has no .sha256 assets to sign" >&2
+            exit 1
+          fi
+          for checksum in "${checksums[@]}"; do
+            scripts/sign-checksum.sh "$checksum" "${checksum}.sig"
+          done
+
+      - name: Upload signatures
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          signatures=(dist/*.sha256.sig)
+          if [ "${#signatures[@]}" -eq 0 ]; then
+            echo "error: no signatures were produced" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${signatures[@]}" --clobber
