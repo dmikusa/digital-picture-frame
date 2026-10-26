@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-# Sign a bundle's `.sha256` file with the offline Ed25519 update key.
+# Sign a bundle's `.sha256` file with the CI Ed25519 update key.
 #
 #   UPDATE_SIGNING_KEY="$(cat update-key.pem)" UPDATE_SIGNING_KEY_ID=2026-10 \
 #     scripts/sign-checksum.sh photo-frame-0.2.0-arm64.tar.gz.sha256 \

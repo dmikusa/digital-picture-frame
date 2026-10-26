@@ -141,12 +141,14 @@ apt and manual kernel policy in `docs/updates.md`.
 Three files per release. Keep it simple and auditable.
 
 ```
-photo-frame-0.2.0-0007.tar.gz
-photo-frame-0.2.0-0007.tar.gz.sha256
-photo-frame-0.2.0-0007.tar.gz.sha256.sig
+photo-frame-0.2.0-arm64.tar.gz
+photo-frame-0.2.0-arm64.tar.gz.sha256
+photo-frame-0.2.0-arm64.tar.gz.sha256.sig
 ```
 
-The tar contains a manifest at the root and a `bin/` directory:
+The name is `photo-frame-<version>-<arch>.tar.gz`. The sequence is in the
+manifest, not the filename. The tar contains a manifest at the root and a `bin/`
+directory:
 
 ```
 manifest.json
@@ -159,37 +161,36 @@ bin/photo-frame-update
 
 ```json
 {
-  "bundle_format": 1,
-  "product": "photo-frame",
-  "arch": "aarch64",
+  "format": 1,
   "version": "0.2.0",
   "sequence": 7,
+  "arch": "arm64",
   "min_version": "0.1.0",
-  "config_schema": 1,
-  "created": "2026-10-24T18:00:00Z",
-  "artifacts": [
-    {"path": "bin/photo-frame-manager", "sha256": "…", "size": 4123456, "mode": "0755"},
-    {"path": "bin/photo-frame-display", "sha256": "…", "size": 51200, "mode": "0755"},
-    {"path": "bin/photo-frame-update", "sha256": "…", "size": 2300000, "mode": "0755"}
+  "files": [
+    {"path": "bin/photo-frame-manager", "sha256": "…"},
+    {"path": "bin/photo-frame-display", "sha256": "…"},
+    {"path": "bin/photo-frame-update", "sha256": "…"}
   ]
 }
 ```
 
 | Field | Purpose |
 |-------|---------|
-| `bundle_format` | Refuse formats the updater does not understand. |
-| `product`, `arch` | Refuse bundles for another device. |
-| `version` | Human-readable semver; used for the release dir name. |
+| `format` | Refuse formats the updater does not understand. Only `1` is accepted. |
+| `version` | Release directory name; must be a safe single path component. |
 | `sequence` | Monotonic integer; the anti-rollback floor (M6, S3). |
-| `min_version` | Refuse if the installed version is older than the bundle supports. |
-| `config_schema` | The config schema the app expects; drives migration (M7, derived). |
-| `artifacts[]` | Path, SHA-256, size, mode for every installed file (M2). |
+| `arch` | Refuse bundles for another CPU; only `arm64` and `aarch64` are accepted. |
+| `min_version` | Optional. Refuse if the active `current` is older than the bundle supports. |
+| `files[]` | Path and SHA-256 for every installed file (M2). |
+
+There is no `product`, `size`, or `mode` field. The extractor sets `0755` for
+files under `bin/` and `0644` for everything else.
 
 The `.sha256` file is `sha256sum` output. The `.sha256.sig` file is a JSON
 envelope over the exact bytes of the checksum file:
 
 ```json
-{"key_id":"release-2026-a","signature":"<base64url>"}
+{"key_id":"2026-10","signature":"<base64url>"}
 ```
 
 **Why the signature covers the checksum file** rather than a field inside the
@@ -198,23 +199,27 @@ JSON, the manifest stays a plain description of contents, and the tarball is
 bound through its digest. Both sidecars are required; the updater refuses a
 bundle without them.
 
+Extraction has hard caps (100 MiB bundle, 512 MiB extracted, 10,000 entries) and
+an allowlist: regular files and directories only, with no absolute paths, `..`,
+links, or device nodes.
+
 ### 3.3 Signing
 
-**Ed25519, raw signature, no certificate.** OpenSSL generates the key, signs the
-checksum file, and needs nothing else:
+**Ed25519, raw signature, no certificate.** OpenSSL generates the key and the
+repository's `scripts/sign-checksum.sh` produces the envelope:
 
 ```bash
-openssl genpkey -algorithm ED25519 -out update-signing-2026-a.pem
-openssl pkeyutl -sign -rawin -inkey update-signing-2026-a.pem \
-  -in photo-frame-0.2.0-0007.tar.gz.sha256 -out signature.bin
+openssl genpkey -algorithm ED25519 -out update-signing-2026-10.pem
+UPDATE_SIGNING_KEY="$(cat update-signing-2026-10.pem)" \
+UPDATE_SIGNING_KEY_ID=2026-10 \
+  scripts/sign-checksum.sh dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
 ```
 
 There is no CA, no certificate chain, no expiry, and no network check, so the
 device can verify offline. The private key file is stored in a password manager
-or encrypted volume, and its backup is kept separately. Signing happens in CI, in
-a dedicated job with its own protected environment; the private key is not on the
-device and is not available to the build job. Section 7.2 covers the split and
-its limits.
+or encrypted volume, and its backup is kept separately. Signing runs in CI, in
+a manual workflow with its own protected environment; the private key is not on
+the device and is not in the build. Section 7.2 covers the split and its limits.
 
 The public key is **baked into `photo-frame-update`** as a compiled constant, not
 installed as a file. Section 7.3 covers distribution; `docs/updates.md` covers
@@ -225,40 +230,40 @@ the commands.
 The updater runs as root (it must replace binaries and flip the symlink) but
 performs all of this **before** touching the live install:
 
-1. Copy the bundle and both sidecars to a root-only staging dir
-   `/var/lib/photo-frame/update/staging/` (0700), writing to `*.part` and
-   renaming when complete. An interrupted copy is never a candidate.
-2. Verify the signature over the `.sha256` bytes with the key named by `key_id`.
-   **Fail closed** on an unknown key ID or an invalid signature (M1, M5).
-3. Check the tarball's SHA-256 against the checksum file, and against
+1. Verify the signature over the `.sha256` bytes with the key named by `key_id`.
+   **Fail closed** on an empty compiled key list, an unknown key ID, or an
+   invalid signature (M1, M5).
+2. Copy (local) or download (HTTPS) the bundle into
+   `/opt/photo-frame/.staging` (0700) and hash that copy. An interrupted copy is
+   never a candidate.
+3. Check the copied bundle's SHA-256 against the checksum file, and against
    `--sha256` when it was supplied. `--sha256` is required for URL installs.
-4. Parse `manifest.json`. Check `bundle_format`, `product`, `arch`,
-   `config_schema`, and `min_version` (M3).
-5. Compare `sequence` with the stored floor; refuse `<= floor` unless
-   `--force` is passed (M6).
-6. Verify each `artifacts[]` entry's SHA-256 and size against the payload (M2).
-7. Extract the payload into a **fresh** directory, rejecting absolute paths,
-   `..`, symlinks, hardlinks, device nodes, and any entry outside the target
-   (M2, S6). Set ownership to root and modes from the manifest.
-8. Only now proceed to install (Section 3.5).
+4. Extract into a fresh directory under `.staging` and parse `manifest.json`.
+   Check `format`, `version`, `arch`, and `min_version` (M3).
+5. Compare `sequence` with the stored floor; refuse anything lower. An equal
+   sequence is allowed only when the target release directory does not already
+   exist. There is no `--force` (M6).
+6. Verify each `files[]` entry's SHA-256 against the extracted payload (M2).
+7. Only now rename the staged tree into `releases/<version>` and proceed
+   (Section 3.5).
 
 ### 3.5 Versioned installs and the flip
 
 ```
 /opt/photo-frame/
   releases/
-    0.1.0-0003/            # previous, kept for rollback
+    0.1.0/                 # previous, kept for rollback
+      manifest.json
       bin/photo-frame-manager
       bin/photo-frame-display
       bin/photo-frame-update
-    0.2.0-0007/            # current
-  current -> releases/0.2.0-0007
+    0.2.0/                 # current
+  current -> releases/0.2.0
+  .staging/                # root-only, never active
 /var/lib/photo-frame/update/
-  sequence                 # monotonic floor (root, 0644)
-  pending.json             # {from, to, attempts, started_at}
-  last-result.json         # for the panel and /api/status
-  staging/
-  audit.log                # persistent, root-owned, 0600
+  state.json               # current, previous, last_good, pending, sequence (0600)
+/var/log/photo-frame/
+  update.log               # persistent audit log, root-owned, 0600
 ```
 
 The systemd units are installed once by the `.deb` and point at the stable path
@@ -266,55 +271,64 @@ The systemd units are installed once by the `.deb` and point at the stable path
 so an update just flips the symlink and no unit changes are involved. If a unit
 ever has to change, that is a manual `.deb` upgrade, not a bundle.
 
+The `.deb` also seeds `releases/<package-version>` from its packaged binaries at
+sequence 0, so a fresh device has a release to run before the first bundle.
+
 Retention keeps the current release, the previous release, and the four most
-recent releases; `gc` removes anything older after a successful install.
+recently modified releases; `gc` removes anything else after a successful
+install.
 
 Install sequence (all on ext4, all atomic via `rename()`):
 
-1. Verify (Section 3.4).
-2. Extract to `releases/<ver>-<seq>.new`; `rename()` to `releases/<ver>-<seq>`.
-3. Write `pending.json` (temp + `rename` + `fsync` the directory).
-4. Create `current.new` symlink, then `rename()` it over `current` (atomic).
-5. `systemctl restart photo-frame-display photo-frame-manager`.
+1. Verify and extract under `.staging` (Section 3.4).
+2. `rename()` the staged tree to `releases/<version>` and flush the directory.
+3. Write `state.json` with the pending marker (`from`, `to`, `sequence`,
+   `key_id`, `source`, `started_at`) via a temp file, `rename`, and `fsync`.
+4. Create a temporary symlink, then `rename()` it over `current`.
+5. `systemctl restart photo-frame-display.service photo-frame-manager.service`.
 6. Health check (Section 3.6).
-7. On success: remove `pending.json`, write `last-result.json`, append to
-   `audit.log`, run `gc`, show "Updated to vX".
-8. On failure: revert `current` to the previous version, restart, mark the
-   result failed, append to `audit.log`, show "Update failed, reverted to vN".
+7. On success: set `current`, `previous`, `last_good`, and the sequence floor;
+   clear `pending`; append to `update.log`; run `gc`.
+8. On failure: revert `current` to the previous release if it exists and
+   restart; otherwise remove `current`. Clear `pending`, record the failure, and
+   return an error.
 
 ### 3.6 Health check
 
-Run for up to 90 seconds after restart:
+Run for up to 30 seconds after restart, probing every 500 ms:
 
 | Check | Pass condition |
 |-------|----------------|
-| Services | `systemctl is-active` for both units |
-| Crash loop | `NRestarts` did not exceed a small threshold |
+| Services | `systemctl is-active --quiet` succeeds for `photo-frame-display.service` and `photo-frame-manager.service` |
 | Display socket | `/run/photo-frame/photo-frame.sock` exists and is a socket |
-| Manager liveness | Manager writes `/run/photo-frame/healthy` with its version and a timestamp (new, small feature) |
-| Index | Photos dir is mounted and readable |
+| Control socket | `/run/photo-frame/control.sock` exists and is a socket |
 
-The manager writes `/run/photo-frame/healthy` once it is past startup and has
-opened the index. That is a tiny, low-risk addition and gives the updater a
-definitive liveness signal rather than a sleep.
+There is no `healthy` file, no restart-count check, and no photos-directory
+check. The socket paths are hardcoded, so moving them in `config.toml` and
+`display.env` makes a post-update health check fail.
 
 ### 3.7 Boot guard (userspace rollback)
 
 There is no hardware fallback, so recovery must work even if the new version
-cannot start at all. `photo-frame-boot-guard.service` is a `oneshot` unit
-ordered `Before=photo-frame-display.service photo-frame-manager.service` and
-`After=local-fs.target`:
+cannot start. `photo-frame-update-guard.service` is a `oneshot` unit ordered
+`After=photo-frame-manager.service photo-frame-display.service` and
+`Wants=` both:
 
-1. No `pending.json`: exit.
-2. If `pending.json` exists, increment `attempts` and exit on the first boot
-   after the flip.
-3. If `attempts >= 1` (we already booted once without confirmation), revert
-   `current` to `pending.from` and record the revert in `audit.log`.
-4. Exit; the normal services start against the good version.
+1. No `pending` in `state.json`: exit.
+2. If `pending` exists and neither the `current` symlink nor `state.current`
+   names `pending.to`, the release never activated: clear `pending` and record
+   `cleared`.
+3. Otherwise wait `--grace-seconds 30`, run the health check, and either confirm
+   the release (update `current`, `previous`, `last_good`, sequence, clear
+   `pending`) or revert `current` to `pending.from` and restart.
+4. If there is no usable previous release on failure, clear `pending` and record
+   `failed`.
 
-Because the kernel is unchanged, the boot guard always runs. This is what makes
-app-only rollback reliable without reflashing. The only unrecoverable case is a
-corrupt rootfs or boot partition, which Option A does not touch.
+Because the kernel is unchanged, the boot guard always runs. Because it runs
+after the app units, it cannot stop a broken release from starting once; it
+detects the failure and rolls back. There is no attempt counter and no
+`guard --clear`. The only unrecoverable case is a corrupt rootfs or boot
+partition, which Option A does not touch.
 
 ### 3.8 Offline install
 
@@ -325,11 +339,12 @@ corrupt rootfs or boot partition, which Option A does not touch.
 3. The owner installs from a shell (SSH or the console):
 
    ```bash
-   sudo photo-frame-update install /media/usb0/photo-frame-0.2.0-0007.tar.gz
+   sudo photo-frame-update install \
+     /media/usb0/photo-frame-0.2.0-arm64.tar.gz
    ```
 
    The sidecars must be in the same directory. A bundle without them is refused.
-4. The panel shows progress and the final result.
+4. The updater prints the result and writes the audit log.
 
 There is no auto-apply marker directory in the adopted design. The `/media`
 watcher does not treat a mounted bundle as an instruction to install, so a
@@ -372,18 +387,19 @@ message.
 
 | Failure | Result |
 |---------|--------|
-| Bad/missing signature | Refuse before install; panel error; audit entry |
+| Bad/missing signature | Refuse before install; audit entry |
 | Unknown key ID | Refuse; the bundle was signed with a key this build does not trust |
 | Rejected URL | Plain HTTP, or an HTTPS-to-HTTP redirect, refusing before download |
-| Hash mismatch / truncated bundle | Refuse; the `*.part` staging file is discarded |
-| Wrong arch/product | Refuse with a specific message |
-| Sequence not newer | Refuse unless `--force` |
-| Disk full | Refuse after a pre-flight space check; no changes |
+| Hash mismatch / truncated bundle | Refuse; the staged copy is discarded |
+| Wrong arch | Refuse with a specific message |
+| Sequence lower than the floor | Refuse. An equal sequence is allowed only for a new version directory; there is no `--force`. |
+| Release directory already exists | Refuse; the same version cannot be installed twice |
+| Disk full | Fail with an I/O error; the staged copy is cleaned up and the live install is untouched |
 | Power loss mid-copy/extract | Nothing installed; staging is incomplete and ignored |
-| Power loss mid-flip | Atomic symlink rename leaves old or new; boot guard decides |
-| New version fails health check | Automatic revert to previous; panel message (M4, S4) |
-| New version cannot start at all | Boot guard reverts on the next boot |
-| Revert target missing | Refuse the install; `gc` always keeps the previous release |
+| Power loss mid-flip | Atomic symlink rename leaves old or new; the guard confirms or reverts |
+| New version fails health check | Automatic revert to previous, or removal of `current` when no fallback exists |
+| New version cannot start at all | The guard runs after the app units, detects the failed health check, and reverts |
+| Revert target missing | The guard clears `pending` and reports failure; `gc` keeps `previous` |
 | Corrupt rootfs/boot partition | Out of scope for A; recover by reflashing |
 
 ### 3.13 Pros, cons, effort, risk
@@ -546,11 +562,11 @@ compatible. The final record is Section 15.
 | Sign release artifacts and publish checksums with signatures | Prerequisite for any update (M1, M2, N5). |
 | Add `config_version` to `config.toml` + migration | Enables forward-compatible config changes (M7). |
 | Add the versioned install layout (`/opt/photo-frame/releases`, `current`) | Makes the flip possible without a partition change. |
-| Add `/var/lib/photo-frame/update/` (sequence, pending, audit) | Update state and audit (M6, S4). |
-| Add `photo-frame-boot-guard.service` | Rollback safety (M4). |
-| Add `/run/photo-frame/healthy` from the manager | Health check signal (S7). |
+| Add `/var/lib/photo-frame/update/state.json` (current, previous, last_good, pending, sequence) and the audit log | Update state and audit (M6, S4). |
+| Add `photo-frame-update-guard.service` | Rollback safety (M4). |
+| Health check on both units and both sockets after restart | Health signal (S7). |
 | Keep `display.env`/`config.toml` as conffiles; ship defaults as `.example` | State preservation (M7). |
-| Sign releases in a dedicated CI job with its own protected environment | CI usefulness without the key in the build job (S5, N5). |
+| Sign releases in a manual CI workflow with its own protected environment | CI usefulness without the key in the build (S5, N5). |
 | Phase 0 hardening (Section 12) | The update mechanism should not rest on unhardened primitives (T-T3, T-T5, T-E4, T-D5, T-D6). |
 
 ### 5.2 Interfaces and reservations
@@ -563,10 +579,10 @@ for a future rootfs B, because Option B is not being built:
 - **Keeping state outside the rootfs** still happens in the narrow sense that
   the updater never touches `/etc/photo-frame` or the photos partition, but there
   is no separate state partition.
-- **Boot-marker contract:** the only marker is
-  `/var/lib/photo-frame/update/pending.json`, read by the userspace boot guard.
-- **Bundle schema:** `bundle_format` is kept so an app bundle and a future OS
-  image could be distinguished, but no OS image format is defined.
+- **Boot-marker contract:** the only marker is the `pending` object in
+  `/var/lib/photo-frame/update/state.json`, read by the userspace guard.
+- **Bundle schema:** `format` is versioned so a future OS image could be
+  distinguished, but no OS image format is defined.
 
 ### 5.3 Later (only if OS updates are needed)
 
@@ -608,7 +624,7 @@ made with `openssl pkeyutl -sign -rawin` over the exact bytes of the `.sha256`
 sidecar. The envelope names the key:
 
 ```json
-{"key_id":"release-2026-a","signature":"<base64url>"}
+{"key_id":"2026-10","signature":"<base64url>"}
 ```
 
 There is no certificate, no expiry, no CA, no keyserver, and no trust path. A GPG
@@ -618,56 +634,60 @@ signature.
 
 ### 7.2 Keys
 
-One signing key, used by one CI job.
+One signing key, used by one manual workflow.
 
 | Key | Where | Signs | Compromise impact |
 |-----|-------|-------|-------------------|
-| **Update signing key** (`release-YYYY-x`) | GitHub environment secret `release-signing`; a backup offline; never on the device | The `.sha256` file for each release | Forged releases. Rotate and reflash or use a recovery key. |
-| **Recovery key** (optional) | Offline only; never in CI | A recovery release that installs a clean key list | Same as above, but it is the way back if the signing key leaks. |
+| **Update signing key** (`2026-10`) | GitHub environment secret `release-signing`; a backup offline; never on the device | The `.sha256` file for each release | Forged releases. Rotate and reflash, or use a second trusted key. |
+| **Recovery key** (optional, not a separate mode) | Offline only; never in CI | A recovery release that installs a clean key list | Same as above, but it is the way back if the signing key leaks. |
 
-The build job has no signing key. The signing job gets the key from a protected
-environment, waits for a required reviewer, and runs only for protected tags or
-a manual dispatch. See `docs/updates.md` for the environment setup and the
-workflow.
+The signing workflow is manual: `workflow_dispatch` with a release-tag input,
+the `release-signing` environment, and `contents: write` only in that job. There
+is no automatic build→sign chain in the repository, and `.github/workflows/build.yml`
+still only produces `.deb` packages. See `docs/updates.md` for the release steps
+and the environment setup.
 
 CI signing means **CI is the build-integrity trust anchor**. The signature proves
-the artifact came from the workflow; it does not prove the workflow was not
-compromised. A compromised build job, dependency, or merged commit produces a
-validly signed malicious artifact. The dedicated key in a separate job limits
-the blast radius and makes each signing event auditable, but it does not make CI
-trustworthy. This is an accepted risk, stated plainly so nobody mistakes the
-signature for a build attestation.
+the artifact came through the release process; it does not prove the process was
+not compromised. A compromised build machine, dependency, or merged commit
+produces a validly signed malicious artifact. The protected environment and its
+required reviewer limit the blast radius and make each signing event auditable,
+but they do not make CI trustworthy. This is an accepted risk, stated plainly so
+nobody mistakes the signature for a build attestation.
 
 Possible future hardening, not planned now: sign through a cloud KMS or a
 PKCS#11 HSM so the key never exists as a file, or run the signing step on a
-self-hosted runner the build job cannot reach.
+self-hosted runner the build cannot reach.
 
 ### 7.3 Distribution and pinning
 
 - The public keys are **compiled into `photo-frame-update`** as a table keyed by
-  key ID, for example `TRUSTED_KEYS` in `src/update/keys.rs`.
+  key ID, for example `TRUSTED_KEYS` in `src/update/keys.rs`. The field is
+  `bytes`.
 - The bytes are the 32-byte raw Ed25519 public key, not PEM or DER. Get them with
   `openssl pkey -pubout -outform DER | tail -c 32`.
 - No public-key file is installed by apt, no keyring is read at runtime, and
   nothing under `/etc/photo-frame` participates in verification.
 - `photo-frame-update` ships inside the release bundle, so the trusted key set
-  travels with the app.
+  travels with the app. Adding or removing a key requires rebuilding the tool.
 - The `.sha256.sig` envelope carries `key_id`; the updater looks that ID up and
   refuses unknown IDs.
-- `photo-frame-update keys` prints each key ID with the SHA-256 fingerprint of
-  its public key, which is what to compare against the signing machine.
+- `photo-frame-update keys` prints key IDs only, one per line. It does not print
+  fingerprints; compute the SHA-256 of the raw 32-byte public key on the signing
+  machine and compare it there.
 
 ### 7.4 Rotation and revocation
 
 Rotation is a sequence of releases, not a single switch:
 
 1. Generate the new key and add its public half to `TRUSTED_KEYS` alongside the
-   old one.
+   old one. Rebuild `photo-frame-update`.
 2. Ship a release signed by the **old** key that contains the new updater.
 3. Let the device install that release, so it now trusts both keys.
-4. Sign subsequent releases with the new key.
-5. Ship a later release, signed with the new key, that removes the old entry.
-6. Replace the CI secrets and retire the old private key.
+4. Replace the CI environment secrets with the new key.
+5. Sign subsequent releases with the new key.
+6. Ship a later release, signed with the new key, that removes the old entry.
+7. Retire the old private key.
 
 The overlap exists because a device can only learn a new key from a release it
 already trusts. The overlap must last long enough to install step 2. It should
@@ -675,28 +695,29 @@ not last longer than that.
 
 Revocation is the same operation with no overlap: if a key is compromised, a
 release signed by it cannot be trusted, so removal cannot go through that key.
-Use the recovery key or reflash.
+Use a second trusted key or reflash.
 
 ### 7.5 Key loss and compromise
 
 - **Lost key:** the device keeps running. No new release can be signed until the
-  key is restored from backup, the recovery key is used, or the device is
+  key is restored from backup, a second trusted key is used, or the device is
   reflashed with a new key list.
 - **Compromised key:** anything signed after the leak is suspect. Remove the key
-  from CI, rotate the environment secrets, and recover with a recovery key or a
-  reflash. There is no online revocation and no expiry date to fall back on.
-- **Recovery key (optional):** a second key baked in at provisioning, held
-  offline, used only to sign a recovery release. Worth the extra constant if the
-  device is hard to reach. If it is skipped, say so, because the only remaining
-  path is a reflash.
+  from CI, rotate the environment secrets, and recover with a second trusted key
+  or a reflash. There is no online revocation and no expiry date to fall back on.
+- **Recovery key (optional):** there is no dedicated recovery mode. A second key
+  baked into `TRUSTED_KEYS` and held offline is the mechanism you can use. If it
+  is skipped, say so, because the only remaining path is a reflash.
 - **No expiry:** a key stays trusted until a release removes it. Expiry would
   create a new failure mode (a device with a wrong clock refusing updates) with
   no matching benefit, since the key can be removed explicitly.
 
 ### 7.6 Anti-rollback floor and its limits
 
-- Store a monotonic `sequence` in `/var/lib/photo-frame/update/sequence`
-  (root-owned). Refuse bundles with `sequence <= floor` unless explicitly forced.
+- Store a monotonic `sequence` in `/var/lib/photo-frame/update/state.json`
+  (root-owned, 0600). Refuse bundles with a sequence lower than the floor. An
+  equal sequence is accepted only for a new release directory; there is no
+  force override.
 - **Limits (documented, per T-E6/T-D3 and assumption A-4):** the floor lives on
   the same SD card. An attacker with physical access can edit it and reinstall
   an older validly signed bundle. A full reflash resets it. The floor therefore
@@ -713,16 +734,19 @@ Use the recovery key or reflash.
 
 See Section 3.5 for the install sequence. The rollback-relevant mechanics:
 
-1. `pending.json` records `from`, `to`, and `attempts`; written atomically.
+1. The `pending` object in `state.json` records `from`, `to`, `sequence`,
+   `key_id`, `source`, and `started_at`; written atomically before the flip.
 2. `current` is flipped with a single `rename()` of a symlink — atomic on ext4.
-3. Success removes `pending.json`; failure flips back immediately.
-4. `photo-frame-boot-guard.service` runs before the app units on every boot and
-   reverts if `pending` is present and `attempts >= 1`.
-5. Power loss between flip and confirm is covered by the boot guard.
+3. Success clears `pending`; failure flips back immediately, or removes `current`
+   when no previous release is usable.
+4. `photo-frame-update-guard.service` runs **after** the app units on every boot.
+   It uses the symlink and `state.current` to decide whether the pending release
+   activated, then either confirms it or reverts to `pending.from`.
+5. Power loss between flip and confirm is covered by the guard on the next boot.
 
 **What is atomic on ext4:** `rename()` of a file or symlink within a directory,
-given `data=ordered` (Debian default) plus a directory `fsync`. Writes to a
-`*.part` file are not atomic but are never used until renamed.
+given `data=ordered` (Debian default) plus a directory `fsync`. Temporary staging
+files are never used until renamed.
 
 **What is not atomic on FAT:** a partial write to `config.txt` or any FAT file
 (the boot partition). Option A does not write to the boot partition, which is
@@ -754,7 +778,7 @@ step that can brick the device, so the design must avoid it.
 | Index, cursors, status | Photos partition | Preserved | Preserved |
 | `config.toml` | `/etc/photo-frame/config.toml` | Preserved (never overwritten) | Preserved via state partition |
 | `display.env` | `/etc/photo-frame/display.env` | Preserved (conffile; new keys as `.example`) | Preserved via state partition |
-| Update state + audit | `/var/lib/photo-frame/update/` | Preserved | Preserved via state partition |
+| Update state + audit | `/var/lib/photo-frame/update/state.json`, `/var/log/photo-frame/update.log` | Preserved | Preserved via state partition |
 | Hostname | `/etc/hostname` | Preserved (rootfs untouched) | Preserved via state partition / re-applied |
 | Wi-Fi | `/etc/wpa_supplicant` (or DietPi config) | Preserved | Preserved via state partition |
 | SSH identity | `/etc/ssh`, `authorized_keys` | Preserved | Preserved via state partition |
@@ -780,36 +804,36 @@ There is no panel-driven approval prompt, no config-mode upload page, and no
 background check. A valid bundle sitting on a mounted drive is not an
 instruction to install it.
 
-### 10.2 Panel messages
+### 10.2 Command output
 
-- "Verifying update…"
-- "Applying update… the frame may restart."
-- "Updated to vX."
-- "Update failed: <reason>. Reverted to vN." (M4, S4)
-- "Update rejected: bad signature." / "wrong device" / "not newer".
+The updater reports on stdout, and failures on stderr. There is no panel or admin
+API integration: no `last-result.json`, no `/api/status` field, and no control
+socket messages from the update path.
 
-These use the existing control socket (`CLR`/`SHOW`) and status-screen rendering
-in `src/qr.rs` / `src/config_mode.rs`, so no new display protocol is needed.
+```
+installed 0.2.0 (sequence 7) signed by 2026-10; previous release 0.1.0
+rolled back from 0.2.0 to 0.1.0
+error: signature key id '2027-04' is not trusted by this build
+```
 
 ### 10.3 Failure reporting
 
-- Panel message (above).
-- `last-result.json` in the update state dir, surfaced in config mode's
-  `/api/status` alongside sync status.
+- The command's exit status and stderr message.
+- The `pending` object in `state.json` while an update is unconfirmed.
 - A line in the persistent audit log.
 
 ### 10.4 Audit log (S4)
 
-`/var/lib/photo-frame/update/audit.log`, root-owned, mode 0600, on persistent
-storage (not tmpfs). One line per attempt:
+`/var/log/photo-frame/update.log`, root-owned, mode 0600, on persistent storage
+(not tmpfs). One line per operation:
 
 ```
-2026-10-24T18:12:03Z action=install from=0.1.0-0003 to=0.2.0-0007 seq=7
-  bundle_sha256=… key_id=release-2026-a source=https trigger=cli result=success
+2026-10-26T18:12:03Z action=install from=0.1.0 to=0.2.0 version=0.2.0 sequence=7 key_id=2026-10 source=https://example/bundle.tar.gz result=success
 ```
 
-Rotate at a small cap (for example 1 MB, keep 3). This is separate from the
-tmpfs operational logs in `/tmp/photo-frame.log`, which do not survive a reboot.
+Failures add `detail=...`. URL queries and fragments are stripped. This is
+separate from the tmpfs operational logs in `/tmp/photo-frame.log`, which do not
+survive a reboot.
 
 ---
 
@@ -869,21 +893,21 @@ T-E1, T-E4, T-D5, T-D6).
 | Publish artifact hashes/SBOM and move toward reproducible builds | N1 |
 | SSH hardening and firewall policy (VPN/loopback only) | T-E4, M8 |
 
-### Phase 1 — Option A app updates
+### Phase 1 — Option A app updates (implemented)
 
 | Task | Output |
 |------|--------|
-| P1.1 Bundle format + manifest + packaging | `photo-frame-0.x.y-NNNN.tar.gz` + `.sha256` + `.sha256.sig` |
+| P1.1 Bundle format + manifest + packaging | `photo-frame-<version>-<arch>.tar.gz` + `.sha256` + `.sha256.sig` |
 | P1.2 `photo-frame-update` binary: verify, extract, flip, health check, revert, gc | Root updater |
-| P1.3 `photo-frame-boot-guard.service` | Userspace rollback |
-| P1.4 Manager writes `/run/photo-frame/healthy` | Health signal |
+| P1.3 `photo-frame-update-guard.service` | Userspace rollback after the app units |
+| P1.4 Health check on both units and both sockets | Health signal |
 | P1.5 Local-path install (mounted drive or `scp`) | Offline install |
 | P1.6 HTTPS install with required `--sha256`, HTTP and downgrade redirects refused | Network install |
-| P1.7 Baked key list + `keys` command with fingerprints | Trust anchor (S5) |
-| P1.8 Panel messages via the control socket | UX (M4, S4) |
-| P1.9 Audit log + `last-result.json` + `/api/status` surfacing | S4 |
-| P1.10 Key rotation and recovery-key procedure | S5 |
-| P1.11 CI signing job + `release-signing` environment | N5, S5 |
+| P1.7 Baked key list + `keys` command | Trust anchor (S5) |
+| P1.8 Command output and errors on stdout/stderr | UX (M4, S4) |
+| P1.9 Audit log in `/var/log/photo-frame/update.log` | S4 |
+| P1.10 Key rotation procedure; optional second trusted key | S5 |
+| P1.11 Manual signing workflow + `release-signing` environment | N5, S5 |
 | P1.12 Tests: signature failure, unknown key ID, hash mismatch, traversal, power-loss simulation, revert, wrong arch, downgrade refusal, HTTP refusal | M1–M9 |
 | P1.13 Docs: owner update runbook, key custody, OS/kernel policy, VPN access | Docs |
 | P1.14 Owner-initiated rollback (`photo-frame-update rollback`) | N4 |
@@ -956,29 +980,38 @@ Not scheduled. Kept here only so the analysis is not lost.
   `/opt/photo-frame/releases/<version>`, a `current` symlink, retention of the
   current, previous, and four most recent releases, a health check, automatic
   rollback, a boot guard, and an audit log.
-- **Bundle format:** `.tar.gz` with `manifest.json` and the three binaries,
-  plus `.sha256` and `.sha256.sig` sidecars. The signature is Ed25519 over the
-  checksum bytes, in a JSON envelope naming the key ID. No certificate, no
-  expiry, no CA, no network.
-- **Public keys are compiled into `photo-frame-update`.** No key file is
+- **Bundle format:** `photo-frame-<version>-<arch>.tar.gz` with `manifest.json`
+  (`format`, `version`, `sequence`, `arch`, `min_version`, `files[]`) and the
+  three binaries, plus `.sha256` and `.sha256.sig` sidecars. The signature is
+  Ed25519 over the checksum bytes, in a JSON envelope naming the key ID. No
+  certificate, no expiry, no CA, no network.
+- **Public keys are compiled into `photo-frame-update`** as `TrustedKey { id,
+  bytes }` entries in `src/update/keys.rs`. The list starts empty and refuses
+  every install until a key is added and the tool is rebuilt. No key file is
   installed by apt and nothing in `/etc` participates in verification. The tool
   ships inside the release bundle.
-- **Transports:** a local path (sidecars required in the same directory) and an
-  HTTPS URL (with a required `--sha256`; plain HTTP and HTTPS-to-HTTP redirects
-  refused).
-- **CI signing:** separate build and signing jobs. The build job has no key. The
-  signing job uses a dedicated key in the `release-signing` environment, runs
-  only on protected tags or manual dispatch, has minimal permissions, and pins
-  actions to SHAs. CI is the build-integrity trust anchor, and a compromised
-  build job can produce a validly signed malicious artifact; the split limits
-  the blast radius but does not remove that risk. KMS, an HSM, or a self-hosted
-  signing runner is a possible later hardening step.
-- **Rotation** adds a key to the updater, ships it in a release signed by the
-  old key, keeps both during an overlap, then removes the old key in a later
-  release. No expiry. Key loss leaves the device running but unable to accept a
-  new release until recovery or reflash. A compromised key cannot be rotated
-  through itself; use a recovery key or reflash.
-- **Releases are published on GitHub Releases.** The device does not poll.
+- **Transports:** a local path (sidecars required in the same directory, optional
+  `--sha256`) and an HTTPS URL (required `--sha256`; plain HTTP and HTTPS-to-HTTP
+  redirects refused).
+- **CI signing:** the `.github/workflows/sign.yml` workflow is manual
+  (`workflow_dispatch` with a release tag), runs in the `release-signing`
+  environment, signs every `*.sha256` asset with
+  `scripts/sign-checksum.sh`, and uploads the `*.sha256.sig` files. The sign job
+  has `contents: write`; there is no automatic build→sign→publish chain, and
+  `build.yml` still only builds `.debs`. The owner must build and upload the
+  bundle and checksum before signing. CI is the build-integrity trust anchor, and
+  a compromised build or merged commit can produce a validly signed malicious
+  artifact; the protected environment limits the blast radius but does not remove
+  that risk. KMS, an HSM, or a self-hosted signing runner is a possible later
+  hardening step.
+- **Rotation** adds a key to the updater and rebuilds it, ships that build in a
+  release signed by the old key, keeps both during an overlap, then removes the
+  old key in a later release signed by the new key. No expiry. Key loss leaves
+  the device running but unable to accept a new release until recovery or
+  reflash. A compromised key cannot be rotated through itself; use a second
+  trusted key or reflash.
+- **Releases are published on GitHub Releases.** The device does not poll, and
+  there is no update check timer.
 
 ### 15.2 OS security updates
 

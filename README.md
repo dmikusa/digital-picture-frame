@@ -30,16 +30,20 @@ A web OAuth callback and the device flow are not supported: the admin UI is plai
 
 ## Updates
 
-Application updates are designed to ship as signed release bundles and install
-with `photo-frame-update`, which verifies an Ed25519 signature against keys
-compiled into the tool, flips a `current` symlink, health-checks the new
-version, and rolls back automatically if it does not come up. That tool is
-Phase 1 work; until it lands, upgrades go through the `.deb`. The OS is not part
-of a bundle: Debian security fixes come from `unattended-upgrades`, and the
-kernel and firmware are updated by hand about twice a year over a VPN.
+Application updates use signed release bundles and `photo-frame-update`. The
+`.deb` seeds the first release under `/opt/photo-frame/releases`; later releases
+are verified against Ed25519 keys compiled into the updater, unpacked into a new
+release directory, and activated by flipping a `current` symlink. A health check
+waits 30 seconds for both services and both sockets, and
+`photo-frame-update-guard.service` confirms or rolls back an unconfirmed release
+on the next boot. The OS is not part of a bundle: Debian security fixes come from
+`unattended-upgrades`, and the kernel and firmware are updated by hand about
+twice a year over a VPN.
 
-See [docs/updates.md](docs/updates.md) for the bundle layout, signing and key
-rotation, the CI workflow, the remote access policy, and recovery procedures.
+Signing is a manual GitHub Actions workflow that signs the release checksums. See
+[docs/updates.md](docs/updates.md) for the bundle layout, commands, signing and
+key rotation, the release process, the remote access policy, and recovery
+procedures.
 
 ## How it fits together
 
