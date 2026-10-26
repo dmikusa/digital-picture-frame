@@ -542,7 +542,16 @@ pub fn guard(
         }
     };
 
-    if state.current.as_deref() != Some(pending.to.as_str()) {
+    // `install` writes `pending` before flipping the symlink and only records
+    // the new version in `state.current` after the health check. A power loss
+    // in between leaves the symlink on the new release while the state file
+    // still names the old one, so both sources have to be considered. The
+    // symlink is what the services actually run; `state.current` covers the
+    // window where it has already been updated.
+    let symlink_active = current_version(paths)?.as_deref() == Some(pending.to.as_str());
+    let state_active = state.current.as_deref() == Some(pending.to.as_str());
+
+    if !symlink_active && !state_active {
         // The new release never became active (crash before the flip, or an
         // install that reverted itself). Nothing to confirm or undo.
         state.pending = None;
@@ -572,6 +581,14 @@ pub fn guard(
 
     match health.check() {
         Ok(()) => {
+            // The new release is active. Reconcile state with what is really
+            // running, including the previous release it replaced.
+            state.current = Some(pending.to.clone());
+            if let Some(from) = &pending.from {
+                if from != &pending.to {
+                    state.previous = Some(from.clone());
+                }
+            }
             state.pending = None;
             state.last_good = Some(pending.to.clone());
             state.sequence = state.sequence.max(pending.sequence);
@@ -1584,6 +1601,29 @@ mod tests {
         state.save(&env.paths.state_file()).unwrap();
     }
 
+    fn seed_pending_flipped(env: &TestEnv, to: &str, from: &str, sequence: u64) {
+        // Power loss after the symlink flip but before `state.current` was
+        // updated: the symlink is on `to`, the state file still says `from`.
+        seed_release(env, to);
+        seed_release(env, from);
+        activate(&env.paths, to).unwrap();
+        let state = State {
+            current: Some(from.to_string()),
+            previous: None,
+            last_good: Some(from.to_string()),
+            pending: Some(Pending {
+                from: Some(from.to_string()),
+                to: to.to_string(),
+                sequence,
+                key_id: "test-2026".to_string(),
+                source: "/tmp/bundle.tar.gz".to_string(),
+                started_at: "2026-10-26T00:00:00Z".to_string(),
+            }),
+            sequence: sequence.saturating_sub(1),
+        };
+        state.save(&env.paths.state_file()).unwrap();
+    }
+
     #[test]
     fn test_rollback_activates_previous_release() {
         let env = test_env();
@@ -1699,6 +1739,68 @@ mod tests {
         assert_eq!(state.current.as_deref(), Some("0.1.0"));
         assert_eq!(state.previous.as_deref(), Some("0.2.1"));
         assert_eq!(state.pending, None);
+        assert!(audit_text(&env).contains("result=rolled_back"));
+    }
+
+    #[test]
+    fn test_guard_confirms_after_power_loss_between_flip_and_confirm() {
+        let env = test_env();
+        seed_pending_flipped(&env, "0.2.1", "0.1.0", 7);
+
+        // Precondition: the symlink is on the new release while the state file
+        // still names the old one.
+        assert_eq!(
+            current_version(&env.paths).unwrap().as_deref(),
+            Some("0.2.1")
+        );
+        assert_eq!(
+            State::load(&env.paths.state_file())
+                .unwrap()
+                .current
+                .as_deref(),
+            Some("0.1.0")
+        );
+
+        let report = guard(&env.paths, Duration::ZERO, &HealthCheck::forced(true), true).unwrap();
+        assert_eq!(report.action, GuardAction::Confirmed);
+        assert_eq!(report.version.as_deref(), Some("0.2.1"));
+
+        let state = State::load(&env.paths.state_file()).unwrap();
+        assert_eq!(state.current.as_deref(), Some("0.2.1"));
+        assert_eq!(state.previous.as_deref(), Some("0.1.0"));
+        assert_eq!(state.last_good.as_deref(), Some("0.2.1"));
+        assert_eq!(state.sequence, 7);
+        assert_eq!(state.pending, None);
+        assert_eq!(
+            fs::read_link(env.paths.current_link()).unwrap(),
+            PathBuf::from("releases/0.2.1")
+        );
+        assert!(audit_text(&env).contains("result=confirmed"));
+    }
+
+    #[test]
+    fn test_guard_rolls_back_after_power_loss_between_flip_and_confirm() {
+        let env = test_env();
+        seed_pending_flipped(&env, "0.2.1", "0.1.0", 7);
+        let report = guard(
+            &env.paths,
+            Duration::ZERO,
+            &HealthCheck::forced(false),
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.action, GuardAction::RolledBack);
+        assert_eq!(report.version.as_deref(), Some("0.1.0"));
+
+        let state = State::load(&env.paths.state_file()).unwrap();
+        assert_eq!(state.current.as_deref(), Some("0.1.0"));
+        assert_eq!(state.previous.as_deref(), Some("0.2.1"));
+        assert_eq!(state.pending, None);
+        assert_eq!(state.sequence, 6);
+        assert_eq!(
+            fs::read_link(env.paths.current_link()).unwrap(),
+            PathBuf::from("releases/0.1.0")
+        );
         assert!(audit_text(&env).contains("result=rolled_back"));
     }
 
