@@ -53,6 +53,7 @@ assets = [
     ["packaging/display.env", "etc/photo-frame/display.env", "644"],
     ["packaging/photo-frame-display.service", "lib/systemd/system/", "644"],
     ["packaging/photo-frame-manager.service", "lib/systemd/system/", "644"],
+    ["packaging/photo-frame-update-guard.service", "lib/systemd/system/", "644"],
 ]
 maintainer-scripts = "packaging/deb-scripts/"
 

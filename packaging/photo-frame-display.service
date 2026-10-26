@@ -4,7 +4,9 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/photo-frame-display
+# Runs whichever release /opt/photo-frame/current points at. A normal update
+# only flips that symlink, so this unit does not change.
+ExecStart=/opt/photo-frame/current/bin/photo-frame-display
 EnvironmentFile=-/etc/photo-frame/display.env
 Restart=on-failure
 User=photo-frame
