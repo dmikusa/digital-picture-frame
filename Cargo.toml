@@ -33,6 +33,11 @@ base64 = "0.22"
 askama = "0.12"
 serde_urlencoded = "0.7"
 form_urlencoded = "1"
+# Signed app updates: raw Ed25519 verification over the release sidecar, plus
+# SHA-256 and safe tar extraction. All small, pure-Rust, and synchronous.
+ed25519-dalek = "2"
+sha2 = "0.10"
+tar = "0.4"
 
 [package.metadata.deb]
 maintainer = "Daniel Mikusa <dan@mikusa.com>"
@@ -42,6 +47,7 @@ depends = "$auto, imagemagick, libdrm2, libegl1, libgbm1"
 recommends = "usbmount, avahi-daemon"
 assets = [
     ["target/release/photo-frame-manager", "usr/bin/photo-frame-manager", "755"],
+    ["target/release/photo-frame-update", "usr/bin/photo-frame-update", "755"],
     ["c/photo-frame-display", "usr/bin/photo-frame-display", "755"],
     ["packaging/config.toml", "etc/photo-frame/config.toml", "644"],
     ["packaging/display.env", "etc/photo-frame/display.env", "644"],
