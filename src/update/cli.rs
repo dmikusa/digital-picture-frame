@@ -22,11 +22,12 @@
 use crate::update::health::{HealthCheck, Services};
 use crate::update::keys::TRUSTED_KEYS;
 use crate::update::{
-    gc, install, list_releases, status, InstallOptions, Paths, DEFAULT_LOG_PATH, DEFAULT_ROOT,
-    DEFAULT_STATE_DIR,
+    gc, guard, install, list_releases, rollback, status, GuardAction, InstallOptions, Paths,
+    DEFAULT_LOG_PATH, DEFAULT_ROOT, DEFAULT_STATE_DIR,
 };
 use std::fmt::Display;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const EXIT_OK: i32 = 0;
 const EXIT_FAILURE: i32 = 1;
@@ -45,9 +46,11 @@ pub fn run(args: Vec<String>) -> i32 {
     let rest = &args[1..];
     match command.as_str() {
         "install" => command_install(rest),
+        "rollback" => command_rollback(rest),
         "list" => command_list(rest),
         "status" => command_status(rest),
         "gc" => command_gc(rest),
+        "guard" => command_guard(rest),
         "keys" => command_keys(rest),
         other => {
             eprintln!("error: unknown command '{}'", other);
@@ -99,6 +102,39 @@ fn command_install(args: &[String]) -> i32 {
                     report.version, report.sequence, report.key_id
                 ),
             }
+            EXIT_OK
+        }
+        Err(err) => fail(&err),
+    }
+}
+
+fn command_rollback(args: &[String]) -> i32 {
+    if wants_help(args) {
+        print_help();
+        return EXIT_OK;
+    }
+    let parsed = match parse(args, false, false) {
+        Ok(parsed) => parsed,
+        Err(err) => return usage_error(&err),
+    };
+    if !parsed.positional.is_empty() {
+        return usage_error("rollback takes no positional arguments");
+    }
+
+    let paths = parsed.paths();
+    let services = Services::default();
+    let health = if parsed.no_restart {
+        HealthCheck::skip()
+    } else {
+        HealthCheck::system(services.clone())
+    };
+    match rollback(&paths, &services, &health, parsed.no_restart) {
+        Ok(report) => {
+            println!(
+                "rolled back from {} to {}",
+                report.from.as_deref().unwrap_or("-"),
+                report.to
+            );
             EXIT_OK
         }
         Err(err) => fail(&err),
@@ -231,6 +267,53 @@ fn command_gc(args: &[String]) -> i32 {
     }
 }
 
+fn command_guard(args: &[String]) -> i32 {
+    if wants_help(args) {
+        print_help();
+        return EXIT_OK;
+    }
+    let parsed = match parse(args, false, true) {
+        Ok(parsed) => parsed,
+        Err(err) => return usage_error(&err),
+    };
+    if !parsed.positional.is_empty() {
+        return usage_error("guard takes no positional arguments");
+    }
+
+    let paths = parsed.paths();
+    let health = if parsed.no_restart {
+        HealthCheck::skip()
+    } else {
+        HealthCheck::system(Services::default())
+    };
+    match guard(
+        &paths,
+        Duration::from_secs(parsed.grace_seconds),
+        &health,
+        parsed.no_restart,
+    ) {
+        Ok(report) => {
+            match report.action {
+                GuardAction::Nothing => println!("no pending update"),
+                GuardAction::Confirmed => println!(
+                    "confirmed {} (pending update cleared)",
+                    report.version.as_deref().unwrap_or("-")
+                ),
+                GuardAction::RolledBack => println!(
+                    "rollback to {} (pending update was unhealthy)",
+                    report.version.as_deref().unwrap_or("-")
+                ),
+                GuardAction::Cleared => println!(
+                    "cleared pending update that was never activated (current: {})",
+                    report.version.as_deref().unwrap_or("-")
+                ),
+            }
+            EXIT_OK
+        }
+        Err(err) => fail(&err),
+    }
+}
+
 fn command_keys(args: &[String]) -> i32 {
     if wants_help(args) {
         print_help();
@@ -257,7 +340,6 @@ struct Options {
     log_path: PathBuf,
     no_restart: bool,
     sha256: Option<String>,
-    #[allow(dead_code)]
     grace_seconds: u64,
     positional: Vec<String>,
 }

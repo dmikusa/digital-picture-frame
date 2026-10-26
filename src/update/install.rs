@@ -95,6 +95,15 @@ pub struct InstallReport {
     pub previous: Option<String>,
 }
 
+/// Result of a successful rollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackReport {
+    /// Release that was active before the rollback.
+    pub from: Option<String>,
+    /// Release now active.
+    pub to: String,
+}
+
 /// Result of a garbage collection pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcReport {
@@ -102,6 +111,40 @@ pub struct GcReport {
     pub removed: Vec<String>,
     /// Release versions that remain.
     pub kept: Vec<String>,
+}
+
+/// What the boot guard did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardAction {
+    /// No pending install.
+    Nothing,
+    /// Pending install was healthy and is now confirmed.
+    Confirmed,
+    /// Pending install was unhealthy and the previous release is active.
+    RolledBack,
+    /// Pending marker pointed at something that was never activated.
+    Cleared,
+}
+
+impl GuardAction {
+    /// Short label for CLI output and the audit log.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GuardAction::Nothing => "nothing",
+            GuardAction::Confirmed => "confirmed",
+            GuardAction::RolledBack => "rolled_back",
+            GuardAction::Cleared => "cleared",
+        }
+    }
+}
+
+/// Result of a boot-guard run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardReport {
+    /// What happened.
+    pub action: GuardAction,
+    /// Release the guard acted on.
+    pub version: Option<String>,
 }
 
 /// One installed release, as shown by `list`.
@@ -372,6 +415,232 @@ pub fn current_version(paths: &Paths) -> Result<Option<String>> {
             paths.current_link().display(),
             err
         ))),
+    }
+}
+
+/// Flip back to the recorded previous release.
+pub fn rollback(
+    paths: &Paths,
+    services: &Services,
+    health: &HealthCheck,
+    no_restart: bool,
+) -> Result<RollbackReport> {
+    let mut state = State::load(&paths.state_file())?;
+    let target = state.previous.clone().ok_or_else(|| {
+        UpdateError::State("no previous release is recorded; nothing to roll back to".to_string())
+    })?;
+    if !paths.release_dir(&target).is_dir() {
+        return Err(UpdateError::State(format!(
+            "previous release {} is missing from {}",
+            target,
+            paths.releases_dir().display()
+        )));
+    }
+    let from = state.current.clone();
+    if from.as_deref() == Some(target.as_str()) {
+        return Err(UpdateError::Unsupported(format!(
+            "previous release {} is already current",
+            target
+        )));
+    }
+
+    state.pending = Some(Pending {
+        from: from.clone(),
+        to: target.clone(),
+        sequence: state.sequence,
+        key_id: String::new(),
+        source: "rollback".to_string(),
+        started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    });
+    state.save(&paths.state_file())?;
+    activate(paths, &target)?;
+
+    let health_result = if no_restart {
+        health.check()
+    } else {
+        restart_services(services).and_then(|_| health.check())
+    };
+
+    match health_result {
+        Ok(()) => {
+            state.current = Some(target.clone());
+            state.previous = from.clone();
+            state.last_good = Some(target.clone());
+            state.pending = None;
+            state.save(&paths.state_file())?;
+            audit(
+                paths,
+                &AuditRecord {
+                    action: "rollback",
+                    from: from.as_deref(),
+                    to: Some(&target),
+                    sequence: None,
+                    key_id: None,
+                    source: Some("rollback"),
+                    result: "success",
+                    detail: None,
+                },
+            );
+            Ok(RollbackReport { from, to: target })
+        }
+        Err(err) => {
+            if let Some(previous) = from.as_deref() {
+                if paths.release_dir(previous).is_dir() {
+                    activate(paths, previous)?;
+                    if !no_restart {
+                        if let Err(restart_err) = restart_services(services) {
+                            eprintln!("warning: failed to restart services: {}", restart_err);
+                        }
+                    }
+                }
+            }
+            state.pending = None;
+            state.save(&paths.state_file())?;
+            audit(
+                paths,
+                &AuditRecord {
+                    action: "rollback",
+                    from: from.as_deref(),
+                    to: Some(&target),
+                    sequence: None,
+                    key_id: None,
+                    source: Some("rollback"),
+                    result: "failed",
+                    detail: Some(&err.to_string()),
+                },
+            );
+            Err(UpdateError::Health(format!(
+                "rollback to {} failed its health check: {}",
+                target, err
+            )))
+        }
+    }
+}
+
+/// Boot guard: confirm or revert an unconfirmed pending install.
+pub fn guard(
+    paths: &Paths,
+    grace: Duration,
+    health: &HealthCheck,
+    no_restart: bool,
+) -> Result<GuardReport> {
+    let mut state = State::load(&paths.state_file())?;
+    let pending = match state.pending.clone() {
+        Some(pending) => pending,
+        None => {
+            return Ok(GuardReport {
+                action: GuardAction::Nothing,
+                version: state.current,
+            })
+        }
+    };
+
+    if state.current.as_deref() != Some(pending.to.as_str()) {
+        // The new release never became active (crash before the flip, or an
+        // install that reverted itself). Nothing to confirm or undo.
+        state.pending = None;
+        state.save(&paths.state_file())?;
+        audit(
+            paths,
+            &AuditRecord {
+                action: "guard",
+                from: pending.from.as_deref(),
+                to: Some(&pending.to),
+                sequence: Some(pending.sequence),
+                key_id: Some(&pending.key_id),
+                source: Some(&pending.source),
+                result: "cleared",
+                detail: Some("pending release was not active"),
+            },
+        );
+        return Ok(GuardReport {
+            action: GuardAction::Cleared,
+            version: state.current,
+        });
+    }
+
+    if !grace.is_zero() {
+        std::thread::sleep(grace);
+    }
+
+    match health.check() {
+        Ok(()) => {
+            state.pending = None;
+            state.last_good = Some(pending.to.clone());
+            state.sequence = state.sequence.max(pending.sequence);
+            state.save(&paths.state_file())?;
+            audit(
+                paths,
+                &AuditRecord {
+                    action: "guard",
+                    from: pending.from.as_deref(),
+                    to: Some(&pending.to),
+                    sequence: Some(pending.sequence),
+                    key_id: Some(&pending.key_id),
+                    source: Some(&pending.source),
+                    result: "confirmed",
+                    detail: None,
+                },
+            );
+            Ok(GuardReport {
+                action: GuardAction::Confirmed,
+                version: Some(pending.to),
+            })
+        }
+        Err(err) => {
+            let previous = pending
+                .from
+                .clone()
+                .or_else(|| state.previous.clone())
+                .filter(|version| paths.release_dir(version).is_dir());
+            if let Some(previous) = previous {
+                activate(paths, &previous)?;
+                if !no_restart {
+                    restart_services(&health.services)?;
+                }
+                state.current = Some(previous.clone());
+                state.previous = Some(pending.to.clone());
+                state.pending = None;
+                state.save(&paths.state_file())?;
+                audit(
+                    paths,
+                    &AuditRecord {
+                        action: "guard",
+                        from: Some(&pending.to),
+                        to: Some(&previous),
+                        sequence: Some(pending.sequence),
+                        key_id: Some(&pending.key_id),
+                        source: Some(&pending.source),
+                        result: "rolled_back",
+                        detail: Some(&err.to_string()),
+                    },
+                );
+                Ok(GuardReport {
+                    action: GuardAction::RolledBack,
+                    version: Some(previous),
+                })
+            } else {
+                state.pending = None;
+                state.save(&paths.state_file())?;
+                audit(
+                    paths,
+                    &AuditRecord {
+                        action: "guard",
+                        from: pending.from.as_deref(),
+                        to: Some(&pending.to),
+                        sequence: Some(pending.sequence),
+                        key_id: Some(&pending.key_id),
+                        source: Some(&pending.source),
+                        result: "failed",
+                        detail: Some(&format!("{}; no previous release available", err)),
+                    },
+                );
+                Err(UpdateError::Health(format!(
+                    "release {} is unhealthy and there is no previous release to revert to: {}",
+                    pending.to, err
+                )))
+            }
+        }
     }
 }
 
@@ -1279,6 +1548,62 @@ mod tests {
         }
     }
 
+    fn seed_pending(env: &TestEnv, current: &str, previous: Option<&str>, sequence: u64) {
+        seed_release(env, current);
+        if let Some(previous) = previous {
+            seed_release(env, previous);
+        }
+        activate(&env.paths, current).unwrap();
+        let state = State {
+            current: Some(current.to_string()),
+            previous: previous.map(|value| value.to_string()),
+            last_good: previous.map(|value| value.to_string()),
+            pending: Some(Pending {
+                from: previous.map(|value| value.to_string()),
+                to: current.to_string(),
+                sequence,
+                key_id: "test-2026".to_string(),
+                source: "/tmp/bundle.tar.gz".to_string(),
+                started_at: "2026-10-26T00:00:00Z".to_string(),
+            }),
+            sequence: sequence.saturating_sub(1),
+        };
+        state.save(&env.paths.state_file()).unwrap();
+    }
+
+    #[test]
+    fn test_rollback_activates_previous_release() {
+        let env = test_env();
+        let key = test_key("test-2026", 7);
+        let first = write_bundle(env._dir.path(), &key, "0.1.0", 1, None);
+        let second = write_bundle(env._dir.path(), &key, "0.2.1", 2, Some("0.1.0"));
+        install_bundle(&env, &key, &first, HealthCheck::skip()).unwrap();
+        install_bundle(&env, &key, &second, HealthCheck::skip()).unwrap();
+
+        let report =
+            rollback(&env.paths, &Services::default(), &HealthCheck::skip(), true).unwrap();
+        assert_eq!(report.from.as_deref(), Some("0.2.1"));
+        assert_eq!(report.to, "0.1.0");
+        assert_eq!(
+            fs::read_link(env.paths.current_link()).unwrap(),
+            PathBuf::from("releases/0.1.0")
+        );
+        let state = State::load(&env.paths.state_file()).unwrap();
+        assert_eq!(state.current.as_deref(), Some("0.1.0"));
+        assert_eq!(state.previous.as_deref(), Some("0.2.1"));
+        assert_eq!(state.last_good.as_deref(), Some("0.1.0"));
+        assert_eq!(state.sequence, 2);
+        assert!(audit_text(&env).contains("action=rollback"));
+    }
+
+    #[test]
+    fn test_rollback_without_previous_errors() {
+        let env = test_env();
+        let err =
+            rollback(&env.paths, &Services::default(), &HealthCheck::skip(), true).unwrap_err();
+        assert!(matches!(err, UpdateError::State(_)), "{err:?}");
+    }
+
     #[test]
     fn test_gc_keeps_current_previous_and_four_recent() {
         let env = test_env();
@@ -1309,6 +1634,86 @@ mod tests {
         for version in ["0.0.3", "0.0.4"] {
             assert!(!env.paths.release_dir(version).exists(), "{} kept", version);
         }
+    }
+
+    #[test]
+    fn test_guard_confirms_healthy_pending() {
+        let env = test_env();
+        seed_pending(&env, "0.2.1", Some("0.1.0"), 7);
+        let report = guard(&env.paths, Duration::ZERO, &HealthCheck::forced(true), true).unwrap();
+        assert_eq!(report.action, GuardAction::Confirmed);
+        let state = State::load(&env.paths.state_file()).unwrap();
+        assert_eq!(state.pending, None);
+        assert_eq!(state.last_good.as_deref(), Some("0.2.1"));
+        assert_eq!(state.sequence, 7);
+        assert_eq!(state.current.as_deref(), Some("0.2.1"));
+        assert!(audit_text(&env).contains("result=confirmed"));
+    }
+
+    #[test]
+    fn test_guard_rolls_back_unhealthy_pending() {
+        let env = test_env();
+        seed_pending(&env, "0.2.1", Some("0.1.0"), 7);
+        let report = guard(
+            &env.paths,
+            Duration::ZERO,
+            &HealthCheck::forced(false),
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.action, GuardAction::RolledBack);
+        assert_eq!(
+            fs::read_link(env.paths.current_link()).unwrap(),
+            PathBuf::from("releases/0.1.0")
+        );
+        let state = State::load(&env.paths.state_file()).unwrap();
+        assert_eq!(state.current.as_deref(), Some("0.1.0"));
+        assert_eq!(state.previous.as_deref(), Some("0.2.1"));
+        assert_eq!(state.pending, None);
+        assert!(audit_text(&env).contains("result=rolled_back"));
+    }
+
+    #[test]
+    fn test_guard_clears_stale_pending() {
+        let env = test_env();
+        seed_release(&env, "0.1.0");
+        activate(&env.paths, "0.1.0").unwrap();
+        let state = State {
+            current: Some("0.1.0".to_string()),
+            previous: None,
+            last_good: Some("0.1.0".to_string()),
+            pending: Some(Pending {
+                from: Some("0.1.0".to_string()),
+                to: "0.2.1".to_string(),
+                sequence: 7,
+                key_id: "test-2026".to_string(),
+                source: "/tmp/bundle.tar.gz".to_string(),
+                started_at: "2026-10-26T00:00:00Z".to_string(),
+            }),
+            sequence: 6,
+        };
+        state.save(&env.paths.state_file()).unwrap();
+
+        let report = guard(
+            &env.paths,
+            Duration::ZERO,
+            &HealthCheck::forced(false),
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.action, GuardAction::Cleared);
+        let state = State::load(&env.paths.state_file()).unwrap();
+        assert_eq!(state.pending, None);
+        assert_eq!(state.current.as_deref(), Some("0.1.0"));
+        assert!(audit_text(&env).contains("result=cleared"));
+    }
+
+    #[test]
+    fn test_guard_without_pending_does_nothing() {
+        let env = test_env();
+        let report = guard(&env.paths, Duration::ZERO, &HealthCheck::skip(), true).unwrap();
+        assert_eq!(report.action, GuardAction::Nothing);
+        assert!(!env.paths.log_path.exists());
     }
 
     #[test]

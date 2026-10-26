@@ -55,8 +55,9 @@ pub use checksum::{is_sha256_hex, parse_sidecar, sha256_file, sha256_hex, Sideca
 pub use cli::run;
 pub use health::{HealthCheck, HealthMode, Services, CONTROL_SOCKET, DISPLAY_SOCKET};
 pub use install::{
-    activate, current_version, gc, install, list_releases, status, GcReport, InstallOptions,
-    InstallReport, ReleaseInfo, StatusReport,
+    activate, current_version, gc, guard, install, list_releases, rollback, status, GcReport,
+    GuardAction, GuardReport, InstallOptions, InstallReport, ReleaseInfo, RollbackReport,
+    StatusReport,
 };
 pub use keys::{TrustedKey, TRUSTED_KEYS};
 pub use signature::{verify_signature, VerifiedSignature};
