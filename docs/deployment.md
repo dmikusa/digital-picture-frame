@@ -163,6 +163,18 @@ Signing keys: `photo-frame-update` contains an empty trusted-key list
 owner pins their Ed25519 public key and rebuilds. See `docs/updates.md` for key
 custody, bundle signing, and rotation.
 
+### Updates
+
+The `.deb` is the initial install path. Once `photo-frame-update` lands,
+application updates use signed release bundles instead of `dpkg`; the tool
+verifies a signature, flips the `current` release symlink, and rolls back if the
+new version fails its health check. OS packages, the kernel, and firmware are
+handled separately with apt.
+
+See [updates.md](updates.md) for the bundle format, commands, signing keys, and
+the OS update policy. `config.toml` and `display.env` are never touched by an
+update.
+
 ### Dedicated User
 
 The package creates a `photo-frame` system user and adds it to the `video` group.

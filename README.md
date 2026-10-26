@@ -28,6 +28,19 @@ A web OAuth callback and the device flow are not supported: the admin UI is plai
 - Debian VM (UTM/QEMU) works too. GPU acceleration helps; without it, Mesa falls back to CPU rendering (llvmpipe) and fades get choppy.
 - Other Linux boards probably work if they have DRM/GBM/EGL support and a Mesa driver. Hardware acceleration helps a lot at 1080p.
 
+## Updates
+
+Application updates are designed to ship as signed release bundles and install
+with `photo-frame-update`, which verifies an Ed25519 signature against keys
+compiled into the tool, flips a `current` symlink, health-checks the new
+version, and rolls back automatically if it does not come up. That tool is
+Phase 1 work; until it lands, upgrades go through the `.deb`. The OS is not part
+of a bundle: Debian security fixes come from `unattended-upgrades`, and the
+kernel and firmware are updated by hand about twice a year over a VPN.
+
+See [docs/updates.md](docs/updates.md) for the bundle layout, signing and key
+rotation, the CI workflow, the remote access policy, and recovery procedures.
+
 ## How it fits together
 
 ```mermaid
@@ -185,6 +198,7 @@ photo-frame/
 - [docs/running.md](docs/running.md) — How to run the apps locally.
 - [docs/config.md](docs/config.md) — Configuration reference.
 - [docs/deployment.md](docs/deployment.md) — DietPi setup, packaging, and installation.
+- [docs/updates.md](docs/updates.md) — Signed update bundles, signing keys, rotation, and OS/kernel policy.
 - [docs/google-drive-setup.md](docs/google-drive-setup.md) — Private Drive setup with a service account.
 - [docs/testing.md](docs/testing.md) — Test commands and methodology.
 

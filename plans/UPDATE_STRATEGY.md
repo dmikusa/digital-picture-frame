@@ -11,6 +11,12 @@ It is a **living document**. Revise it when a phase lands, when the threat model
 (`plans/UPDATE_THREAT_MODEL.md`) changes, or when the owner answers an open
 question. Keep the comparison table and the requirements mapping current.
 
+The design has since been decided. The decision record is Section 15, and the
+operational documentation is `docs/updates.md`. Where this plan and
+`docs/updates.md` disagree, `docs/updates.md` is correct. Sections 4 and 5 are
+kept as the analysis that led to the decision; the A/B OS update options in them
+were evaluated and **not** adopted.
+
 Companion: `plans/UPDATE_THREAT_MODEL.md` holds the findings (`T-S*`, `T-T*`,
 `T-R*`, `T-I*`, `T-D*`, `T-E*`) and the MUST/SHOULD/NICE requirements
 (`M1`–`M9`, `S1`–`S7`, `N1`–`N5`) referenced throughout.
@@ -26,19 +32,19 @@ access. The device also has no hardware secure boot, no A/B boot slots, and no
 `tryboot`/EEPROM fallback, so any update design must supply its own
 authenticity, rollback, and recovery.
 
-The recommended approach is **Option C: ship app-only signed updates first
-(Option A), and keep the door open for full OS image updates later (Option B)**
-by reserving partitions and putting state outside the rootfs now. Option A:
+The approach that was adopted is **Option A: app-only signed release bundles**.
+The planning recommendation had been Option C, which is A now with the door left
+open for B later; the owner chose app-only, so B is not built. Option A:
 
-- updates the two binaries, systemd units, and docs — not the OS or kernel;
-- installs from a signed bundle verified against an **owner-pinned public key**
-  before anything privileged happens;
+- updates the two application binaries plus the updater — not the OS or kernel;
+- installs from a signed bundle verified against public keys **baked into
+  `photo-frame-update`** before anything privileged happens;
 - uses versioned install directories plus an atomic `current` symlink flip;
 - health-checks the new version and **automatically reverts** on failure, with a
   userspace boot guard that covers power loss and a new version that will not
   start;
-- works fully **offline from USB**, over the **LAN**, or via an **opt-in**
-  online check;
+- installs from a local file or an HTTPS URL, with the checksum and signature
+  sidecars verified in both cases;
 - never turns the frame into a permanently listening service; and
 - preserves all state by construction, because it never touches the photos
   partition or `/etc/photo-frame`.
@@ -46,13 +52,14 @@ by reserving partitions and putting state outside the rootfs now. Option A:
 Option B (full OS A/B images) is the only way to patch the kernel, ImageMagick,
 OpenSSL, and the OS. It is large, changes the partition layout, and on this
 board still needs a bootloader (U-Boot) or a recovery kernel to make rollback
-work at boot. It should be built only if the owner decides OS updates are
-actually needed.
+work at boot.
 
-**The key decision for the owner:** is app-only updating sufficient, or must the
-device be able to update the OS and kernel? If app-only is sufficient, build
-Option A now and stop. If OS updates are required, commit to Option C and accept
-the partition and bootloader work.
+**The decision:** app-only updating is sufficient. The OS, kernel, firmware, and
+bootloader are maintained with `unattended-upgrades` plus a manually scheduled
+kernel/firmware refresh about twice a year, not with an A/B image mechanism.
+Option B is not being built, and RAUC, SWUpdate, and `dietpi-backup` are not part
+of the design. See `docs/updates.md` for the procedure and Section 15 for the
+full decision record.
 
 ---
 
@@ -112,7 +119,7 @@ versioning):
 
 ---
 
-## 3. Option A — App-only signed release bundles
+## 3. Option A — App-only signed release bundles (adopted)
 
 ### 3.1 What is updated
 
@@ -120,34 +127,32 @@ versioning):
 |---------|-------------|
 | `photo-frame-manager` (Rust) | OS packages, libc, OpenSSL |
 | `photo-frame-display` (C) | Kernel, firmware, boot files |
-| systemd units (if changed) | ImageMagick and other runtime deps |
-| `photo-frame-update` helper (new) | Partition layout |
-| docs / `display.env` **defaults** (never the live file) | `config.toml` |
+| `photo-frame-update` helper | ImageMagick and other runtime deps |
+| | Partition layout |
+| | systemd units (installed once by the `.deb`) |
+| | docs, `display.env`, `config.toml` |
 
 This is deliberately narrow. It fixes application bugs and ships features. It
-cannot fix a kernel CVE, an ImageMagick CVE, or an OpenSSL CVE — those require
-Option B.
+cannot fix a kernel CVE, an ImageMagick CVE, or an OpenSSL CVE; those follow the
+apt and manual kernel policy in `docs/updates.md`.
 
 ### 3.2 Signed bundle format
 
-One file, plus a detached signature. Keep it simple and auditable.
+Three files per release. Keep it simple and auditable.
 
 ```
-photo-frame-0.2.0-0007.pfupdate          # gzip-compressed tar
-photo-frame-0.2.0-0007.pfupdate.minisig  # detached Ed25519 signature
+photo-frame-0.2.0-0007.tar.gz
+photo-frame-0.2.0-0007.tar.gz.sha256
+photo-frame-0.2.0-0007.tar.gz.sha256.sig
 ```
 
-The tar contains a manifest at the root and a `payload/` tree:
+The tar contains a manifest at the root and a `bin/` directory:
 
 ```
 manifest.json
-payload/usr/bin/photo-frame-manager
-payload/usr/bin/photo-frame-display
-payload/usr/bin/photo-frame-update
-payload/lib/systemd/system/photo-frame-manager.service
-payload/lib/systemd/system/photo-frame-display.service
-payload/lib/systemd/system/photo-frame-boot-guard.service
-payload/etc/photo-frame/display.env.example
+bin/photo-frame-manager
+bin/photo-frame-display
+bin/photo-frame-update
 ```
 
 `manifest.json`:
@@ -161,12 +166,11 @@ payload/etc/photo-frame/display.env.example
   "sequence": 7,
   "min_version": "0.1.0",
   "config_schema": 1,
-  "created": "2026-10-21T00:00:00Z",
-  "key_id": "owner-2026-a",
+  "created": "2026-10-24T18:00:00Z",
   "artifacts": [
-    {"path": "usr/bin/photo-frame-manager", "sha256": "…", "size": 4123456, "mode": "0755"},
-    {"path": "usr/bin/photo-frame-display", "sha256": "…", "size": 51200, "mode": "0755"},
-    {"path": "lib/systemd/system/photo-frame-manager.service", "sha256": "…", "size": 512, "mode": "0644"}
+    {"path": "bin/photo-frame-manager", "sha256": "…", "size": 4123456, "mode": "0755"},
+    {"path": "bin/photo-frame-display", "sha256": "…", "size": 51200, "mode": "0755"},
+    {"path": "bin/photo-frame-update", "sha256": "…", "size": 2300000, "mode": "0755"}
   ]
 }
 ```
@@ -175,92 +179,106 @@ payload/etc/photo-frame/display.env.example
 |-------|---------|
 | `bundle_format` | Refuse formats the updater does not understand. |
 | `product`, `arch` | Refuse bundles for another device. |
-| `version` | Human-readable semver; used for the install dir name. |
+| `version` | Human-readable semver; used for the release dir name. |
 | `sequence` | Monotonic integer; the anti-rollback floor (M6, S3). |
 | `min_version` | Refuse if the installed version is older than the bundle supports. |
 | `config_schema` | The config schema the app expects; drives migration (M7, derived). |
-| `key_id` | Which trusted key signed it; enables rotation (S5). |
 | `artifacts[]` | Path, SHA-256, size, mode for every installed file (M2). |
 
-**Why a detached signature over the whole bundle** rather than a signature field
-inside the manifest: the signature must cover the manifest *and* the payload. A
-detached signature over the exact bundle bytes does that with no ambiguity, and
-it lets the device verify before it parses untrusted JSON (M1, M3).
+The `.sha256` file is `sha256sum` output. The `.sha256.sig` file is a JSON
+envelope over the exact bytes of the checksum file:
+
+```json
+{"key_id":"release-2026-a","signature":"<base64url>"}
+```
+
+**Why the signature covers the checksum file** rather than a field inside the
+manifest: the device can verify one small file before it parses any untrusted
+JSON, the manifest stays a plain description of contents, and the tarball is
+bound through its digest. Both sidecars are required; the updater refuses a
+bundle without them.
 
 ### 3.3 Signing
 
-Recommended: **minisign / Ed25519**, detached, with the public key pinned on the
-device.
+**Ed25519, raw signature, no certificate.** OpenSSL generates the key, signs the
+checksum file, and needs nothing else:
 
-- Small, no keyring, no expiry or keyserver semantics, one public key to pin.
-- The private key is password-protected and kept **offline** (never on the
-  device, never in CI).
-- A GPG detached signature (`gpg --detach-sign`, Ed25519 subkey) is an
-  acceptable alternative, and the owner already uses GPG for commits. If GPG is
-  chosen, the device must pin the **exact public key bytes**, not a keyring, and
-  must not honor expiry or trust paths.
+```bash
+openssl genpkey -algorithm ED25519 -out update-signing-2026-a.pem
+openssl pkeyutl -sign -rawin -inkey update-signing-2026-a.pem \
+  -in photo-frame-0.2.0-0007.tar.gz.sha256 -out signature.bin
+```
 
-CI produces unsigned artifacts. The owner signs the bundle (or a release
-manifest) on an offline machine. See Section 9 for the two-tier key design that
-keeps CI useful without holding the root key.
+There is no CA, no certificate chain, no expiry, and no network check, so the
+device can verify offline. The private key file is stored in a password manager
+or encrypted volume, and its backup is kept separately. Signing happens in CI, in
+a dedicated job with its own protected environment; the private key is not on the
+device and is not available to the build job. Section 7.2 covers the split and
+its limits.
+
+The public key is **baked into `photo-frame-update`** as a compiled constant, not
+installed as a file. Section 7.3 covers distribution; `docs/updates.md` covers
+the commands.
 
 ### 3.4 On-device verification (before any privileged action)
 
-The updater runs as root (it must replace binaries and units) but performs all
-of this **before** touching the live install:
+The updater runs as root (it must replace binaries and flip the symlink) but
+performs all of this **before** touching the live install:
 
-1. Copy the bundle to a root-only staging dir
+1. Copy the bundle and both sidecars to a root-only staging dir
    `/var/lib/photo-frame/update/staging/` (0700), writing to `*.part` and
    renaming when complete. An interrupted copy is never a candidate.
-2. Verify the detached signature over the bundle bytes with the pinned key.
-   **Fail closed** on a missing/invalid signature (M1, M5).
-3. Parse `manifest.json`. Check `bundle_format`, `product`, `arch`,
+2. Verify the signature over the `.sha256` bytes with the key named by `key_id`.
+   **Fail closed** on an unknown key ID or an invalid signature (M1, M5).
+3. Check the tarball's SHA-256 against the checksum file, and against
+   `--sha256` when it was supplied. `--sha256` is required for URL installs.
+4. Parse `manifest.json`. Check `bundle_format`, `product`, `arch`,
    `config_schema`, and `min_version` (M3).
-4. Compare `sequence` with the stored floor; refuse `<= floor` unless
+5. Compare `sequence` with the stored floor; refuse `<= floor` unless
    `--force` is passed (M6).
-5. Verify each `artifacts[]` entry's SHA-256 and size against the payload (M2).
-6. Extract the payload into a **fresh** directory, rejecting absolute paths,
+6. Verify each `artifacts[]` entry's SHA-256 and size against the payload (M2).
+7. Extract the payload into a **fresh** directory, rejecting absolute paths,
    `..`, symlinks, hardlinks, device nodes, and any entry outside the target
    (M2, S6). Set ownership to root and modes from the manifest.
-7. Only now proceed to install (Section 3.5).
+8. Only now proceed to install (Section 3.5).
 
 ### 3.5 Versioned installs and the flip
 
 ```
 /opt/photo-frame/
-  versions/
-    0.1.0-0000/            # seeded from the original .deb install
+  releases/
+    0.1.0-0003/            # previous, kept for rollback
       bin/photo-frame-manager
       bin/photo-frame-display
       bin/photo-frame-update
-      units/*.service
-    0.2.0-0007/            # newly verified
-  current -> versions/0.2.0-0007
+    0.2.0-0007/            # current
+  current -> releases/0.2.0-0007
 /var/lib/photo-frame/update/
   sequence                 # monotonic floor (root, 0644)
   pending.json             # {from, to, attempts, started_at}
-  confirmed.json           # written after a successful health check
   last-result.json         # for the panel and /api/status
   staging/
   audit.log                # persistent, root-owned, 0600
 ```
 
-The systemd units are installed once and point at the stable path
-`/opt/photo-frame/current/bin/...`. A normal update only flips the symlink, so
-unit churn is rare. If a bundle does change a unit, the updater copies it to
-`/etc/systemd/system/`, runs `systemctl daemon-reload`, and records it in the
-pending marker so the revert restores the previous unit.
+The systemd units are installed once by the `.deb` and point at the stable path
+`/opt/photo-frame/current/bin/...`. A release only contains the three binaries,
+so an update just flips the symlink and no unit changes are involved. If a unit
+ever has to change, that is a manual `.deb` upgrade, not a bundle.
+
+Retention keeps the current release, the previous release, and the four most
+recent releases; `gc` removes anything older after a successful install.
 
 Install sequence (all on ext4, all atomic via `rename()`):
 
 1. Verify (Section 3.4).
-2. Extract to `versions/<ver>-<seq>.new`; `rename()` to `versions/<ver>-<seq>`.
+2. Extract to `releases/<ver>-<seq>.new`; `rename()` to `releases/<ver>-<seq>`.
 3. Write `pending.json` (temp + `rename` + `fsync` the directory).
 4. Create `current.new` symlink, then `rename()` it over `current` (atomic).
 5. `systemctl restart photo-frame-display photo-frame-manager`.
 6. Health check (Section 3.6).
-7. On success: write `confirmed.json`, remove `pending.json`, append to
-   `audit.log`, show "Updated to vX".
+7. On success: remove `pending.json`, write `last-result.json`, append to
+   `audit.log`, run `gc`, show "Updated to vX".
 8. On failure: revert `current` to the previous version, restart, mark the
    result failed, append to `audit.log`, show "Update failed, reverted to vN".
 
@@ -287,56 +305,53 @@ cannot start at all. `photo-frame-boot-guard.service` is a `oneshot` unit
 ordered `Before=photo-frame-display.service photo-frame-manager.service` and
 `After=local-fs.target`:
 
-1. If `confirmed.json` exists, clear `pending.json` and exit.
-2. If `pending.json` exists and is unconfirmed, increment `attempts`.
+1. No `pending.json`: exit.
+2. If `pending.json` exists, increment `attempts` and exit on the first boot
+   after the flip.
 3. If `attempts >= 1` (we already booted once without confirmation), revert
-   `current` to `pending.from`, restore any replaced units, restart
-   `systemd`, and record the revert in `audit.log`.
+   `current` to `pending.from` and record the revert in `audit.log`.
 4. Exit; the normal services start against the good version.
 
 Because the kernel is unchanged, the boot guard always runs. This is what makes
 app-only rollback reliable without reflashing. The only unrecoverable case is a
 corrupt rootfs or boot partition, which Option A does not touch.
 
-### 3.8 Offline USB flow
+### 3.8 Offline install
 
-1. The owner copies `photo-frame-<ver>-<seq>.pfupdate` and `.minisig` to a
-   FAT-formatted USB stick, under a marker directory `photo-frame-update/`.
-2. Inserting the stick is detected by the existing `/media` watcher. A
-   `photo-frame-update/` directory means **update**, not photo import.
-3. The panel shows: "Update v0.2.0 (seq 7) ready. Remove and re-insert with
-   `apply` to install." The owner adds an empty `photo-frame-update/apply` file
-   (or uses the config-mode button) to approve. Presence of a valid bundle alone
-   is **not** approval (S1, T-S1).
-4. On approval the updater verifies and installs. The panel shows progress and
-   the final result.
-5. If anything fails, nothing is applied and the panel explains why.
+1. The owner copies the tarball and both sidecars to a FAT-formatted USB stick.
+2. Inserting the stick is detected by the existing `/media` watcher, which mounts
+   it as usual. Photo import runs; the update files are ignored by the importer
+   because they are not images.
+3. The owner installs from a shell (SSH or the console):
 
-A second physical step (remove/re-insert with `apply`) is intentionally
-awkward: it prevents a planted drive from installing silently.
+   ```bash
+   sudo photo-frame-update install /media/usb0/photo-frame-0.2.0-0007.tar.gz
+   ```
 
-### 3.9 LAN / local flow
+   The sidecars must be in the same directory. A bundle without them is refused.
+4. The panel shows progress and the final result.
 
-- **Config-mode button:** add an "Update" section to the admin UI that accepts an
-  uploaded bundle (or a LAN URL) and triggers the same verified install. This
-  reuses the existing rotating-password session and disappears with config mode,
-  so it adds no permanent exposure (M8).
-- **CLI/SSH:** `photo-frame-update install /path/to/bundle` or
-  `photo-frame-update install https://host/bundle` for an owner on the LAN. The
-  download is verified identically.
+There is no auto-apply marker directory in the adopted design. The `/media`
+watcher does not treat a mounted bundle as an instruction to install, so a
+planted USB stick cannot update the device without a command being run. That
+satisfies S1 and T-S1 with less code than a marker/`apply` handshake.
 
-### 3.10 Optional online check
+### 3.9 LAN / local and HTTPS flow
 
-- A systemd timer, **disabled by default**, runs
-  `photo-frame-update check`.
-- The check does one HTTPS `GET` of a static manifest from an owner-controlled
-  URL, compares `version`/`sequence`, and if newer shows a panel message and
-  writes `last-result.json`. It **does not download or install** (S1, S2).
-- Request is minimal: no device ID, no telemetry, a fixed `User-Agent`. Privacy
-  impact (T-I5) is that the endpoint operator (the owner) sees the device IP and
-  poll timing. Document it.
-- Installing from the online source requires the same explicit approval and the
-  same signature verification as USB.
+- **CLI/SSH:** `photo-frame-update install <path>` for a file on the device, or
+  `photo-frame-update install <https-url> --sha256 <hex>` over the network. The
+  download is verified identically; `--sha256` is required for URL installs and
+  pins the expected digest out of band.
+- Non-HTTPS URLs are refused, and so is an HTTPS-to-HTTP redirect.
+- The config-mode upload page was **not** adopted. Updates run from a shell, over
+  the VPN, or from a mounted drive.
+
+### 3.10 Online checks
+
+There is no update-check timer and no background poll. The owner runs `install`
+with a known URL, or installs from a local file. This drops the optional
+`photo-frame-update check` endpoint and its privacy trade-off (T-I5) entirely
+rather than shipping it disabled.
 
 ### 3.11 State preservation
 
@@ -358,6 +373,8 @@ message.
 | Failure | Result |
 |---------|--------|
 | Bad/missing signature | Refuse before install; panel error; audit entry |
+| Unknown key ID | Refuse; the bundle was signed with a key this build does not trust |
+| Rejected URL | Plain HTTP, or an HTTPS-to-HTTP redirect, refusing before download |
 | Hash mismatch / truncated bundle | Refuse; the `*.part` staging file is discarded |
 | Wrong arch/product | Refuse with a specific message |
 | Sequence not newer | Refuse unless `--force` |
@@ -366,8 +383,8 @@ message.
 | Power loss mid-flip | Atomic symlink rename leaves old or new; boot guard decides |
 | New version fails health check | Automatic revert to previous; panel message (M4, S4) |
 | New version cannot start at all | Boot guard reverts on the next boot |
-| Revert target missing | Boot guard falls back to the newest confirmed version; the original `.deb` install is seeded as `versions/<base>-0000` |
-| Corrupt rootfs/boot partition | Out of scope for A; recover via Option B or reflash |
+| Revert target missing | Refuse the install; `gc` always keeps the previous release |
+| Corrupt rootfs/boot partition | Out of scope for A; recover by reflashing |
 
 ### 3.13 Pros, cons, effort, risk
 
@@ -380,7 +397,7 @@ message.
 
 ---
 
-## 4. Option B — Full OS A/B image updates
+## 4. Option B — Full OS A/B image updates (evaluated, not adopted)
 
 ### 4.1 Partition layout
 
@@ -456,9 +473,9 @@ SHA-256 on a single-core-class board, which is acceptable for a photo frame.
 
 ### 4.5 Transports
 
-- **Offline USB:** a signed full image (`photo-frame-os-<ver>.img.zst` +
-  `.minisig`) plus manifest. Same verification gate as Option A, applied to an
-  image.
+- **Offline USB:** a signed full image (`photo-frame-os-<ver>.img.zst` plus a
+  checksum and signature) and a manifest. Same verification gate as Option A,
+  applied to an image.
 - **Online:** RAUC's hawkBit backend, a Mender server, or a static signed image
   over HTTPS from an owner-controlled host. Larger payloads (hundreds of MB) and
   a stable connection are needed.
@@ -495,8 +512,9 @@ avoid it.
 | **OSTree** | Not recommended | Atomic signed commits and rollback, but it is an atomic-filesystem approach (Fedora IoT-style), heavier for a minimal DietPi image, and still needs a bootloader to select deployments on a Pi. |
 
 **Why not for Option A:** Option A needs no bootloader work at all. A
-minisign-verified tarball plus a symlink flip is simpler, smaller, and easier to
-audit than any of these frameworks. Use RAUC only if and when Option B is built.
+signed tarball plus a symlink flip is simpler, smaller, and easier to audit than
+any of these frameworks. None of them is in the adopted design; RAUC would only
+be considered if Option B were ever built.
 
 ### 4.9 Pros, cons, effort, risk
 
@@ -506,49 +524,53 @@ audit than any of these frameworks. Use RAUC only if and when Option B is built.
 | **Cons** | Large complexity; partition rework; ~3 GB overhead; needs U-Boot or a recovery kernel; SD write amplification; still not tamper-proof (no hardware root of trust). |
 | **Effort** | Large. |
 | **Risk** | High. A mistake can make the device unbootable and cost state. |
+| **Decision** | Not adopted. OS security comes from apt; kernel and firmware are refreshed manually twice a year. |
 
 ---
 
-## 5. Option C — Hybrid staged approach (recommended)
+## 5. Option C — Hybrid staged approach (evaluated, not adopted)
 
 Ship Option A now. Keep Option B possible later by making a few structural
 choices today. Do **not** build the A/B machinery until the owner decides OS
 updates are required.
 
+This section is the staging proposal that was on the table. The adopted design
+takes Option A and skips the Option B reservations: there are no partition
+changes, no 1.2 GB reserve, and no attempt to keep a future bootloader
+compatible. The final record is Section 15.
+
 ### 5.1 Do now
 
 | Task | Why |
 |------|-----|
-| Sign release artifacts and publish a signed manifest | Prerequisite for any update (M1, M2, N5). |
+| Sign release artifacts and publish checksums with signatures | Prerequisite for any update (M1, M2, N5). |
 | Add `config_version` to `config.toml` + migration | Enables forward-compatible config changes (M7). |
-| Add the versioned install layout (`/opt/photo-frame/versions`, `current`) and seed `versions/<base>-0000` from the current `.deb` | Makes the flip possible without a partition change. |
-| Add `/var/lib/photo-frame/update/` (sequence, pending, confirmed, audit) | Update state and audit (M6, S4). |
+| Add the versioned install layout (`/opt/photo-frame/releases`, `current`) | Makes the flip possible without a partition change. |
+| Add `/var/lib/photo-frame/update/` (sequence, pending, audit) | Update state and audit (M6, S4). |
 | Add `photo-frame-boot-guard.service` | Rollback safety (M4). |
 | Add `/run/photo-frame/healthy` from the manager | Health check signal (S7). |
 | Keep `display.env`/`config.toml` as conffiles; ship defaults as `.example` | State preservation (M7). |
-| Publish a **two-tier** signing setup (offline root key + CI build key) | CI usefulness without the root key (S5, N5). |
+| Sign releases in a dedicated CI job with its own protected environment | CI usefulness without the key in the build job (S5, N5). |
 | Phase 0 hardening (Section 12) | The update mechanism should not rest on unhardened primitives (T-T3, T-T5, T-E4, T-D5, T-D6). |
 
-### 5.2 Interfaces and reservations to fix now
+### 5.2 Interfaces and reservations
 
-These are cheap now and expensive later:
+These were considered and then dropped. There is no plan to reserve partitions
+for a future rootfs B, because Option B is not being built:
 
-- **Boot FAT ≥ 256 MB** so it can hold two kernels/initramfs plus a bootloader
-  env.
-- **Reserve ~1.2 GB** of unallocated space (or an unused partition) after the
-  photos partition for a future rootfs B. Document the partition plan in
-  `docs/deployment.md`.
-- **Keep state outside the rootfs.** Plan to relocate `/etc/photo-frame` to a
-  dedicated state partition (or a bind mount from the photos partition) before
-  Option B. Option A already assumes state is not owned by the app image.
-- **Define a boot-marker contract** — a documented location/format that both the
-  app boot guard and a future bootloader/recovery kernel can read
-  (`/var/lib/photo-frame/update/pending.json` + a copy on the boot FAT).
-- **Agree on the bundle/ manifest schema** so the same manifest can later
-  describe either an app bundle or an OS image (`bundle_format` distinguishes
-  them).
+- **Boot FAT ≥ 256 MB** and **~1.2 GB of unallocated space** were for a future
+  A/B layout. Not adopted.
+- **Keeping state outside the rootfs** still happens in the narrow sense that
+  the updater never touches `/etc/photo-frame` or the photos partition, but there
+  is no separate state partition.
+- **Boot-marker contract:** the only marker is
+  `/var/lib/photo-frame/update/pending.json`, read by the userspace boot guard.
+- **Bundle schema:** `bundle_format` is kept so an app bundle and a future OS
+  image could be distinguished, but no OS image format is defined.
 
 ### 5.3 Later (only if OS updates are needed)
+
+Not scheduled. If the decision is ever revisited, this is the shape of the work:
 
 - Add U-Boot with `bootcount`/`altbootcmd` (or a recovery kernel).
 - Adopt RAUC for signed `.raucb` OS bundles and bootchooser integration.
@@ -559,8 +581,8 @@ These are cheap now and expensive later:
 
 - Option A delivers real value (bug fixes, features, safe rollback) with low
   risk and no partition work.
-- The reservations above are the only things Option B truly needs from the
-  current layout; deferring them is what would force a disruptive reflash later.
+- Option B's cost is only worth paying if OS image updates become a real
+  requirement. They have not.
 - If the owner never needs OS updates, nothing in Option B was built and no
   complexity was paid.
 
@@ -570,10 +592,9 @@ These are cheap now and expensive later:
 
 | Transport | Works offline | Required | Privacy impact |
 |-----------|---------------|----------|----------------|
-| Offline USB | Yes | FAT stick, signed bundle + signature, `photo-frame-update/` marker and `apply` file | None. No network. |
-| LAN / local (config-mode upload, SSH, `scp`) | Yes (LAN only) | Owner device on the same LAN; existing admin session or SSH; verified bundle | LAN only; credentials cross the LAN as today (T-S3, T-I2). |
-| Online check (opt-in) | No | Internet + owner-controlled HTTPS endpoint; timer enabled | Endpoint sees device IP and poll timing; no device ID (T-I5). |
-| Online install (opt-in) | No | Same as check, plus explicit approval and signature verification | As above; payload downloaded from the owner's endpoint. |
+| Local file (mounted USB, `scp`, local disk) | Yes | Tarball plus `.sha256` and `.sha256.sig` in the same directory; a shell to run `install` | None. No network. |
+| HTTPS URL | No | Release URL, `--sha256` digest, signature sidecars fetched from the same URL | GitHub sees the device IP and download timing; no device ID in the request. |
+| Plain HTTP | No | Not supported. Refused. | n/a |
 | SD reflash | Yes | A computer + card reader | N/A. **Fallback only**; loses state. Not an update path. |
 
 ---
@@ -582,50 +603,97 @@ These are cheap now and expensive later:
 
 ### 7.1 Format
 
-Recommended: **minisign/Ed25519 detached signature** over the bundle bytes.
-Alternative: **GPG detached signature** with an Ed25519 subkey (the owner
-already uses GPG for commits). If GPG is used, pin the exact public key bytes
-and ignore expiry/trust paths. Both are acceptable; pick one and document it.
+**Ed25519 with a raw signature, wrapped in a JSON envelope.** The signature is
+made with `openssl pkeyutl -sign -rawin` over the exact bytes of the `.sha256`
+sidecar. The envelope names the key:
+
+```json
+{"key_id":"release-2026-a","signature":"<base64url>"}
+```
+
+There is no certificate, no expiry, no CA, no keyserver, and no trust path. A GPG
+detached signature was considered and rejected: it brings keyring and expiry
+semantics the device would have to ignore, for no benefit over a 64-byte raw
+signature.
 
 ### 7.2 Keys
 
-Two tiers, so CI can build without holding the root key (S5, N5):
+One signing key, used by one CI job.
 
 | Key | Where | Signs | Compromise impact |
 |-----|-------|-------|-------------------|
-| **Root/authority key** | Offline machine or hardware token; passphrase-protected; never on the device or in CI | The release manifest (version, sequence, hashes, key list) and key-rotation statements | Forged releases. Highest value; protect most. |
-| **Build key** | CI secret | Artifact hashes recorded in the CI-produced manifest | Cannot forge a release without the root key signing the manifest. |
+| **Update signing key** (`release-YYYY-x`) | GitHub environment secret `release-signing`; a backup offline; never on the device | The `.sha256` file for each release | Forged releases. Rotate and reflash or use a recovery key. |
+| **Recovery key** (optional) | Offline only; never in CI | A recovery release that installs a clean key list | Same as above, but it is the way back if the signing key leaks. |
 
-Flow: CI builds and attaches artifacts and a candidate manifest; the owner
-downloads and signs the manifest (or a small release file) with the root key,
-then publishes the signed manifest next to the artifacts. The device verifies
-the manifest with the pinned root key, then verifies artifact hashes from it.
-CI's key alone cannot produce an installable release.
+The build job has no signing key. The signing job gets the key from a protected
+environment, waits for a required reviewer, and runs only for protected tags or
+a manual dispatch. See `docs/updates.md` for the environment setup and the
+workflow.
 
-If a two-tier flow is too much for one device, the minimal viable version is:
-CI builds and attaches **unsigned** artifacts; the owner signs locally before
-publishing. CI then holds no signing key at all.
+CI signing means **CI is the build-integrity trust anchor**. The signature proves
+the artifact came from the workflow; it does not prove the workflow was not
+compromised. A compromised build job, dependency, or merged commit produces a
+validly signed malicious artifact. The dedicated key in a separate job limits
+the blast radius and makes each signing event auditable, but it does not make CI
+trustworthy. This is an accepted risk, stated plainly so nobody mistakes the
+signature for a build attestation.
+
+Possible future hardening, not planned now: sign through a cloud KMS or a
+PKCS#11 HSM so the key never exists as a file, or run the signing step on a
+self-hosted runner the build job cannot reach.
 
 ### 7.3 Distribution and pinning
 
-- The public root key is shipped in the first `.deb` and pinned at
-  `/etc/photo-frame/update-trusted-keys/<key_id>.pub` (root-owned, 0644).
-- The device trusts a **set** of keys keyed by `key_id`, not a keyring and not a
-  trust path.
-- The manifest carries `key_id`, so a signature is checked against the named
-  trusted key.
+- The public keys are **compiled into `photo-frame-update`** as a table keyed by
+  key ID, for example `TRUSTED_KEYS` in `src/update/keys.rs`.
+- The bytes are the 32-byte raw Ed25519 public key, not PEM or DER. Get them with
+  `openssl pkey -pubout -outform DER | tail -c 32`.
+- No public-key file is installed by apt, no keyring is read at runtime, and
+  nothing under `/etc/photo-frame` participates in verification.
+- `photo-frame-update` ships inside the release bundle, so the trusted key set
+  travels with the app.
+- The `.sha256.sig` envelope carries `key_id`; the updater looks that ID up and
+  refuses unknown IDs.
+- `photo-frame-update keys` prints each key ID with the SHA-256 fingerprint of
+  its public key, which is what to compare against the signing machine.
 
 ### 7.4 Rotation and revocation
 
-- **Rotation:** a new key is added by a bundle signed with the old key (a signed
-  key-allowlist update), or out-of-band by the owner via SSH/USB (break-glass).
-- **Revocation:** remove the key from the trusted set via a statement signed by
-  a still-trusted key. If the root key itself is compromised, the only clean
-  recovery is a physical/out-of-band key update, because anything signed with
-  the old key must be assumed hostile.
-- Record the active `key_id` in `last-result.json` and the audit log.
+Rotation is a sequence of releases, not a single switch:
 
-### 7.5 Anti-rollback floor and its limits
+1. Generate the new key and add its public half to `TRUSTED_KEYS` alongside the
+   old one.
+2. Ship a release signed by the **old** key that contains the new updater.
+3. Let the device install that release, so it now trusts both keys.
+4. Sign subsequent releases with the new key.
+5. Ship a later release, signed with the new key, that removes the old entry.
+6. Replace the CI secrets and retire the old private key.
+
+The overlap exists because a device can only learn a new key from a release it
+already trusts. The overlap must last long enough to install step 2. It should
+not last longer than that.
+
+Revocation is the same operation with no overlap: if a key is compromised, a
+release signed by it cannot be trusted, so removal cannot go through that key.
+Use the recovery key or reflash.
+
+### 7.5 Key loss and compromise
+
+- **Lost key:** the device keeps running. No new release can be signed until the
+  key is restored from backup, the recovery key is used, or the device is
+  reflashed with a new key list.
+- **Compromised key:** anything signed after the leak is suspect. Remove the key
+  from CI, rotate the environment secrets, and recover with a recovery key or a
+  reflash. There is no online revocation and no expiry date to fall back on.
+- **Recovery key (optional):** a second key baked in at provisioning, held
+  offline, used only to sign a recovery release. Worth the extra constant if the
+  device is hard to reach. If it is skipped, say so, because the only remaining
+  path is a reflash.
+- **No expiry:** a key stays trusted until a release removes it. Expiry would
+  create a new failure mode (a device with a wrong clock refusing updates) with
+  no matching benefit, since the key can be removed explicitly.
+
+### 7.6 Anti-rollback floor and its limits
 
 - Store a monotonic `sequence` in `/var/lib/photo-frame/update/sequence`
   (root-owned). Refuse bundles with `sequence <= floor` unless explicitly forced.
@@ -647,9 +715,9 @@ See Section 3.5 for the install sequence. The rollback-relevant mechanics:
 
 1. `pending.json` records `from`, `to`, and `attempts`; written atomically.
 2. `current` is flipped with a single `rename()` of a symlink — atomic on ext4.
-3. Success writes `confirmed.json`; failure flips back immediately.
+3. Success removes `pending.json`; failure flips back immediately.
 4. `photo-frame-boot-guard.service` runs before the app units on every boot and
-   reverts if `pending` is unconfirmed and `attempts >= 1`.
+   reverts if `pending` is present and `attempts >= 1`.
 5. Power loss between flip and confirm is covered by the boot guard.
 
 **What is atomic on ext4:** `rename()` of a file or symlink within a directory,
@@ -704,14 +772,16 @@ Migration functions must be idempotent and covered by tests.
 
 | Method | How | Approval |
 |--------|-----|----------|
-| USB marker | `photo-frame-update/` dir with a signed bundle; then add `apply` | Explicit second physical step (S1, T-S1) |
-| Config-mode button | Upload/URL in the admin UI | Owner is in the authenticated session |
-| CLI/SSH | `photo-frame-update install <path|url>` | Owner runs it |
-| Online check | `photo-frame-update check` or an opt-in timer | Notification only; install still needs approval |
+| CLI/SSH | `photo-frame-update install <path\|url> [--sha256 <hex>]` | Owner runs it |
+| Local file | Same command with a path on a mounted drive | Owner runs it |
+| Remote shell | Same command over the VPN | Owner runs it, after VPN and SSH auth |
+
+There is no panel-driven approval prompt, no config-mode upload page, and no
+background check. A valid bundle sitting on a mounted drive is not an
+instruction to install it.
 
 ### 10.2 Panel messages
 
-- "Update vX (seq N) ready — add `apply` to install."
 - "Verifying update…"
 - "Applying update… the frame may restart."
 - "Updated to vX."
@@ -724,7 +794,7 @@ in `src/qr.rs` / `src/config_mode.rs`, so no new display protocol is needed.
 ### 10.3 Failure reporting
 
 - Panel message (above).
-- `last-result.json` in the update state dir, surfaced in config-mode
+- `last-result.json` in the update state dir, surfaced in config mode's
   `/api/status` alongside sync status.
 - A line in the persistent audit log.
 
@@ -734,8 +804,8 @@ in `src/qr.rs` / `src/config_mode.rs`, so no new display protocol is needed.
 storage (not tmpfs). One line per attempt:
 
 ```
-2026-10-21T14:03:11Z action=install from=0.1.0-0000 to=0.2.0-0007 seq=7
-  bundle_sha256=… key_id=owner-2026-a trigger=usb result=success
+2026-10-24T18:12:03Z action=install from=0.1.0-0003 to=0.2.0-0007 seq=7
+  bundle_sha256=… key_id=release-2026-a source=https trigger=cli result=success
 ```
 
 Rotate at a small cap (for example 1 MB, keep 3). This is separate from the
@@ -745,29 +815,32 @@ tmpfs operational logs in `/tmp/photo-frame.log`, which do not survive a reboot.
 
 ## 11. Security requirements mapping
 
-| Req | Option A | Option B | Option C |
+The Option A column is the adopted design. Option B and Option C are kept for
+comparison only.
+
+| Req | Option A (adopted) | Option B | Option C |
 |-----|----------|----------|----------|
-| M1 authenticated updates | Satisfied (pinned key, fail closed) | Satisfied (signed image/manifest) | Satisfied |
+| M1 authenticated updates | Satisfied (baked keys, fail closed) | Satisfied (signed image/manifest) | Satisfied |
 | M2 whole-artifact integrity | Satisfied (per-artifact hashes) | Satisfied (image hash + dm-verity) | Satisfied |
 | M3 no root action before verify | Satisfied | Satisfied | Satisfied |
 | M4 crash/power-fail + rollback | Satisfied (health check + boot guard) | Satisfied (U-Boot/recovery kernel) | Satisfied |
 | M5 fail-closed | Satisfied | Satisfied | Satisfied |
 | M6 anti-rollback floor | Satisfied (sequence; physical limits documented) | Satisfied (same; dm-verity detects tamper) | Satisfied |
 | M7 state preservation | Satisfied by construction | Satisfied via state partition | Satisfied |
-| M8 least privilege / not LAN-triggerable | Satisfied (root updater, narrow staging, config-mode only) | Satisfied | Satisfied |
-| M9 offline-capable | Satisfied (USB) | Satisfied (USB image) | Satisfied |
-| S1 owner approval | Satisfied (explicit step) | Satisfied | Satisfied |
-| S2 minimal opt-out checks | Satisfied (opt-in timer, no device ID) | Satisfied | Satisfied |
+| M8 least privilege / not LAN-triggerable | Satisfied (root updater invoked from a shell; no listener, no panel trigger) | Satisfied | Satisfied |
+| M9 offline-capable | Satisfied (local path with sidecars) | Satisfied (USB image) | Satisfied |
+| S1 owner approval | Satisfied (owner runs the command) | Satisfied | Satisfied |
+| S2 minimal opt-out checks | Satisfied (no background check exists) | Satisfied | Satisfied |
 | S3 signed metadata + sequence | Satisfied | Satisfied | Satisfied |
 | S4 persistent audit | Satisfied | Satisfied | Satisfied |
-| S5 key rotation/revocation | Satisfied (key set + signed statements) | Satisfied | Satisfied |
+| S5 key rotation/revocation | Satisfied (key set in the binary, release-based rotation) | Satisfied | Satisfied |
 | S6 sandboxing/atomicity | Satisfied on ext4; no FAT writes | Satisfied if `config.txt` is not rewritten | Satisfied |
-| S7 recovery tooling | Satisfied (runbook + seeded previous version) | Satisfied (recovery partition) | Satisfied |
+| S7 recovery tooling | Satisfied (runbook + previous release kept) | Satisfied (recovery partition) | Satisfied |
 | N1 reproducible builds/hashes | Optional (Phase 0) | Optional | Optional |
 | N2 dm-verity | Not applicable (no OS image) | Satisfied | Satisfied (Phase 2) |
 | N3 encrypted photos | Optional (separate) | Optional (separate) | Optional (separate) |
 | N4 rollback command / hold | Satisfied (CLI) | Satisfied | Satisfied |
-| N5 sign CI artifacts | Satisfied (two-tier) | Satisfied | Satisfied |
+| N5 sign CI artifacts | Satisfied (dedicated signing job; see 7.2 for the residual risk) | Satisfied | Satisfied |
 
 Option A fails none of the MUST requirements. Its only material gap versus
 Option B is that it cannot patch the OS/kernel/dependencies (not a MUST) and
@@ -776,7 +849,7 @@ because the kernel is unchanged, so the boot guard always runs).
 
 ---
 
-## 12. Recommended roadmap
+## 12. Roadmap
 
 ### Phase 0 — Current-state hardening (prerequisite)
 
@@ -785,35 +858,39 @@ T-E1, T-E4, T-D5, T-D6).
 
 | Task | Finding |
 |------|---------|
-| Publish signed release artifacts + a signed manifest; adopt the two-tier key split | T-S1, T-E1, T-E2, N5 |
+| Publish signed release artifacts (checksum + signature); sign in a dedicated CI job with a protected environment | T-S1, T-E1, T-E2, N5 |
 | Systemd sandboxing: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictAddressFamilies=`, `SystemCallFilter=@system-service`, and explicit `ReadWritePaths=` for the photos dir, `/run/photo-frame`, `/etc/photo-frame` | T-E4 |
 | Admin API hardening: constant-time credential comparison (replace `==` in `check_auth`), CSRF protection (Origin/Referer check), request-size limits, and a simple rate limit/lockout | T-D5, T-D6 |
 | ImageMagick sandboxing: a hardened `policy.xml` (disable Ghostscript, MVG/MSL, SVG, PDF, and unused coders; set resource limits), run under a restricted profile/namespace | T-T3, T-E3 |
 | Fix `token_uri` SSRF: ignore `token_uri` for service accounts or restrict it to the Google token host; reject private/loopback/link-local targets and `http://` | T-T5 |
 | Harden `/tmp` files: `O_NOFOLLOW`/ownership checks on the PID lock and setup file | T-T6 |
 | Add `config_version` and migration | M7 |
-| Add the versioned install layout and seed `versions/<base>-0000` | Phase 1 prerequisite |
+| Add the versioned release layout (`/opt/photo-frame/releases`, `current`) | Phase 1 prerequisite |
 | Publish artifact hashes/SBOM and move toward reproducible builds | N1 |
+| SSH hardening and firewall policy (VPN/loopback only) | T-E4, M8 |
 
 ### Phase 1 — Option A app updates
 
 | Task | Output |
 |------|--------|
-| P1.1 Bundle format + manifest + signing tooling | `photo-frame-0.x.y-NNNN.pfupdate` + `.minisig` |
-| P1.2 `photo-frame-update` binary: verify, extract, flip, health check, revert | Root updater |
+| P1.1 Bundle format + manifest + packaging | `photo-frame-0.x.y-NNNN.tar.gz` + `.sha256` + `.sha256.sig` |
+| P1.2 `photo-frame-update` binary: verify, extract, flip, health check, revert, gc | Root updater |
 | P1.3 `photo-frame-boot-guard.service` | Userspace rollback |
 | P1.4 Manager writes `/run/photo-frame/healthy` | Health signal |
-| P1.5 USB marker + `apply` flow via the `/media` watcher | Offline install |
-| P1.6 Config-mode "Update" page (upload/URL) | LAN install |
-| P1.7 Optional `photo-frame-update check` + disabled timer | Online check (S1, S2) |
+| P1.5 Local-path install (mounted drive or `scp`) | Offline install |
+| P1.6 HTTPS install with required `--sha256`, HTTP and downgrade redirects refused | Network install |
+| P1.7 Baked key list + `keys` command with fingerprints | Trust anchor (S5) |
 | P1.8 Panel messages via the control socket | UX (M4, S4) |
 | P1.9 Audit log + `last-result.json` + `/api/status` surfacing | S4 |
-| P1.10 Key pinning, `key_id`, rotation/revocation statements | S5 |
-| P1.11 Tests: signature failure, hash mismatch, traversal, power-loss simulation, revert, wrong arch, downgrade refusal | M1–M9 |
-| P1.12 Docs: owner update runbook, key custody, USB layout | Docs |
-| P1.13 Owner-initiated rollback/hold command (`photo-frame-update rollback` / `hold`) | N4 |
+| P1.10 Key rotation and recovery-key procedure | S5 |
+| P1.11 CI signing job + `release-signing` environment | N5, S5 |
+| P1.12 Tests: signature failure, unknown key ID, hash mismatch, traversal, power-loss simulation, revert, wrong arch, downgrade refusal, HTTP refusal | M1–M9 |
+| P1.13 Docs: owner update runbook, key custody, OS/kernel policy, VPN access | Docs |
+| P1.14 Owner-initiated rollback (`photo-frame-update rollback`) | N4 |
 
-### Phase 2 — Option B OS image A/B (only if needed)
+### Phase 2 — Option B OS image A/B
+
+Not scheduled. Kept here only so the analysis is not lost.
 
 | Task | Output |
 |------|--------|
@@ -827,55 +904,104 @@ T-E1, T-E4, T-D5, T-D6).
 
 ---
 
-## 13. Open questions for the owner
+## 13. Open questions (answered)
 
 1. **Is app-only updating enough, or must the OS/kernel/ImageMagick be
-   patchable?** This is the decision that determines whether Option B is ever
-   built.
-2. **Signing tool:** minisign, or GPG detached signatures (already used for
-   commits)?
-3. **Hardware token** for the offline root key, or a passphrase-protected key on
-   an offline machine?
-4. **Where do release artifacts and the signed manifest live?** GitHub Releases,
-   or the owner's own server?
-5. **Online check:** wanted at all? If yes, which endpoint, and is the privacy
-   trade-off (IP + timing) acceptable?
-6. **Approval UX on a headless device:** USB `apply` marker, config-mode button,
-   SSH, or more than one?
-7. **Partition reservations:** acceptable to reserve ~1.2 GB for a future rootfs
-   B and grow the boot FAT to ≥ 256 MB?
-8. **State relocation:** acceptable to move `/etc/photo-frame` to a dedicated
-   state partition before Option B?
-9. **Release channels:** is a stable/beta split wanted? (Not in the threat
-   model's requirement list; a product decision.)
-10. **How much update automation is acceptable**, given that silent
-    auto-update is undesirable and owner approval is required (S1)?
+   patchable?** App-only. OS and kernel fixes come from `unattended-upgrades`
+   and a manual kernel refresh about twice a year.
+2. **Signing tool:** OpenSSL Ed25519 with a raw signature over the `.sha256`
+   sidecar. Not minisign, not GPG.
+3. **Hardware token or offline machine?** Neither. The key lives in a protected
+   GitHub environment; a KMS/HSM is a possible later step.
+4. **Where do releases live?** GitHub Releases, with the tarball and both
+   sidecars attached.
+5. **Online check?** No. There is no check timer and no endpoint.
+6. **Approval UX:** a shell command, locally or over the VPN. No `apply` marker
+   and no config-mode upload page.
+7. **Partition reservations?** Not taken. No A/B layout is planned.
+8. **State relocation?** Not needed without Option B.
+9. **Release channels:** one channel. No stable/beta split.
+10. **How much automation?** None for app updates: the owner runs `install`.
+    OS security updates are automatic through apt, with no auto-reboot.
 
 ---
 
 ## 14. Comparison table
 
-| Criterion | Option A (app bundles) | Option B (OS A/B) | Option C (hybrid, recommended) |
+| Criterion | Option A (app bundles, adopted) | Option B (OS A/B) | Option C (hybrid) |
 |-----------|------------------------|-------------------|-------------------------------|
 | Security | Strong for app code; no OS CVE coverage | Strongest; enables dm-verity and signed kernel | Strong now, extensible later |
 | Complexity | Low–Medium | High (bootloader, partitions, RAUC) | Medium now, High later if Phase 2 |
 | Rollback | Health check + userspace boot guard (reliable for app updates) | Bootloader/recovery-kernel fallback (reliable at boot) | A now, B later |
-| Offline | Yes (USB) | Yes (USB image) | Yes |
+| Offline | Yes (local file with sidecars) | Yes (USB image) | Yes |
 | Effort | Medium | Large | Medium + optional Large |
 | State preservation | By construction | Via state partition | By construction now |
-| OS/kernel updates | No | Yes | No, until Phase 2 |
+| OS/kernel updates | No (apt and manual kernel refresh instead) | Yes | No, until Phase 2 |
 | Partition changes | None | Required (~3 GB) | None now; reserved for later |
 | Power-loss safety | Strong (no FAT writes) | Strong only if `config.txt` is not rewritten | Strong |
 | Risk | Low | High | Low now |
 
 ---
 
-## 15. Decision record
+## 15. Decision record and operating policy
 
-- **Decision:** proceed with Option C. Build Option A in Phase 1 after the
-  Phase 0 hardening, and reserve partitions/interfaces for a possible Option B.
-- **Pending:** the owner's answer to Open Question 1 (app-only vs OS updates)
-  determines whether Phase 2 is ever scheduled.
+### 15.1 Decisions
+
+- **App-only signed release bundles on DietPi.** The OS image is managed by
+  apt, not by the updater.
+- **No A/B partitioning, no RAUC, no SWUpdate, no `dietpi-backup`.** Rollback is
+  a symlink flip plus a userspace boot guard, which is sufficient because the
+  kernel never changes during an app update.
+- **`photo-frame-update` CLI** with versioned releases under
+  `/opt/photo-frame/releases/<version>`, a `current` symlink, retention of the
+  current, previous, and four most recent releases, a health check, automatic
+  rollback, a boot guard, and an audit log.
+- **Bundle format:** `.tar.gz` with `manifest.json` and the three binaries,
+  plus `.sha256` and `.sha256.sig` sidecars. The signature is Ed25519 over the
+  checksum bytes, in a JSON envelope naming the key ID. No certificate, no
+  expiry, no CA, no network.
+- **Public keys are compiled into `photo-frame-update`.** No key file is
+  installed by apt and nothing in `/etc` participates in verification. The tool
+  ships inside the release bundle.
+- **Transports:** a local path (sidecars required in the same directory) and an
+  HTTPS URL (with a required `--sha256`; plain HTTP and HTTPS-to-HTTP redirects
+  refused).
+- **CI signing:** separate build and signing jobs. The build job has no key. The
+  signing job uses a dedicated key in the `release-signing` environment, runs
+  only on protected tags or manual dispatch, has minimal permissions, and pins
+  actions to SHAs. CI is the build-integrity trust anchor, and a compromised
+  build job can produce a validly signed malicious artifact; the split limits
+  the blast radius but does not remove that risk. KMS, an HSM, or a self-hosted
+  signing runner is a possible later hardening step.
+- **Rotation** adds a key to the updater, ships it in a release signed by the
+  old key, keeps both during an overlap, then removes the old key in a later
+  release. No expiry. Key loss leaves the device running but unable to accept a
+  new release until recovery or reflash. A compromised key cannot be rotated
+  through itself; use a recovery key or reflash.
+- **Releases are published on GitHub Releases.** The device does not poll.
+
+### 15.2 OS security updates
+
+- Automatic Debian security updates through `unattended-upgrades`.
+- `needrestart` for services that link a patched library.
+- No custom maintenance timer and no self-written apt wrapper.
+- Kernel, firmware, and bootloader packages are held.
+- Manual kernel/firmware/bootloader update roughly twice a year over the VPN,
+  with a known-good SD card on hand.
+- No automatic reboot.
+
+### 15.3 Remote access
+
+- Mesh VPN (Tailscale, self-hosted Headscale, or NetBird). No port forwarding.
+- SSH on the VPN and loopback only; the firewall drops LAN SSH.
+- Key-only authentication, no root login, a dedicated `admin` user, and `sudo`
+  scoped to `photo-frame-update`.
+- Config mode's admin server stays LAN-only and is not exposed over the VPN.
+- Remote update workflow: copy the bundle over `scp`, run
+  `photo-frame-update install` locally, check `status` and the audit log.
+
+See `docs/updates.md` for the commands, key ceremony, CI workflow, rotation
+steps, and troubleshooting.
 
 ---
 
