@@ -148,6 +148,16 @@ jobs:
           mv "$SRC" "$DEST"
           echo "Built: $DEST"
 
+      - name: Write .deb checksum
+        env:
+          FULL_VERSION: ${{ needs.check.outputs.full }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cd target/debian
+          DEB="photo-frame_${FULL_VERSION}_${ARCH}.deb"
+          sha256sum "$DEB" > "${DEB}.sha256"
+          cat "${DEB}.sha256"
+
       - name: Build update bundle
         if: matrix.arch == 'arm64'
         env:
@@ -164,7 +174,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deb-${{ matrix.arch }}
-          path: target/debian/*.deb
+          path: |
+            target/debian/*.deb
+            target/debian/*.deb.sha256
 
       - name: Upload update bundle artifact
         if: matrix.arch == 'arm64'

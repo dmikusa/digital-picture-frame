@@ -522,15 +522,19 @@ unavailable; the merge must still land on `main`.
 On every push to `main`, `build.yml` first checks whether `vX.Y.Z` is already
 published. If it is, the build is a no-op. Otherwise it:
 
-- builds `amd64` and `arm64` `.deb` packages,
+- builds `amd64` and `arm64` `.deb` packages and their `.sha256` sidecars,
 - builds the `arm64` update bundle and `.sha256` sidecar,
 - creates the draft release `vX.Y.Z` if it does not exist, or replaces the
   assets on the existing draft,
-- uploads the `.deb` files, bundle, and checksum to the draft.
+- uploads the `.deb` files, bundle, and checksums to the draft.
 
-The bundle assets are named:
+The assets are named:
 
 ```text
+photo-frame_<X.Y.Z>-<short-sha>_amd64.deb
+photo-frame_<X.Y.Z>-<short-sha>_amd64.deb.sha256
+photo-frame_<X.Y.Z>-<short-sha>_arm64.deb
+photo-frame_<X.Y.Z>-<short-sha>_arm64.deb.sha256
 photo-frame-<X.Y.Z>-<short-sha>-arm64.tar.gz
 photo-frame-<X.Y.Z>-<short-sha>-arm64.tar.gz.sha256
 ```
@@ -564,9 +568,9 @@ Confirm the draft has the expected assets:
 gh release view v0.2.0 --json assets --jq '.assets[].name'
 ```
 
-Expect both `.deb` files, the bundle, the bundle's `.sha256`, and the
-`.sha256.sig`. On a test device, install the HTTPS bundle and then check status
-and list:
+Expect both `.deb` files and their `.sha256`/`.sha256.sig` sidecars, the bundle,
+and the bundle's `.sha256`/`.sha256.sig`. On a test device, install the HTTPS
+bundle and then check status and list:
 
 ```bash
 SHA=$(awk '{print $1}' photo-frame-0.2.0-abc1234-arm64.tar.gz.sha256)

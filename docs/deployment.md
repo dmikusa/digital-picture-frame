@@ -86,13 +86,46 @@ Any auto-mount solution that mounts USB drives there works:
 
 Fetch the latest version of the [Photo Frame software](https://github.com/dmikusa/digital-picture-frame/releases) from our Github Releases page.
 
+Before installing, verify the `.deb` signature and checksum. Set these to the
+release and architecture you are installing:
+
+```bash
+TAG=v0.2.0
+VERSION=0.2.0-ffd3bcf
+ARCH=arm64
+BASE="https://github.com/dmikusa/digital-picture-frame/releases/download/${TAG}"
+DEB="photo-frame_${VERSION}_${ARCH}.deb"
+
+curl -fLO "${BASE}/${DEB}"
+curl -fLO "${BASE}/${DEB}.sha256"
+curl -fLO "${BASE}/${DEB}.sha256.sig"
+curl -fsSLo 2026-10.pub \
+  https://raw.githubusercontent.com/dmikusa/digital-picture-frame/main/packaging/update-keys/2026-10.pub
+```
+
+Verify the signature over the checksum, then the checksum over the package:
+
+```bash
+printf 'release %s\n' "$(cat 2026-10.pub)" > allowed_signers
+ssh-keygen -Y verify \
+  -f allowed_signers \
+  -I release \
+  -n photo-frame-update \
+  -s "${DEB}.sha256.sig" \
+  < "${DEB}.sha256"
+sha256sum -c "${DEB}.sha256"
+```
+
+`ssh-keygen` should print `Good "photo-frame-update" signature`, and
+`sha256sum` should report `OK`. Then install:
+
 ```bash
 sudo apt update
 sudo apt install -y imagemagick avahi-daemon
-sudo dpkg -i photo-frame_x.y.z_amd64.deb
+sudo apt install "./${DEB}"
 ```
 
-This installs imagemagick which the tool uses for some photo conversion tasks & the Photo Frame software itself. The software installs a few the Photo Frame Manager and Photo Frame Display services.
+This installs imagemagick which the tool uses for some photo conversion tasks & the Photo Frame software itself. The software installs the Photo Frame Manager and Photo Frame Display services.
 
 ### Load Some Photos!
 
