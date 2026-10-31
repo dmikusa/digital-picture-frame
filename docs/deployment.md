@@ -129,9 +129,56 @@ Pre-built `.deb` packages are available from GitHub Releases for both `amd64` an
    ```bash
    sudo dpkg -i photo-frame_*.deb
    ```
-3. The package installs and starts two systemd services:
-   - `photo-frame-display.service` — the C DRM display app
+3. The package installs and starts these systemd services:
+|||||||   - `photo-frame-display.service` — the C DRM display app
    - `photo-frame-manager.service` — the Rust manager
+   - `photo-frame-update-guard.service` — oneshot boot guard for app updates.
+     It is a no-op unless an update was activated and never confirmed, in which
+     case it confirms the new release or reverts to the previous one.
+
+### Versioned install layout
+
+The services run from `/opt/photo-frame/current`, not from `/usr/bin`:
+
+```
+/opt/photo-frame/
+  releases/<version>/bin/{photo-frame-manager,photo-frame-display,photo-frame-update}
+  releases/<version>/manifest.json
+  current -> releases/<version>
+/var/lib/photo-frame/update/state.json
+/var/log/photo-frame/update.log
+```
+
+`postinst` seeds `releases/<package-version>` from the packaged binaries and
+records it as sequence `0`. Signed release bundles add new directories and move
+the `current` symlink; the `.deb` never removes them. On upgrade the package
+leaves an update-managed `current` alone and only stages its own release in
+`releases/`, so `apt upgrade` cannot roll back a newer installed release.
+
+`/usr/bin/photo-frame-*` still ship as the packaged copy (fallback and manual
+use), and `/usr/local/sbin/photo-frame-update` points at the active release.
+
+Signing keys: `photo-frame-update` contains an empty trusted-key list
+(`src/update/keys.rs`, `TRUSTED_KEYS`), so every install is refused until the
+owner pins their Ed25519 public key and rebuilds. See `docs/updates.md` for key
+custody, bundle signing, and rotation.
+|||||||
+### Updates
+
+The `.deb` is the initial install path and seeds a release at sequence 0. After
+that, application updates use signed release bundles and `photo-frame-update`
+rather than `dpkg`: the tool verifies the signature and checksums, unpacks into
+`/opt/photo-frame/releases/<version>`, flips the `current` symlink, and rolls
+back if the new version fails its 30-second health check. A later `.deb` upgrade
+stages its own release but does not move an update-managed `current` backwards.
+
+`photo-frame-update-guard.service` runs after the app services on every boot and
+confirms or reverts a release that was activated but never confirmed. OS
+packages, the kernel, and firmware are handled separately with apt.
+
+See [updates.md](updates.md) for the bundle format, commands, signing keys, the
+manual signing workflow, and the OS update policy. `config.toml` and
+`display.env` are never touched by an update.
 
 ### Dedicated User
 

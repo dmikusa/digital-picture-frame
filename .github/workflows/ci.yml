@@ -60,3 +60,4 @@ jobs:
           inputs: |
             .github/workflows/build.yml
             .github/workflows/ci.yml
+            .github/workflows/sign.yml

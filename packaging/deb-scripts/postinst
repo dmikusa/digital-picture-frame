@@ -17,6 +17,172 @@
 
 set -e
 
+# Versioned install layout shared with photo-frame-update. The package seeds
+# one release (sequence 0) so a device always has a known-good app to run and
+# to fall back to; later signed bundles are added under releases/ and selected
+# by flipping the `current` symlink.
+OPT_ROOT=/opt/photo-frame
+RELEASES_DIR="${OPT_ROOT}/releases"
+STAGING_DIR="${OPT_ROOT}/.staging"
+CURRENT_LINK="${OPT_ROOT}/current"
+UPDATE_STATE_DIR=/var/lib/photo-frame/update
+UPDATE_STATE_FILE="${UPDATE_STATE_DIR}/state.json"
+UPDATE_LOG_DIR=/var/log/photo-frame
+BIN_DIR=/usr/bin
+SEED_BINARIES=(photo-frame-manager photo-frame-display photo-frame-update)
+
+log() {
+  echo "photo-frame: $*"
+}
+
+# Debian versions can carry an epoch ("1:0.2.0") or a tilde ("0.2.0~rc1").
+# Neither is a safe release directory name for photo-frame-update, which only
+# accepts [A-Za-z0-9._+-] and must not start with a dot. Map anything else to
+# '-', then cap the length.
+seed_version() {
+  printf '%s' "$1" |
+    sed -e 's/[^A-Za-z0-9._+-]/-/g' -e 's/^\./0./' |
+    cut -c1-64
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+manifest_arch() {
+  local arch="${DPKG_MAINTSCRIPT_ARCH:-}"
+  if [ -z "$arch" ]; then
+    arch="$(uname -m)"
+  fi
+  case "$arch" in
+    aarch64) arch=arm64 ;;
+  esac
+  printf '%s' "$arch"
+}
+
+# Prefer a hardlink: /opt and /usr are on the same filesystem on the device, so
+# the seed release costs no extra SD-card space. Fall back to a copy when they
+# are not. A later package upgrade replaces /usr/bin/<name> by rename, which
+# leaves the seeded inode (and therefore the old release) intact.
+install_binary() {
+  local src="$1"
+  local dest="$2"
+  rm -f "$dest"
+  if ! ln "$src" "$dest" 2>/dev/null; then
+    cp -f "$src" "$dest"
+  fi
+  chmod 0755 "$dest"
+  chown root:root "$dest"
+}
+
+# Create (or refresh) releases/<version> with the packaged binaries and a
+# manifest that matches them. Idempotent: re-running rewrites the same files.
+seed_release() {
+  local version="$1"
+  local dir="${RELEASES_DIR}/${version}"
+  local manifest="${dir}/manifest.json"
+  local tmp="${dir}/manifest.json.tmp"
+  local name
+  local first=1
+
+  mkdir -p "${dir}/bin"
+  chown root:root "$RELEASES_DIR" "$dir" "${dir}/bin"
+  chmod 0755 "$RELEASES_DIR" "$dir" "${dir}/bin"
+
+  for name in "${SEED_BINARIES[@]}"; do
+    install_binary "${BIN_DIR}/${name}" "${dir}/bin/${name}"
+  done
+
+  {
+    printf '{\n'
+    printf '  "format": 1,\n'
+    printf '  "version": "%s",\n' "$version"
+    printf '  "sequence": 0,\n'
+    printf '  "arch": "%s",\n' "$(manifest_arch)"
+    printf '  "min_version": null,\n'
+    printf '  "files": [\n'
+    for name in "${SEED_BINARIES[@]}"; do
+      if [ "$first" -eq 1 ]; then
+        first=0
+      else
+        printf ',\n'
+      fi
+      printf '    {"path": "bin/%s", "sha256": "%s"}' \
+        "$name" "$(sha256_of "${dir}/bin/${name}")"
+    done
+    printf '\n  ]\n'
+    printf '}\n'
+  } >"$tmp"
+  chmod 0644 "$tmp"
+  chown root:root "$tmp"
+  mv -f "$tmp" "$manifest"
+}
+
+# True when state.json is missing or records only packaged seeds: no release
+# has ever been installed by photo-frame-update.
+state_has_no_tool_installs() {
+  [ -f "$UPDATE_STATE_FILE" ] || return 0
+  grep -Eq '"sequence"[[:space:]]*:[[:space:]]*0([^0-9]|$)' "$UPDATE_STATE_FILE" || return 1
+  grep -Eq '"previous"[[:space:]]*:[[:space:]]*null' "$UPDATE_STATE_FILE" || return 1
+  grep -Eq '"pending"[[:space:]]*:[[:space:]]*null' "$UPDATE_STATE_FILE" || return 1
+  return 0
+}
+
+# Resolve the `current` symlink to an absolute path. photo-frame-update always
+# writes a relative `releases/<version>` target, which keeps /opt relocatable.
+resolve_current() {
+  local target
+  target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+  [ -n "$target" ] || return 1
+  case "$target" in
+    /*) printf '%s' "$target" ;;
+    *) printf '%s/%s' "$OPT_ROOT" "$target" ;;
+  esac
+}
+
+# True when the active release has a sequence-0 (packaged seed) manifest.
+current_is_seed_release() {
+  local target
+  target="$(resolve_current)" || return 1
+  [ -f "${target}/manifest.json" ] || return 1
+  grep -Eq '"sequence"[[:space:]]*:[[:space:]]*0([^0-9]|$)' "${target}/manifest.json"
+}
+
+# Atomically point current at releases/<version>: write a temp symlink in the
+# same directory, then rename over the old link. `mv -T` replaces the link
+# itself instead of moving into the directory it points at.
+flip_current() {
+  local version="$1"
+  local tmp="${OPT_ROOT}/.current.$$"
+  rm -f "$tmp"
+  ln -s "releases/${version}" "$tmp"
+  chown -h root:root "$tmp"
+  if ! mv -T "$tmp" "$CURRENT_LINK" 2>/dev/null; then
+    rm -f "$CURRENT_LINK"
+    mv "$tmp" "$CURRENT_LINK"
+  fi
+  chown -h root:root "$CURRENT_LINK"
+}
+
+write_seed_state() {
+  local version="$1"
+  local tmp="${UPDATE_STATE_FILE}.tmp"
+  printf '{\n' >"$tmp"
+  printf '  "current": "%s",\n' "$version" >>"$tmp"
+  printf '  "previous": null,\n' >>"$tmp"
+  printf '  "last_good": "%s",\n' "$version" >>"$tmp"
+  printf '  "pending": null,\n' >>"$tmp"
+  printf '  "sequence": 0\n' >>"$tmp"
+  printf '}\n' >>"$tmp"
+  chmod 0600 "$tmp"
+  chown root:root "$tmp"
+  mv -f "$tmp" "$UPDATE_STATE_FILE"
+}
+
 case "$1" in
   configure)
     # Create the service group explicitly. useradd normally creates a matching
@@ -49,16 +215,76 @@ case "$1" in
       chmod 0600 /etc/photo-frame/config.toml
     fi
 
+    # Update state and the persistent audit log are root-only. The state and
+    # staging directories are created here so the guard unit can rely on them
+    # existing even before the first update.
+    install -d -m 0750 -o root -g root "$UPDATE_LOG_DIR"
+    install -d -m 0700 -o root -g root "$UPDATE_STATE_DIR"
+
+    install -d -m 0755 -o root -g root "$OPT_ROOT"
+    install -d -m 0755 -o root -g root "$RELEASES_DIR"
+    install -d -m 0700 -o root -g root "$STAGING_DIR"
+
+    # The package version is not passed to maintainer scripts, so ask dpkg. The
+    # package name comes from dpkg itself to survive a rename.
+    PKG_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-photo-frame-manager}"
+    PKG_VERSION="$(dpkg-query -W -f='${Version}' "$PKG_NAME" 2>/dev/null || true)"
+    if [ -z "$PKG_VERSION" ]; then
+      PKG_VERSION="0.0.0"
+      log "warning: could not read the version of ${PKG_NAME}; seeding release ${PKG_VERSION}"
+    fi
+    SEED_VERSION="$(seed_version "$PKG_VERSION")"
+    if [ -z "$SEED_VERSION" ]; then
+      SEED_VERSION="0.0.0"
+    fi
+
+    # Always keep the packaged binaries available as a release, even when an
+    # update-tool-managed release stays active below. The .deb still owns
+    # /usr/bin, so manual use and the fallback path keep working.
+    seed_release "$SEED_VERSION"
+
+    # Decide whether this script may repoint `current`:
+    #   - nothing active yet (fresh install, or an install predating this
+    #     layout): seed it;
+    #   - a broken symlink: nothing usable is active, so re-seed it;
+    #   - only packaged seeds so far: advance to the version just installed, so
+    #     plain `apt upgrade` still takes effect;
+    #   - otherwise photo-frame-update owns `current`: never flip it back to the
+    #     packaged version, and never rewrite state.json.
+    manage_current=0
+    if [ ! -e "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
+      manage_current=1
+    elif [ -L "$CURRENT_LINK" ] && [ ! -e "$CURRENT_LINK" ]; then
+      manage_current=1
+    elif state_has_no_tool_installs && current_is_seed_release; then
+      manage_current=1
+    fi
+
+    if [ "$manage_current" -eq 1 ]; then
+      flip_current "$SEED_VERSION"
+      write_seed_state "$SEED_VERSION"
+    else
+      log "keeping the update-managed release active; ${SEED_VERSION} is staged in ${RELEASES_DIR}"
+    fi
+
+    # Convenience entry point: always resolves to the active release.
+    install -d -m 0755 -o root -g root /usr/local/sbin
+    ln -sfn "${CURRENT_LINK}/bin/photo-frame-update" /usr/local/sbin/photo-frame-update
+    chown -h root:root /usr/local/sbin/photo-frame-update
+
     # Reload systemd to pick up new units
     systemctl daemon-reload
 
-    # Enable services to start on boot
+    # Enable services to start on boot. The guard unit is a no-op when there is
+    # no pending update, so it is always safe to enable.
     systemctl enable photo-frame-display.service
     systemctl enable photo-frame-manager.service
+    systemctl enable photo-frame-update-guard.service
 
     # Start services on fresh install
     systemctl start photo-frame-display.service || true
     systemctl start photo-frame-manager.service || true
+    systemctl start photo-frame-update-guard.service || true
     ;;
 
   abort-upgrade|abort-remove|abort-deconfigure)

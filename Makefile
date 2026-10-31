@@ -25,6 +25,7 @@
 #   make c                 - build only the C display app
 #   make rust              - build only the Rust manager (native)
 #   make deb               - build Debian package (requires cargo-deb)
+#   make update-bundle     - build an unsigned app-update bundle (VERSION= SEQUENCE=)
 #   make test              - run all tests (Rust + C in container)
 #   make test-rust         - run Rust tests only
 #   make test-c            - run C build + lint in container (Podman/Docker)
@@ -53,7 +54,13 @@ endif
 CONTAINER := $(shell which podman 2>/dev/null || which docker 2>/dev/null)
 CONTAINER_IMAGE := photo-frame-c-build
 
-.PHONY: all c rust deb test test-rust test-c build-c-container clean install run-display run-manager setup-debian setup-cargo font
+# Signed app-update bundles: make update-bundle VERSION=0.2.0 SEQUENCE=7
+VERSION ?=
+SEQUENCE ?=
+ARCH ?= arm64
+UPDATE_OUT ?= dist/update
+
+.PHONY: all c rust deb update-bundle test test-rust test-c build-c-container clean install run-display run-manager setup-debian setup-cargo font
 
 all: font c rust
 
@@ -79,6 +86,13 @@ rust: font
 deb: font c
 	cargo deb
 
+# Unsigned release bundle plus its sha256sum-format sidecar. Signing is a
+# separate, offline step: scripts/sign-checksum.sh (see docs/updates.md).
+update-bundle: rust c
+	@test -n "$(VERSION)" || { echo "ERROR: VERSION is required, e.g. make update-bundle VERSION=0.2.0 SEQUENCE=7" >&2; exit 1; }
+	@test -n "$(SEQUENCE)" || { echo "ERROR: SEQUENCE is required, e.g. make update-bundle VERSION=0.2.0 SEQUENCE=7" >&2; exit 1; }
+	scripts/build-update-bundle.sh --version "$(VERSION)" --sequence "$(SEQUENCE)" --arch "$(ARCH)" --out "$(UPDATE_OUT)"
+
 test: test-rust test-c
 
 test-rust: font
@@ -95,7 +109,7 @@ build-c-container:
 clean:
 	$(MAKE) -C c clean
 	cargo clean
-	rm -rf $(FONT_DIR)
+	rm -rf $(FONT_DIR) dist
 	-$(CONTAINER) rmi $(CONTAINER_IMAGE) 2>/dev/null || true
 
 install: all

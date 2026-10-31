@@ -28,6 +28,23 @@ A web OAuth callback and the device flow are not supported: the admin UI is plai
 - Debian VM (UTM/QEMU) works too. GPU acceleration helps; without it, Mesa falls back to CPU rendering (llvmpipe) and fades get choppy.
 - Other Linux boards probably work if they have DRM/GBM/EGL support and a Mesa driver. Hardware acceleration helps a lot at 1080p.
 
+## Updates
+
+Application updates use signed release bundles and `photo-frame-update`. The
+`.deb` seeds the first release under `/opt/photo-frame/releases`; later releases
+are verified against Ed25519 keys compiled into the updater, unpacked into a new
+release directory, and activated by flipping a `current` symlink. A health check
+waits 30 seconds for both services and both sockets, and
+`photo-frame-update-guard.service` confirms or rolls back an unconfirmed release
+on the next boot. The OS is not part of a bundle: Debian security fixes come from
+`unattended-upgrades`, and the kernel and firmware are updated by hand about
+twice a year over a VPN.
+
+Signing is a manual GitHub Actions workflow that signs the release checksums. See
+[docs/updates.md](docs/updates.md) for the bundle layout, commands, signing and
+key rotation, the release process, the remote access policy, and recovery
+procedures.
+
 ## How it fits together
 
 ```mermaid
@@ -185,6 +202,7 @@ photo-frame/
 - [docs/running.md](docs/running.md) — How to run the apps locally.
 - [docs/config.md](docs/config.md) — Configuration reference.
 - [docs/deployment.md](docs/deployment.md) — DietPi setup, packaging, and installation.
+- [docs/updates.md](docs/updates.md) — Signed update bundles, signing keys, rotation, and OS/kernel policy.
 - [docs/google-drive-setup.md](docs/google-drive-setup.md) — Private Drive setup with a service account.
 - [docs/testing.md](docs/testing.md) — Test commands and methodology.
 

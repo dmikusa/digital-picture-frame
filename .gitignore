@@ -1,4 +1,5 @@
 /target
+/dist
 c/*.o
 c/photo-frame-display
 c/photo-frame-display-client

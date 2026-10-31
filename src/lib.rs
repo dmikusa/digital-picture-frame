@@ -24,3 +24,4 @@ pub mod import;
 pub mod index;
 pub mod logger;
 pub mod qr;
+pub mod update;

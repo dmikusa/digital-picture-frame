@@ -1,0 +1,27 @@
+[Unit]
+Description=Photo Frame Update Guard
+# Runs on every boot after the app services. With no pending update in
+# /var/lib/photo-frame/update/state.json the guard is a no-op, so it is always
+# safe to include. When a previous install was activated but never confirmed
+# (power loss, or a release that could not start), it confirms or reverts it.
+After=photo-frame-manager.service photo-frame-display.service
+Wants=photo-frame-manager.service photo-frame-display.service
+
+[Service]
+Type=oneshot
+# grace-seconds lets the fresh release settle before the health check. The
+# health check itself waits for both sockets, so a slow display start is fine.
+ExecStart=/opt/photo-frame/current/bin/photo-frame-update guard --grace-seconds 30
+# Grace period plus the health-check timeout plus service restarts on revert.
+TimeoutStartSec=180
+User=root
+Group=root
+UMask=0077
+# Minimal hardening: the guard writes only under /opt/photo-frame and
+# /var/{lib,log}/photo-frame, and talks to systemd over its socket.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

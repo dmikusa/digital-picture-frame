@@ -5,7 +5,9 @@ Wants=photo-frame-display.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/photo-frame-manager /etc/photo-frame/config.toml
+# Runs whichever release /opt/photo-frame/current points at. A normal update
+# only flips that symlink, so this unit does not change.
+ExecStart=/opt/photo-frame/current/bin/photo-frame-manager /etc/photo-frame/config.toml
 Restart=on-failure
 User=photo-frame
 # NOTE: /run/photo-frame is created and owned by photo-frame-display.service.
