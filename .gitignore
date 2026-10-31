@@ -6,3 +6,6 @@ c/photo-frame-display-client
 c/test_display_logic
 c/test_logger
 /fonts
+
+# Update signing private keys must never be committed.
+update-signing-*.pem

@@ -47,9 +47,8 @@ CI builds the same bundle for the `arm64` release and uploads it to the draft
 release; the local target is for testing. Bundles are unsigned by design. Sign
 the sidecar with `scripts/sign-checksum.sh`; production releases sign it in the
 protected `release-signing` GitHub environment. A device only accepts a bundle
-signed by a key pinned in `src/update/keys.rs` (`TRUSTED_KEYS`, empty in this
-repo until the owner adds theirs). See `docs/updates.md` for the full release
-checklist.
+signed by a key in `packaging/update-keys/*.pub` (empty in this repo until the
+owner adds theirs). See `docs/updates.md` for the full release checklist.
 
 ## Debian VM with GPU acceleration (UTM/QEMU)
 
