@@ -451,6 +451,18 @@ CI builds both the `.deb` packages and the arm64 update bundle, and creates or
 updates the draft release. The only manual gates are triggering the version bump,
 signing the checksums, and publishing the draft.
 
+### Release checklist at a glance
+
+1. Run **Actions → Bump version** and enter the next `X.Y.Z`.
+2. Let the bump PR pass CI and auto-merge.
+3. Wait for **Build and Release** to build the `.deb` files and arm64 bundle,
+   and to create or update the draft release `vX.Y.Z`.
+4. Run **Sign Release Checksums** for `vX.Y.Z` and approve the
+   `release-signing` environment.
+5. Review and test the draft, then publish it.
+
+The rest of this section explains each step.
+
 The release tag and `Cargo.toml` use `X.Y.Z`. Builds use
 `X.Y.Z-<short-sha>`:
 
