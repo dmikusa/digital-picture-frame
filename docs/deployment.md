@@ -124,13 +124,13 @@ Pre-built `.deb` packages are available from GitHub Releases for both `amd64` an
 
 ### Install
 
-1. Download the `.deb` for your architecture from the latest draft release.
+1. Download the `.deb` for your architecture from the latest published release.
 2. Install it:
    ```bash
    sudo dpkg -i photo-frame_*.deb
    ```
 3. The package installs and starts these systemd services:
-|||||||   - `photo-frame-display.service` — the C DRM display app
+   - `photo-frame-display.service` — the C DRM display app
    - `photo-frame-manager.service` — the Rust manager
    - `photo-frame-update-guard.service` — oneshot boot guard for app updates.
      It is a no-op unless an update was activated and never confirmed, in which
@@ -149,9 +149,9 @@ The services run from `/opt/photo-frame/current`, not from `/usr/bin`:
 /var/log/photo-frame/update.log
 ```
 
-`postinst` seeds `releases/<package-version>` from the packaged binaries and
-records it as sequence `0`. Signed release bundles add new directories and move
-the `current` symlink; the `.deb` never removes them. On upgrade the package
+`postinst` seeds `releases/<package-version>-seed` from the packaged binaries
+and records it as sequence `0`. Signed release bundles add new directories and
+move the `current` symlink; the `.deb` never removes them. On upgrade the package
 leaves an update-managed `current` alone and only stages its own release in
 `releases/`, so `apt upgrade` cannot roll back a newer installed release.
 
@@ -162,7 +162,7 @@ Signing keys: `photo-frame-update` contains an empty trusted-key list
 (`src/update/keys.rs`, `TRUSTED_KEYS`), so every install is refused until the
 owner pins their Ed25519 public key and rebuilds. See `docs/updates.md` for key
 custody, bundle signing, and rotation.
-|||||||
+
 ### Updates
 
 The `.deb` is the initial install path and seeds a release at sequence 0. After

@@ -9,13 +9,69 @@ permissions:
 
 concurrency:
   group: release
-  cancel-in-progress: true
+  # Queue rather than cancel. Cancelling a run in flight can leave a draft
+  # release partly updated, and can kill the release job midway through
+  # replacing its assets. Only one run waits at a time.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.state.outputs.publish }}
+      base: ${{ steps.version.outputs.base }}
+      full: ${{ steps.version.outputs.full }}
+      sequence: ${{ steps.version.outputs.sequence }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute version
+        id: version
+        run: |
+          git config --global --add safe.directory "$(pwd)"
+          BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//; s/".*//')
+          COMMIT=$(git rev-parse --short HEAD)
+
+          if [[ ! "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Cargo.toml version '$BASE_VERSION' is not semver (X.Y.Z)"
+            exit 1
+          fi
+
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          SEQUENCE=$((10#$MAJOR * 1000000 + 10#$MINOR * 1000 + 10#$PATCH))
+
+          echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "full=${BASE_VERSION}-${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "sequence=${SEQUENCE}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version is already published
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_VERSION: ${{ steps.version.outputs.base }}
+        run: |
+          TAG="v${BASE_VERSION}"
+          IS_DRAFT=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo "")
+
+          if [ "$IS_DRAFT" = "false" ]; then
+            echo "$TAG is already published, nothing to build"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$TAG is not published yet, building"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
     permissions:
       contents: read
       actions: write
@@ -48,21 +104,12 @@ jobs:
             pkg-config \
             unzip
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download font
         run: make font
-
-      - name: Compute version
-        id: version
-        run: |
-          git config --global --add safe.directory "$(pwd)"
-          BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//; s/".*//')
-          COMMIT=$(git rev-parse --short HEAD)
-          echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "full=${BASE_VERSION}-${COMMIT}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         run: |
@@ -86,14 +133,14 @@ jobs:
 
       - name: Build .deb package
         env:
-          FULL_VERSION: ${{ steps.version.outputs.full }}
+          FULL_VERSION: ${{ needs.check.outputs.full }}
         run: |
           . "$HOME/.cargo/env"
           cargo deb --deb-version "$FULL_VERSION"
 
       - name: Rename .deb with architecture
         env:
-          FULL_VERSION: ${{ steps.version.outputs.full }}
+          FULL_VERSION: ${{ needs.check.outputs.full }}
           ARCH: ${{ matrix.arch }}
         run: |
           SRC=$(ls target/debian/*.deb | head -n1)
@@ -101,43 +148,96 @@ jobs:
           mv "$SRC" "$DEST"
           echo "Built: $DEST"
 
-      - name: Upload artifact
+      - name: Build update bundle
+        if: matrix.arch == 'arm64'
+        env:
+          FULL_VERSION: ${{ needs.check.outputs.full }}
+          SEQUENCE: ${{ needs.check.outputs.sequence }}
+        run: |
+          bash scripts/build-update-bundle.sh \
+            --version "$FULL_VERSION" \
+            --sequence "$SEQUENCE" \
+            --arch arm64 \
+            --out target/update
+
+      - name: Upload .deb artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: deb-${{ matrix.arch }}
           path: target/debian/*.deb
 
+      - name: Upload update bundle artifact
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: update-bundle-arm64
+          path: |
+            target/update/*.tar.gz
+            target/update/*.sha256
+
   release:
-    needs: build
+    needs: [check, build]
+    if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Compute version
-        id: version
-        run: |
-          BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//; s/".*//')
-          COMMIT=$(git rev-parse --short HEAD)
-          echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "full=${BASE_VERSION}-${COMMIT}" >> "$GITHUB_OUTPUT"
-
-      - name: Download artifacts
+      - name: Download .deb artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           pattern: deb-*
           merge-multiple: true
 
-      - name: Upload artifacts to release
+      - name: Download update bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          pattern: update-bundle-arm64
+          merge-multiple: true
+
+      - name: Create or update draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BASE_VERSION: ${{ steps.version.outputs.base }}
+          BASE_VERSION: ${{ needs.check.outputs.base }}
+          FULL_VERSION: ${{ needs.check.outputs.full }}
         run: |
           TAG="v${BASE_VERSION}"
-          echo "Uploading artifacts to release $TAG"
-          gh release upload "$TAG" artifacts/*.deb --clobber
+
+          {
+            echo "Release ${TAG}"
+            echo ""
+            echo "Built from \`${FULL_VERSION}\`."
+            echo ""
+            echo "Assets:"
+            echo "- Debian packages for amd64 and arm64"
+            echo "- App update bundle and checksum"
+            echo ""
+            echo "Run the **Sign Release Checksums** workflow before publishing."
+          } > notes.md
+
+          STATE=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo "")
+          if [ "$STATE" = "true" ]; then
+            echo "Updating existing draft release $TAG"
+            # Draft assets are rebuilt from scratch for each main push, so
+            # remove the previous build's assets instead of accumulating them.
+            while IFS= read -r asset; do
+              [ -n "$asset" ] || continue
+              gh release delete-asset "$TAG" "$asset" --yes
+            done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+            gh release edit "$TAG" --title "photo-frame ${TAG}" --notes-file notes.md
+            gh release upload "$TAG" artifacts/* --clobber
+          elif [ -z "$STATE" ]; then
+            echo "Creating draft release $TAG"
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" \
+              --title "photo-frame ${TAG}" \
+              --notes-file notes.md
+            gh release upload "$TAG" artifacts/* --clobber
+          else
+            echo "Release $TAG is already published, leaving it alone"
+          fi

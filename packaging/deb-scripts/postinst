@@ -233,9 +233,13 @@ case "$1" in
       PKG_VERSION="0.0.0"
       log "warning: could not read the version of ${PKG_NAME}; seeding release ${PKG_VERSION}"
     fi
-    SEED_VERSION="$(seed_version "$PKG_VERSION")"
+    # The -seed suffix keeps the packaged release directory distinct from a
+    # signed update bundle built from the same commit. Without it, installing
+    # the bundle for the version already seeded by the .deb would collide with
+    # the existing releases/<version> directory.
+    SEED_VERSION="$(seed_version "${PKG_VERSION}-seed")"
     if [ -z "$SEED_VERSION" ]; then
-      SEED_VERSION="0.0.0"
+      SEED_VERSION="0.0.0-seed"
     fi
 
     # Always keep the packaged binaries available as a release, even when an

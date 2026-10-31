@@ -37,11 +37,18 @@ complexity.
 ## Versioning Strategy
 
 - The source of truth is `version` in `Cargo.toml` (currently `0.1.0`).
-- You manually bump this when starting a new release cycle.
+- `bump-version.yml` is a manual workflow that opens a PR for the next version and
+  enables squash auto-merge. It updates `Cargo.toml` and the root package entry
+  in `Cargo.lock`.
 - CI appends the 7-character git commit hash: `0.1.0-abc1234`.
 - CI uses `cargo deb --deb-version 0.1.0-abc1234` — no `Cargo.toml` mutation needed.
-- Humans create releases with tags matching `v${BASE_VERSION}` (e.g., `v0.1.0`).
-- CI uploads built artifacts to the existing release. CI never creates or deletes releases.
+- The release tag is `v${BASE_VERSION}` (e.g., `v0.1.0`). CI creates the tag and
+  draft release when the first build for that version runs.
+- The update bundle uses the same full version (`0.1.0-abc1234`) and derives its
+  anti-rollback sequence from the semver parts:
+  `major * 1_000_000 + minor * 1_000 + patch`.
+- Once `v${BASE_VERSION}` is published, pushes at that version build nothing.
+  Bump the version to start the next release.
 
 ## Workflows
 
@@ -56,13 +63,28 @@ complexity.
 
 Runs on `ubuntu-latest` (amd64 only — sufficient for Rust tests).
 
-### 2. `build.yml`
+### 2. `bump-version.yml`
+
+**Trigger:** manual `workflow_dispatch` with a `version` input.
+
+Validates semver and that the new version is greater than the current one, bumps
+`Cargo.toml`, syncs the root package in `Cargo.lock`, pushes
+`bump-version-<version>`, opens a PR labeled `dependencies`, and enables squash
+auto-merge. It uses `RENOVATE_TOKEN` so the merge triggers `build.yml`.
+
+### 3. `build.yml`
 
 **Triggers:** `push` to `main` only
 
+**Check job:**
+1. Compute base version, full version (`base-<short-sha>`), and update sequence
+   from the semver parts.
+2. If `v${BASE_VERSION}` is already published, skip the build. A draft or
+   missing release builds.
+
 **Matrix:**
 - Job A: `ubuntu-22.04` → amd64 `.deb`
-- Job B: `ubuntu-22.04-arm` → arm64 `.deb`
+- Job B: `ubuntu-22.04-arm` → arm64 `.deb` and the arm64 update bundle
 
 **Steps per job:**
 1. Install system deps: `build-essential`, `pkg-config`, `libdrm-dev`,
@@ -73,15 +95,19 @@ Runs on `ubuntu-latest` (amd64 only — sufficient for Rust tests).
 5. Build Rust manager: `cargo build --release --locked`
 6. Install `cargo-deb`
 7. Build `.deb`: `cargo deb --deb-version $FULL_VERSION`
-8. Upload `.deb` as artifact
+8. On arm64, build the update bundle:
+   `scripts/build-update-bundle.sh --version $FULL_VERSION --sequence $SEQUENCE`
+9. Upload `.deb` and, on arm64, the bundle + `.sha256` as artifacts
 
-**Release job (depends on both matrix jobs):**
-1. Download both `.deb` artifacts
-2. Compute base version from `Cargo.toml`
-3. Upload both `.deb` files to the existing release matching `v${BASE_VERSION}`
+**Release job (depends on check and both matrix jobs):**
+1. Download the `.deb` artifacts and the update bundle.
+2. Create the draft release `v${BASE_VERSION}` if it does not exist.
+3. If it is already a draft, delete its old assets and replace them with this
+   build's assets.
+4. Leave a published release alone.
 
-**Concurrency:** `group: release`, `cancel-in-progress: true` — prevents race conditions
-when multiple commits land on `main` in quick succession.
+**Concurrency:** `group: release`, `cancel-in-progress: false` — queues builds so
+an in-flight run cannot be interrupted while updating a draft release.
 
 ## Packaging
 
@@ -225,6 +251,8 @@ prevent the token from being persisted in the git config.
   workflows/
     ci.yml
     build.yml
+    bump-version.yml
+    sign.yml
 packaging/
   photo-frame-display.service
   photo-frame-manager.service

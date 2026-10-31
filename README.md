@@ -40,7 +40,8 @@ on the next boot. The OS is not part of a bundle: Debian security fixes come fro
 `unattended-upgrades`, and the kernel and firmware are updated by hand about
 twice a year over a VPN.
 
-Signing is a manual GitHub Actions workflow that signs the release checksums. See
+CI builds the `.deb` packages and the arm64 update bundle, and opens the draft
+release. Signing is still a manual, protected GitHub Actions workflow. See
 [docs/updates.md](docs/updates.md) for the bundle layout, commands, signing and
 key rotation, the release process, the remote access policy, and recovery
 procedures.

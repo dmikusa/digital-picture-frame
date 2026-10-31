@@ -43,11 +43,13 @@ bundle at `dist/update/photo-frame-0.2.0-arm64.tar.gz` plus a `sha256sum`-format
 depends on the normal Rust and C builds and calls
 `scripts/build-update-bundle.sh`.
 
-Bundles are unsigned by design. Sign the sidecar with
-`scripts/sign-checksum.sh`; production releases sign it in the protected
-`release-signing` GitHub environment. A device only accepts a bundle signed by a
-key pinned in `src/update/keys.rs` (`TRUSTED_KEYS`, empty in this repo until the
-owner adds theirs). See `docs/updates.md` for the full release checklist.
+CI builds the same bundle for the `arm64` release and uploads it to the draft
+release; the local target is for testing. Bundles are unsigned by design. Sign
+the sidecar with `scripts/sign-checksum.sh`; production releases sign it in the
+protected `release-signing` GitHub environment. A device only accepts a bundle
+signed by a key pinned in `src/update/keys.rs` (`TRUSTED_KEYS`, empty in this
+repo until the owner adds theirs). See `docs/updates.md` for the full release
+checklist.
 
 ## Debian VM with GPU acceleration (UTM/QEMU)
 

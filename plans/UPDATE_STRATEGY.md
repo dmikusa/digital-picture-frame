@@ -643,9 +643,10 @@ One signing key, used by one manual workflow.
 
 The signing workflow is manual: `workflow_dispatch` with a release-tag input,
 the `release-signing` environment, and `contents: write` only in that job. There
-is no automatic build→sign chain in the repository, and `.github/workflows/build.yml`
-still only produces `.deb` packages. See `docs/updates.md` for the release steps
-and the environment setup.
+is no automatic sign→publish chain. `.github/workflows/build.yml` builds the
+`.deb` packages and the arm64 update bundle, then creates or updates the draft
+release. Signing the checksums and publishing the draft stay manual. See
+`docs/updates.md` for the release steps and the environment setup.
 
 CI signing means **CI is the build-integrity trust anchor**. The signature proves
 the artifact came through the release process; it does not prove the process was
@@ -993,17 +994,17 @@ Not scheduled. Kept here only so the analysis is not lost.
 - **Transports:** a local path (sidecars required in the same directory, optional
   `--sha256`) and an HTTPS URL (required `--sha256`; plain HTTP and HTTPS-to-HTTP
   redirects refused).
-- **CI signing:** the `.github/workflows/sign.yml` workflow is manual
-  (`workflow_dispatch` with a release tag), runs in the `release-signing`
-  environment, signs every `*.sha256` asset with
-  `scripts/sign-checksum.sh`, and uploads the `*.sha256.sig` files. The sign job
-  has `contents: write`; there is no automatic build→sign→publish chain, and
-  `build.yml` still only builds `.debs`. The owner must build and upload the
-  bundle and checksum before signing. CI is the build-integrity trust anchor, and
-  a compromised build or merged commit can produce a validly signed malicious
-  artifact; the protected environment limits the blast radius but does not remove
-  that risk. KMS, an HSM, or a self-hosted signing runner is a possible later
-  hardening step.
+- **CI build and signing:** `.github/workflows/build.yml` builds the `.deb`
+  packages and the arm64 update bundle, then creates or updates the draft
+  release. `.github/workflows/sign.yml` is manual (`workflow_dispatch` with a
+  release tag), runs in the `release-signing` environment, signs every
+  `*.sha256` asset with `scripts/sign-checksum.sh`, and uploads the
+  `*.sha256.sig` files. The sign job has `contents: write`. There is no automatic
+  sign→publish chain. CI is the build-integrity trust anchor, and a compromised
+  build or merged commit can produce a validly signed malicious artifact; the
+  protected environment limits the blast radius but does not remove that risk.
+  KMS, an HSM, or a self-hosted signing runner is a possible later hardening
+  step.
 - **Rotation** adds a key to the updater and rebuilds it, ships that build in a
   release signed by the old key, keeps both during an overlap, then removes the
   old key in a later release signed by the new key. No expiry. Key loss leaves
