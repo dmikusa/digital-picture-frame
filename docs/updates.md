@@ -136,9 +136,6 @@ public key; the updater requires that key to exactly match one in
 deliberate: the signature authenticates the checksum, and the checksum
 authenticates the tarball, so all three files are required.
 
-Older bundles that use the original JSON envelope
-`{"key_id":"…","signature":"…"}` are still accepted.
-
 Extraction and parsing have hard caps and an allowlist:
 
 | Limit | Value |
@@ -432,6 +429,24 @@ The script reads the OpenSSH private key from the environment only, runs
 `ssh-keygen -Y sign -n photo-frame-update`, requires the key to be usable
 without an interactive passphrase, and writes the armored SSH signature with
 mode 0600. The output is `photo-frame-0.2.0-arm64.tar.gz.sha256.sig`.
+
+Test the exact CI path locally before storing the key. This fails immediately if
+the key requires a passphrase:
+
+```bash
+printf 'test\n' > /tmp/checksum.sha256
+UPDATE_SIGNING_KEY="$(cat update-signing-2026-10)" \
+  scripts/sign-checksum.sh /tmp/checksum.sha256 /tmp/checksum.sha256.sig
+```
+
+You can also check the key without signing:
+
+```bash
+ssh-keygen -y -P '' -f update-signing-2026-10 >/dev/null
+```
+
+If that fails with `incorrect passphrase supplied to decrypt private key`, use a
+passphrase-free copy for the CI secret or a signing runner with an SSH agent.
 
 There is no separate verify-only command. The same verification path runs at the
 start of `install`; to exercise a signature without touching the real install,

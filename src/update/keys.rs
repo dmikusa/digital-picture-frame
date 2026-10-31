@@ -34,8 +34,8 @@
 /// A pinned update-signing public key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedKey {
-    /// Short stable identifier, matched against the `key_id` in the signature
-    /// envelope (for example a year and month).
+    /// Short stable identifier, taken from the public key filename (for
+    /// example a year and month).
     pub id: &'static str,
     /// Raw 32-byte Ed25519 public key.
     pub bytes: [u8; 32],

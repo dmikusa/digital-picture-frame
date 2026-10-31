@@ -26,7 +26,7 @@ use crate::update::checksum::{
     normalize_sha256, parse_sidecar, read_small, sha256_file, verify_sha256,
 };
 use crate::update::health::{restart_services, HealthCheck, Services};
-use crate::update::signature::{verify_signature, MAX_SIGNATURE_ENVELOPE_BYTES};
+use crate::update::signature::{verify_signature, MAX_SIGNATURE_BYTES};
 use crate::update::state::{sync_dir, Pending, State};
 use crate::update::{compare_versions, is_safe_version, Paths, Result, TrustedKey, UpdateError};
 use chrono::{SecondsFormat, Utc};
@@ -826,11 +826,7 @@ fn fetch_local(
     let sidecar_path = path_with_suffix(&path, ".sha256");
     let signature_path = path_with_suffix(&path, ".sha256.sig");
     let sidecar_bytes = read_small(&sidecar_path, MAX_SIDECAR_BYTES, "checksum sidecar")?;
-    let signature_bytes = read_small(
-        &signature_path,
-        MAX_SIGNATURE_ENVELOPE_BYTES,
-        "signature envelope",
-    )?;
+    let signature_bytes = read_small(&signature_path, MAX_SIGNATURE_BYTES, "signature file")?;
     let verified = verify_signature(trusted_keys, &sidecar_bytes, &signature_bytes)?;
     let sidecar = parse_sidecar(&sidecar_bytes)?;
 
@@ -893,8 +889,8 @@ fn fetch_remote(
     let signature_bytes = fetch_small(
         &client,
         &url_with_suffix(&url, ".sha256.sig"),
-        MAX_SIGNATURE_ENVELOPE_BYTES,
-        "signature envelope",
+        MAX_SIGNATURE_BYTES,
+        "signature file",
     )?;
     let verified = verify_signature(trusted_keys, &sidecar_bytes, &signature_bytes)?;
     let sidecar = parse_sidecar(&sidecar_bytes)?;
@@ -1204,11 +1200,12 @@ mod tests {
     use crate::update::archive::{Manifest, ManifestFile, REQUIRED_BINARIES};
     use crate::update::checksum::sha256_hex;
     use crate::update::keys::TrustedKey;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
     use tar::{Builder, Header};
 
@@ -1230,6 +1227,60 @@ mod tests {
 
     fn keys_of(key: &TestKey) -> &[TrustedKey] {
         std::slice::from_ref(&key.trusted)
+    }
+
+    fn push_ssh_string(buffer: &mut Vec<u8>, value: &[u8]) {
+        buffer.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        buffer.extend_from_slice(value);
+    }
+
+    fn ssh_public_key_blob(key: &[u8; 32]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        push_ssh_string(&mut blob, b"ssh-ed25519");
+        push_ssh_string(&mut blob, key);
+        blob
+    }
+
+    fn ssh_signature_blob(signature: &[u8]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        push_ssh_string(&mut blob, b"ssh-ed25519");
+        push_ssh_string(&mut blob, signature);
+        blob
+    }
+
+    fn armor_ssh_signature(blob: &[u8]) -> Vec<u8> {
+        let encoded = STANDARD.encode(blob);
+        let mut out = String::from("-----BEGIN SSH SIGNATURE-----\n");
+        for chunk in encoded.as_bytes().chunks(70) {
+            out.push_str(std::str::from_utf8(chunk).unwrap());
+            out.push('\n');
+        }
+        out.push_str("-----END SSH SIGNATURE-----\n");
+        out.into_bytes()
+    }
+
+    fn sign_ssh(key: &TestKey, message: &[u8]) -> Vec<u8> {
+        let digest = Sha256::digest(message);
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(b"SSHSIG");
+        push_ssh_string(&mut signed_data, b"photo-frame-update");
+        push_ssh_string(&mut signed_data, b"");
+        push_ssh_string(&mut signed_data, b"sha256");
+        push_ssh_string(&mut signed_data, &digest);
+        let signature = key.signing.sign(&signed_data);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"SSHSIG");
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        push_ssh_string(
+            &mut payload,
+            &ssh_public_key_blob(&key.signing.verifying_key().to_bytes()),
+        );
+        push_ssh_string(&mut payload, b"photo-frame-update");
+        push_ssh_string(&mut payload, b"");
+        push_ssh_string(&mut payload, b"sha256");
+        push_ssh_string(&mut payload, &ssh_signature_blob(&signature.to_bytes()));
+        armor_ssh_signature(&payload)
     }
 
     struct TestBundle {
@@ -1299,13 +1350,8 @@ mod tests {
         let sidecar = format!("{}  {}\n", bundle_hash, filename);
         fs::write(path_with_suffix(&bundle_path, ".sha256"), &sidecar).unwrap();
 
-        let signature = key.signing.sign(sidecar.as_bytes());
-        let envelope = serde_json::to_vec(&serde_json::json!({
-            "key_id": key.trusted.id,
-            "signature": URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-        }))
-        .unwrap();
-        fs::write(path_with_suffix(&bundle_path, ".sha256.sig"), envelope).unwrap();
+        let signature = sign_ssh(key, sidecar.as_bytes());
+        fs::write(path_with_suffix(&bundle_path, ".sha256.sig"), signature).unwrap();
 
         TestBundle { path: bundle_path }
     }
