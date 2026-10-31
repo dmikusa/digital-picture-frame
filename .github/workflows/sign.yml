@@ -6,9 +6,9 @@ name: Sign Release Checksums
 # docs/updates.md.
 #
 # It downloads each `*.sha256` asset from an existing release, signs the exact
-# bytes with the offline-style Ed25519 key held in the environment secret, and
-# uploads the `<bundle>.sha256.sig` envelope next to it. photo-frame-update
-# fetches `<bundle>.sha256` and `<bundle>.sha256.sig` from the same location.
+# bytes with the Ed25519 key held in the environment secret, and uploads the
+# `<bundle>.sha256.sig` envelope next to it. photo-frame-update fetches
+# `<bundle>.sha256` and `<bundle>.sha256.sig` from the same location.
 
 on:
   workflow_dispatch:

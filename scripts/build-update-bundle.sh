@@ -28,8 +28,8 @@
 #   photo-frame-<version>-<arch>.tar.gz.sha256   (sha256sum format)
 #
 # This script does not sign anything and holds no key material. Sign the
-# .sha256 file with scripts/sign-checksum.sh on a machine that holds the
-# Ed25519 private key; see docs/updates.md.
+# .sha256 file with scripts/sign-checksum.sh in the protected signing
+# environment (or on a test machine with a test key); see docs/updates.md.
 
 set -euo pipefail
 

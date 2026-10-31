@@ -87,7 +87,8 @@ deb: font c
 	cargo deb
 
 # Unsigned release bundle plus its sha256sum-format sidecar. Signing is a
-# separate, offline step: scripts/sign-checksum.sh (see docs/updates.md).
+# separate step: scripts/sign-checksum.sh or the release-signing workflow
+# (see docs/updates.md).
 update-bundle: rust c
 	@test -n "$(VERSION)" || { echo "ERROR: VERSION is required, e.g. make update-bundle VERSION=0.2.0 SEQUENCE=7" >&2; exit 1; }
 	@test -n "$(SEQUENCE)" || { echo "ERROR: SEQUENCE is required, e.g. make update-bundle VERSION=0.2.0 SEQUENCE=7" >&2; exit 1; }
