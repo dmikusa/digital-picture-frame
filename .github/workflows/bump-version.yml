@@ -1,0 +1,100 @@
+name: Bump version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New version (e.g. 0.2.0)
+        required: true
+        type: string
+
+# The default GITHUB_TOKEN cannot be used for this job. It is refused by the
+# repository's "Allow GitHub Actions to create and approve pull requests"
+# setting, and a merge it performs is attributed to github-actions[bot], whose
+# pushes do not trigger the build workflow. A PAT is used instead so the merge
+# fires build.yml.
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No `token:` on purpose. Checkout falls back to the job's read-only
+          # GITHUB_TOKEN, so the PAT is never written to disk as a git
+          # credential. The push is authenticated by `gh auth setup-git` below.
+          persist-credentials: false
+
+      - name: Configure git credentials
+        env:
+          GH_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+        # Records a credential helper in the runner's global git config. The
+        # token is not written anywhere: the helper reads GH_TOKEN from the
+        # environment when git asks it to authenticate.
+        run: gh auth setup-git
+
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: version '$VERSION' does not match semver (X.Y.Z)"
+            exit 1
+          fi
+
+          CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//; s/".*//')
+          CURRENT_MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          CURRENT_MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          CURRENT_PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          CURRENT_NUM=$((CURRENT_MAJOR * 1000000 + CURRENT_MINOR * 1000 + CURRENT_PATCH))
+
+          NEW_MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          NEW_MINOR=$(echo "$VERSION" | cut -d. -f2)
+          NEW_PATCH=$(echo "$VERSION" | cut -d. -f3)
+          NEW_NUM=$((NEW_MAJOR * 1000000 + NEW_MINOR * 1000 + NEW_PATCH))
+
+          if [ "$NEW_NUM" -le "$CURRENT_NUM" ]; then
+            echo "Error: new version '$VERSION' must be greater than current version '$CURRENT'"
+            exit 1
+          fi
+
+          echo "Valid: ${CURRENT} → ${VERSION}"
+
+      - name: Bump version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          echo "Bumped to ${VERSION}"
+
+      - name: Update Cargo.lock
+        # Sync only the root package's entry. `cargo generate-lockfile`
+        # re-resolves the whole dependency graph instead of honouring the
+        # existing pins, which sweeps every pending upgrade into the version
+        # bump commit.
+        run: cargo update -p photo-frame-manager
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          BRANCH="bump-version-${VERSION}"
+          # Author the commit as the PAT's owner, so the commit, the pull
+          # request and the merge all show the same identity instead of a bot
+          # commit landing under a human's merge.
+          AUTHOR=$(gh api user --jq .login)
+          AUTHOR_ID=$(gh api user --jq .id)
+          git config user.name "$AUTHOR"
+          git config user.email "${AUTHOR_ID}+${AUTHOR}@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${VERSION}"
+          git push origin "$BRANCH"
+          PR_URL=$(gh pr create \
+            --title "chore: bump version to ${VERSION}" \
+            --body "Version bump triggered manually." \
+            --label dependencies)
+          gh pr merge --auto --squash "$PR_URL"

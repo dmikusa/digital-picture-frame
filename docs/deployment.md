@@ -28,7 +28,7 @@ This step is for optional partitioning of the SDcard. You do not have to do this
 It's important to do this before booting, because on first boot the DietPi scripts that run will expand your rootfs to consume the full SDcard.
 
 To do this, mount the SD card's `ext4` partition on another computer and delete the resize symlink. This is easiest on a Linux system.
-  
+
 ```bash
 rm <mount>/etc/systemd/system/local-fs.target.wants/dietpi-fs_partition_resize.service
 ```
@@ -53,7 +53,7 @@ These are first-time only steps you need to run to setup the device.
 5. Login as the `dietpi` user. It will run a one-time startup script. Let it do that. This includes updating `apt` and the software on the device, so it might take a little time.
 
 If you removed the resize script, you have one more step which is to resize the root partition and create the partition for your photos.
-  
+
 ```bash
 sudo parted /dev/mmcblk0
 # (parted) resizepart 2 1600MB
@@ -117,7 +117,7 @@ The `photo-frame-update-guard` service is a no-op unless an update was activated
 
 ### Updates
 
-The `.deb` you originally installed is just the initial install path and seeds a release at sequence 0. After that, application updates use signed release bundles and the `photo-frame-update` tool, rather than `dpkg`. The tool verifies the signature and checksums, unpacks into
+The `.deb` you originally installed is just the initial install path. It seeds `releases/<package-version>-seed` at sequence 0. After that, application updates use signed release bundles and the `photo-frame-update` tool, rather than `dpkg`. The tool verifies the signature and checksums, unpacks into
 `/opt/photo-frame/releases/<version>`, flips the `current` symlink, and rolls back if the new version fails its 30-second health check. A later `.deb` upgrade stages its own release but does not move an update-managed `current` backwards.
 
 The `photo-frame-update-guard.service` service runs after the app services on every boot and confirms or reverts a release that was activated but never confirmed. OS packages, the kernel, and firmware are handled separately with `apt`. You may do these at your convenience.

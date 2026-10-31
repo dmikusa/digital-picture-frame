@@ -257,6 +257,6 @@ echo "bundle:   ${OUT_DIR}/${BUNDLE_NAME}"
 echo "checksum: ${OUT_DIR}/${BUNDLE_NAME}.sha256"
 cat "${OUT_DIR}/${BUNDLE_NAME}.sha256"
 echo
-echo "Unsigned. Sign the checksum with the offline update key:"
+echo "Unsigned. Sign the checksum in the release-signing workflow, or with a test key:"
 echo "  UPDATE_SIGNING_KEY=... UPDATE_SIGNING_KEY_ID=... \\"
 echo "    scripts/sign-checksum.sh ${OUT_DIR}/${BUNDLE_NAME}.sha256 ${OUT_DIR}/${BUNDLE_NAME}.sha256.sig"

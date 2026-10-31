@@ -447,22 +447,34 @@ point the tool at a throwaway root and state directory with `--root`,
 
 ## 6. Cutting, building, and signing a release
 
-The release process is split between GitHub Actions and manual steps. CI builds
-and uploads the `.deb` packages; the update bundle and its signature are manual.
-The short version is: bump the version, create the release, let CI attach the
-`.deb` files, build and upload the bundle, run the signing workflow, then verify
-on a device.
+CI builds both the `.deb` packages and the arm64 update bundle, and creates or
+updates the draft release. The only manual gates are triggering the version bump,
+signing the checksums, and publishing the draft.
 
-The `.deb` package and the update bundle are different artifacts with different
-version strings:
+### Release checklist at a glance
 
-- The `.deb` is the initial install path. Its version is `X.Y.Z-<short-sha>`;
-  it seeds a release at sequence 0.
-- The update bundle is the app-update path. Its version is normally `X.Y.Z`;
-  its sequence is the value passed to `make update-bundle`.
+1. Run **Actions → Bump version** and enter the next `X.Y.Z`.
+2. Let the bump PR pass CI and auto-merge.
+3. Wait for **Build and Release** to build the `.deb` files and arm64 bundle,
+   and to create or update the draft release `vX.Y.Z`.
+4. Run **Sign Release Checksums** for `vX.Y.Z` and approve the
+   `release-signing` environment.
+5. Review and test the draft, then publish it.
 
-Both are valid release directory names. The first bundle install records the
-seeded `.deb` release as `previous`.
+The rest of this section explains each step.
+
+The release tag and `Cargo.toml` use `X.Y.Z`. Builds use
+`X.Y.Z-<short-sha>`:
+
+- The `.deb` package version is `X.Y.Z-<short-sha>`. It seeds a release
+  directory named `X.Y.Z-<short-sha>-seed` at sequence 0. The `-seed` suffix
+  keeps the packaged release distinct from an update bundle built from the same
+  commit.
+- The update bundle is the app-update path. It uses `X.Y.Z-<short-sha>` as its
+  release version and `major * 1_000_000 + minor * 1_000 + patch` as its
+  sequence, so version `0.2.0` is sequence `2000`. Every main commit with the
+  same `X.Y.Z` has the same sequence but a different release directory.
+- The first bundle install records the seeded `.deb` release as `previous`.
 
 ### Before the first release
 
@@ -472,77 +484,48 @@ seeded `.deb` release as `previous`.
 2. Configure the `release-signing` environment (see
    [Workflow behavior](#workflow-behavior)). Until the public key is pinned,
    every `photo-frame-update install` fails closed.
+3. Configure the repository settings used by the bump workflow:
+   - `RENOVATE_TOKEN` secret with Contents and Pull requests write access.
+   - Auto-merge enabled.
+   - A `dependencies` label.
 
-### 1. Choose the version and sequence
+### 1. Trigger the version bump
 
-- Pick the release version `X.Y.Z`. It must match `version` in `Cargo.toml` and
-  the release tag `vX.Y.Z`.
-- Pick a sequence `N` greater than the last published sequence. Sequence 0 is
-  reserved for the `.deb` seed. The sequence is not derived from the version,
-  so keep a record of the last one used.
+Run **Actions → Bump version** with the next `X.Y.Z` version. The workflow:
 
-### 2. Bump and merge
+- validates that the new version is semver and greater than the current one,
+- updates `Cargo.toml` and syncs the root package entry in `Cargo.lock`,
+- pushes `bump-version-X.Y.Z`,
+- opens a PR labeled `dependencies`,
+- enables squash auto-merge.
 
-Set `version = "X.Y.Z"` in `Cargo.toml` and merge the change to `main`.
-`.github/workflows/build.yml` computes the full `.deb` version
-`X.Y.Z-<short-sha>`, builds `amd64` and `arm64` packages, and uploads them to the
-release.
+The PR runs the normal CI checks. Merging it puts the new version on `main` and
+triggers `build.yml`. Do not hand-edit the version unless the bump workflow is
+unavailable; the merge must still land on `main`.
 
-### 3. Create the release and attach the `.deb` files
+### 2. Let CI build and open the draft release
 
-`build.yml` uploads to an **existing** release; it does not create the tag or
-release. After the merge, create a draft release at that commit:
+On every push to `main`, `build.yml` first checks whether `vX.Y.Z` is already
+published. If it is, the build is a no-op. Otherwise it:
 
-```bash
-gh release create v0.2.0 --draft --target "$(git rev-parse HEAD)" \
-  --title "v0.2.0" --notes-file release-notes.md
-```
+- builds `amd64` and `arm64` `.deb` packages,
+- builds the `arm64` update bundle and `.sha256` sidecar,
+- creates the draft release `vX.Y.Z` if it does not exist, or replaces the
+  assets on the existing draft,
+- uploads the `.deb` files, bundle, and checksum to the draft.
 
-If the push-triggered build already ran and failed at its release step because
-the release did not exist, rerun that workflow run after creating the release:
-
-```bash
-gh run list --workflow=build.yml --limit 5
-gh run rerun <run-id>
-```
-
-`build.yml` has no `workflow_dispatch` trigger, so use **Re-run jobs** in
-GitHub Actions or `gh run rerun`; `gh workflow run build.yml` will not work.
-
-### 4. Build the update bundle on arm64 Linux
-
-The bundle must contain Linux `arm64` binaries. `make update-bundle` calls the
-host C and Rust compilers; `ARCH` only labels the manifest and filename, it does
-not cross-compile. Do this on an arm64 Linux host, container, or runner, from
-the same tag:
-
-```bash
-git checkout v0.2.0
-make update-bundle VERSION=0.2.0 SEQUENCE=7 ARCH=arm64
-```
-
-That writes:
+The bundle assets are named:
 
 ```text
-dist/update/photo-frame-0.2.0-arm64.tar.gz
-dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
+photo-frame-<X.Y.Z>-<short-sha>-arm64.tar.gz
+photo-frame-<X.Y.Z>-<short-sha>-arm64.tar.gz.sha256
 ```
 
-This build is not currently automated. Running it on macOS or an x86 host
-produces the wrong binaries even if `ARCH=arm64`.
+A push that only adds dependency updates keeps the current version and updates
+the current draft. Once `vX.Y.Z` is published, later pushes at that version do
+nothing; bump the version to start the next release.
 
-### 5. Upload the bundle and checksum
-
-```bash
-gh release upload v0.2.0 \
-  dist/update/photo-frame-0.2.0-arm64.tar.gz \
-  dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
-```
-
-The release can be a draft at this point. Do not upload the signature by hand;
-the signing workflow produces it.
-
-### 6. Sign the checksums
+### 3. Sign the checksums
 
 Run the **Sign Release Checksums** workflow (`.github/workflows/sign.yml`) with
 the release tag, from the Actions UI or:
@@ -559,9 +542,9 @@ downloads every `*.sha256` asset from the release, signs each one with
 Putting unrelated `.sha256` assets on the release will make the workflow sign
 them too, which is harmless but noisy.
 
-### 7. Verify the release
+### 4. Verify and publish
 
-Confirm the release has the expected assets:
+Confirm the draft has the expected assets:
 
 ```bash
 gh release view v0.2.0 --json assets --jq '.assets[].name'
@@ -569,12 +552,12 @@ gh release view v0.2.0 --json assets --jq '.assets[].name'
 
 Expect both `.deb` files, the bundle, the bundle's `.sha256`, and the
 `.sha256.sig`. On a test device, install the HTTPS bundle and then check status
-and rollback:
+and list:
 
 ```bash
-SHA=$(awk '{print $1}' photo-frame-0.2.0-arm64.tar.gz.sha256)
+SHA=$(awk '{print $1}' photo-frame-0.2.0-abc1234-arm64.tar.gz.sha256)
 sudo photo-frame-update install \
-  https://github.com/dmikusa/digital-picture-frame/releases/download/v0.2.0/photo-frame-0.2.0-arm64.tar.gz \
+  https://github.com/dmikusa/digital-picture-frame/releases/download/v0.2.0/photo-frame-0.2.0-abc1234-arm64.tar.gz \
   --sha256 "$SHA"
 sudo photo-frame-update status
 sudo photo-frame-update list
@@ -583,29 +566,35 @@ sudo photo-frame-update list
 The install must pass verification, activate, and pass the 30-second health
 check. If it fails, the previous release should still be active.
 
-### 8. Publish and roll out
-
-If the release is a draft, publish it after the assets and signature are
-verified:
+Publish the draft after the signature and a test install are good:
 
 ```bash
 gh release edit v0.2.0 --draft=false
 ```
 
 Install it on the frame using the same HTTPS command with the hash from the
-published `.sha256` file. Keep the previous release on disk; `photo-frame-update
-rollback` returns to it. Record the sequence used so the next release uses a
-higher one.
+published `.sha256` file. Keep the previous release on disk;
+`photo-frame-update rollback` returns to it.
 
-### Current automation gaps
+### What is automated and what is not
 
-There is no build→sign→publish chain in the repository. The manual steps above
-exist because:
+Automated:
 
-- `.github/workflows/build.yml` only builds and uploads `.deb` packages.
-- It does not create the release, and it has no manual-dispatch trigger.
-- Nothing builds the update bundle or chooses the monotonic sequence.
-- `.github/workflows/sign.yml` is deliberately manual and environment-gated.
+- version bump PR creation and auto-merge,
+- `.deb` builds for both architectures,
+- the arm64 update bundle and its `.sha256`,
+- creating or updating the draft release and replacing stale draft assets.
+
+Still manual:
+
+- triggering the version bump workflow and merging the PR,
+- running the signing workflow and approving the protected environment,
+- reviewing and publishing the draft release,
+- installing on the frame.
+
+The build is only for `arm64`; the `amd64` `.deb` is for development and is not
+an update target. Signing stays manual so the update key is never available to
+the build job.
 
 ### Workflow behavior
 
@@ -892,8 +881,8 @@ A pending install adds:
 }
 ```
 
-The `.deb` seeds `releases/<package-version>` from the packaged binaries with
-`sequence: 0` and points `current` at it on a fresh install. After that the
+The `.deb` seeds `releases/<package-version>-seed` from the packaged binaries
+with `sequence: 0` and points `current` at it on a fresh install. After that the
 updater owns the symlink; a later `.deb` upgrade stages its own release but does
 not move `current` back.
 
