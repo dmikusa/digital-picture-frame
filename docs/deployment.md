@@ -1,252 +1,134 @@
 # Deployment
 
-## DietPi setup
+This document walks through the setup of a device. This process can and will vary depending on the device you're using. These instructions are meant to be somewhat generic though, so I hope they work on a wide variety of devices.
 
-### 1. Don't expand the rootfs
+## Highlights
 
-Before first boot, mount the SD card's ext4 partition on another computer and delete the resize symlink:
+1. Download DietPi for your device & flash it to an SD card.
+2. Setup the filesystem *optional*
+3. Boot it up.
+4. Install dependencies and the Photo Frame software
+5. Setup WiFi *optional*
+6. Load photos from USB or configure other photo locations
 
+## Installation Details
+
+### Download & Flash
+
+You can download from the [DietPi Website](https://dietpi.com/#downloadinfo). Find the ISO for your device.
+
+Use something like [Fedora Media Writer](https://fedoraproject.org/workstation/download/) or `dd` to flash the image to your SDcard.
+
+DO NOT BOOT THE DEVICE YET!
+
+### Before Booting
+
+This step is for optional partitioning of the SDcard. You do not have to do this, but I recommend it. The Photo Manager is able to automatically clean up old files when you run out of space, if you follow this method. If you skip this, then the auto clean up feature does not work because by the time a single partition fills up, you will run into other problems.
+
+It's important to do this before booting, because on first boot the DietPi scripts that run will expand your rootfs to consume the full SDcard.
+
+To do this, mount the SD card's `ext4` partition on another computer and delete the resize symlink. This is easiest on a Linux system.
+  
 ```bash
 rm <mount>/etc/systemd/system/local-fs.target.wants/dietpi-fs_partition_resize.service
 ```
 
-This keeps root at ~900MB, leaving the rest of the card for a photos partition.
+This keeps root at ~900MB and we'll expand that to 1600MB later, leaving the rest of the card for a photos partition.
 
-### 2. Create the photos partition
+Please note that doing this will cause an error to show up on initial login. DietPi sees that the resize script didn't run and will open an error dialog. You can ignore this.
 
-After first boot:
+Put your SDcard into the device & boot it now.
 
+### Initial Setup
+
+These are first-time only steps you need to run to setup the device.
+
+1. Login as `root`. The default login is root/dietpi. Dietpi will display that in case it changes in the future.
+2. As the warning message says, first thing you need to do is to run `tune2fs -j $G_ROOTFS_DEV`. This is something that the resize script would do, but we've opted not to do.
+3. Run `dietpi-config` to configure the device.
+  1. Change the password. Security Options -> User passwords
+  2. Change the hostname. Network Options -> Misc
+  2. Setup WiFi. Network Options -> Adapters -> wlan0 (or your device) -> Scan
+4. Logout
+5. Login as the `dietpi` user. It will run a one-time startup script. Let it do that. This includes updating `apt` and the software on the device, so it might take a little time.
+
+If you removed the resize script, you have one more step which is to resize the root partition and create the partition for your photos.
+  
 ```bash
 sudo parted /dev/mmcblk0
-# (parted) mkpart primary ext4 <start> 100%
+# (parted) resizepart 2 1600MB
+# (parted) mkpart primary ext4 1600MB 100%
 # (parted) quit
 
+sudo resize2fs /dev/sda1
 sudo mkfs.ext4 /dev/mmcblk0p3
 sudo mkdir -p /var/lib/photo-frame/photos
 sudo mount /dev/mmcblk0p3 /var/lib/photo-frame/photos
-
-# Add to /etc/fstab:
-# PARTUUID=<uuid> /var/lib/photo-frame/photos ext4 noatime,lazytime 0 2
 ```
 
-### 3. Install packages
+Lastly, run `sudo blkid` to get the block id for the new partition. Run `nano /etc/fstab` and add this line.
+
+```
+UUID=<uuid> /var/lib/photo-frame/photos ext4 noatime,lazytime 0 2
+```
+
+### Enable USB auto-mount
+
+The Photo Frame Manager watches `/media` for new directories. It does this to auto import files from the attached USB drive.
+
+Any auto-mount solution that mounts USB drives there works:
+
+- **DietPi:** Enable auto-mount in `dietpi-drive_manager`
+- **Debian/Raspberry Pi OS:** `usbmount` (auto-mounts to `/media/usb0`, `/media/usb1`, etc.)
+- **Manual:** Add entries to `/etc/fstab` or use `systemd` mount units
+
+### Install Dependencies & Software
+
+Fetch the latest version of the [Photo Frame software](https://github.com/dmikusa/digital-picture-frame/releases) from our Github Releases page.
 
 ```bash
 sudo apt update
-sudo apt install -y imagemagick
+sudo apt install -y imagemagick avahi-daemon
+sudo dpkg -i photo-frame_x.y.z_amd64.deb
 ```
 
-### 4. USB auto-mount
+This installs imagemagick which the tool uses for some photo conversion tasks & the Photo Frame software itself. The software installs a few the Photo Frame Manager and Photo Frame Display services.
 
-The app watches `/media` for new directories, so any auto-mount solution that mounts USB drives there works:
+### Load Some Photos!
 
-- **Debian/Raspberry Pi OS:** `usbmount` (auto-mounts to `/media/usb0`, `/media/usb1`, etc.)
-- **DietPi:** Enable auto-mount in `dietpi-drive_manager`
-- **Manual:** Add entries to `/etc/fstab` or use `systemd` mount units
+When you start the software for the first time, there are no photos loaded. You have two options to load photos.
 
-### 5. Display app
+1. Plug in USB drive with photos on it. The Photo Manager will automatically load them to the device and begin displaying them.
+2. Load photos from the Internet
+  1. You must have configured WiFi for this option to work.
+  2. When the device starts up, it will present instructions on the screen to access the Photo Manager configuration UI, which is a web site running on the device.
+  3. Type in the URL from the screen or load the QR code on your phone.
+  4. Use the UI to configure one of the options for loading photos like Google Drive or DropBox.
 
-The Rust manager needs the C display app (`photo-frame-display.c`) running alongside it. See `c/photo-frame-display.c` in this repo.
+### Service Status & Restarts
 
-## Config mode
+The package installs and starts these systemd services:
 
-The frame shows a setup QR code when it has no photos and no remote sources. The
-screen also lists the reachable LAN URL (`http://<ip>:<port>`), the rotating
-8-character password, and an optional `photo-frame.local` URL.
+- `photo-frame-display.service` — the C DRM display app
+- `photo-frame-manager.service` — the Rust manager
+- `photo-frame-update-guard.service` — oneshot boot guard for app updates.
 
-1. Connect a phone or laptop to the same network as the frame.
-2. Scan the QR code, or open the LAN URL shown on screen.
-3. Sign in with the username `photo-frame` and the password shown under the QR.
-4. Add, edit, or remove remote sources and press **Finish**.
+The `photo-frame-update-guard` service is a no-op unless an update was activated and never confirmed, in which case it confirms the new release or reverts to the previous one.
 
-The QR code itself embeds the LAN IP address and the password, so scanning it
-works on networks without mDNS. `photo-frame.local` is only an alternative.
-
-Flow details:
-
-- **USB import**: inserting a drive shows "Importing photos..." and starts the
-  import. When it finishes, the setup screen replaces it. Removing the drive
-  cancels config mode and discards unsaved changes.
-- **First remote sync**: if no photos exist but remote sources are configured,
-  the screen shows "First remote sync in progress" instead. It switches back to
-  the slideshow as soon as photos appear.
-- **Re-entry**: inserting a drive during an existing session stops the old admin
-  server first, then imports and starts a new session with a new port/password.
-- **Staging**: the source list starts with the sources already in
-  `config.toml`. Changes stay in memory until **Finish**. Finishing validates
-  every entry (names, required credentials, check interval) and atomically
-  rewrites `config.toml`. An empty list is allowed: it removes all remote
-  sources. Clearing the list or abandoning the session writes nothing.
-- **Leaving config mode**: the manager sends `RESUME` so the slideshow takes the
-  panel back. If the display app does not accept it (for example `Broken pipe`
-  because it closed the control socket), the manager retries every 2 seconds
-  until the command lands or it shuts down, instead of leaving the QR image up.
-- **Status**: `GET /api/status` returns the staged sources plus the contents of
-  `<photos_dir>/sync-status.json` when the scheduler has written it. A missing
-  file yields an empty `sync` object.
-
-If the display app has not created its control socket yet, or closes it, the QR
-screen cannot be shown. That no longer ends config mode: the admin server and its
-password stay live, the failure is logged, and the screen is retried. The same
-URL, mDNS alternative, username, and password are in
-`/tmp/photo-frame-setup.txt` (mode 0600) until config mode exits, so setup can be
-completed from a shell or another device. Check `/tmp/photo-frame.log` if the
-setup screen never appears.
-
-### Optional: mDNS hostname
-
-The IP-based URL works without any extra packages. To also use
-`http://photo-frame.local:<port>`, install and run `avahi-daemon` and give the
-frame a `photo-frame` hostname (or an alias):
-
-```bash
-sudo apt install -y avahi-daemon
-sudo hostnamectl set-hostname photo-frame
-# Some networks also need an /etc/hosts entry for the local address:
-echo "127.0.1.1 photo-frame.local photo-frame" | sudo tee -a /etc/hosts
-```
-
-The `.deb` lists `avahi-daemon` under `Recommends`, not `Depends`, so it is not
-required. If the optional URL does not resolve, use the numeric IP address
-shown on the setup screen.
-
-## Storage rotation
-
-When the photos partition fills up (`ENOSPC`), the app deletes the oldest `batch_delete_size` photos. The CSV index keeps ghost entries until compaction, which happens on startup if ghosts exceed 50%.
-
-## Shutdown
-
-The app handles `SIGTERM` and `SIGINT`. It closes the socket immediately and exits. It won't finish sending a half-sent image, since the display app handles disconnects fine.
-
-## Packaging & Installation
-
-Pre-built `.deb` packages are available from GitHub Releases for both `amd64` and `arm64`.
-
-### Install
-
-1. Download the `.deb` for your architecture from the latest draft release.
-2. Install it:
-   ```bash
-   sudo dpkg -i photo-frame_*.deb
-   ```
-3. The package installs and starts these systemd services:
-|||||||   - `photo-frame-display.service` — the C DRM display app
-   - `photo-frame-manager.service` — the Rust manager
-   - `photo-frame-update-guard.service` — oneshot boot guard for app updates.
-     It is a no-op unless an update was activated and never confirmed, in which
-     case it confirms the new release or reverts to the previous one.
-
-### Versioned install layout
-
-The services run from `/opt/photo-frame/current`, not from `/usr/bin`:
-
-```
-/opt/photo-frame/
-  releases/<version>/bin/{photo-frame-manager,photo-frame-display,photo-frame-update}
-  releases/<version>/manifest.json
-  current -> releases/<version>
-/var/lib/photo-frame/update/state.json
-/var/log/photo-frame/update.log
-```
-
-`postinst` seeds `releases/<package-version>` from the packaged binaries and
-records it as sequence `0`. Signed release bundles add new directories and move
-the `current` symlink; the `.deb` never removes them. On upgrade the package
-leaves an update-managed `current` alone and only stages its own release in
-`releases/`, so `apt upgrade` cannot roll back a newer installed release.
-
-`/usr/bin/photo-frame-*` still ship as the packaged copy (fallback and manual
-use), and `/usr/local/sbin/photo-frame-update` points at the active release.
-
-Signing keys: `photo-frame-update` contains an empty trusted-key list
-(`src/update/keys.rs`, `TRUSTED_KEYS`), so every install is refused until the
-owner pins their Ed25519 public key and rebuilds. See `docs/updates.md` for key
-custody, bundle signing, and rotation.
-|||||||
 ### Updates
 
-The `.deb` is the initial install path and seeds a release at sequence 0. After
-that, application updates use signed release bundles and `photo-frame-update`
-rather than `dpkg`: the tool verifies the signature and checksums, unpacks into
-`/opt/photo-frame/releases/<version>`, flips the `current` symlink, and rolls
-back if the new version fails its 30-second health check. A later `.deb` upgrade
-stages its own release but does not move an update-managed `current` backwards.
+The `.deb` you originally installed is just the initial install path and seeds a release at sequence 0. After that, application updates use signed release bundles and the `photo-frame-update` tool, rather than `dpkg`. The tool verifies the signature and checksums, unpacks into
+`/opt/photo-frame/releases/<version>`, flips the `current` symlink, and rolls back if the new version fails its 30-second health check. A later `.deb` upgrade stages its own release but does not move an update-managed `current` backwards.
 
-`photo-frame-update-guard.service` runs after the app services on every boot and
-confirms or reverts a release that was activated but never confirmed. OS
-packages, the kernel, and firmware are handled separately with apt.
+The `photo-frame-update-guard.service` service runs after the app services on every boot and confirms or reverts a release that was activated but never confirmed. OS packages, the kernel, and firmware are handled separately with `apt`. You may do these at your convenience.
 
-See [updates.md](updates.md) for the bundle format, commands, signing keys, the
-manual signing workflow, and the OS update policy. `config.toml` and
-`display.env` are never touched by an update.
-
-### Dedicated User
-
-The package creates a `photo-frame` system user and adds it to the `video` group.
-This grants the display app access to `/dev/dri/card0` on standard Debian-based systems.
-
-If your system has custom udev rules that prevent the `video` group from accessing the
-DRM device, you can fall back to running the display app as `root`:
-
-```bash
-sudo systemctl edit photo-frame-display.service
-```
-
-Add:
-```ini
-[Service]
-User=root
-Group=root
-```
-
-Then:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart photo-frame-display
-```
-
-### Security
-
-Both services run as the `photo-frame` user. The **display** service owns
-`/run/photo-frame/` via `RuntimeDirectory=photo-frame` with
-`RuntimeDirectoryMode=0700`, so the directory and the sockets inside it are only
-accessible to the owner. The C display app also sets `umask(077)` before `bind()`
-as defense in depth.
-
-The manager service deliberately does **not** declare `RuntimeDirectory`. systemd
-removes a `RuntimeDirectory` when its owning unit stops, and because the two
-services share this path, restarting the manager would otherwise delete the
-display app's socket files while it keeps running. Only the display service owns
-the directory.
-
-If you change either socket path, update both `display_socket_path` /
-`control_socket_path` in `config.toml` and `DISPLAY_SOCKET_PATH` /
-`CONTROL_SOCKET_PATH` in `display.env` so the two apps agree. Ensure the
-directory is restricted to the service user (e.g., `chmod 700 /run/my-socket-dir`).
-Both services must run as the same user for the manager to connect.
+See [updates.md](updates.md) for the bundle format, commands, signing keys, the manual signing workflow, and the OS update policy. `config.toml` and `display.env` are never touched by an update.
 
 ### Configuration
 
-Edit `/etc/photo-frame/config.toml` to change manager settings (photos directory, socket path, resolution, etc.).
+There are two configuration files, which you may edit directly:
 
-Edit `/etc/photo-frame/display.env` to change display settings (fade duration, frame skip).
+1. `/etc/photo-frame/config.toml` settings for the Photo Manager (photos directory, socket path, resolution, etc.).
+2. `/etc/photo-frame/display.env` settins for the Display (fade duration, frame skip).
+
 Both files are marked as `conffiles`, so `dpkg` will preserve your changes on package upgrades.
-
-`/etc/photo-frame` is owned by `photo-frame:photo-frame` with mode `0750`, and
-`config.toml` is owned by the service user with mode `0600`. Config mode rewrites
-`config.toml` atomically (write a temp file in the same directory, then rename),
-so the service user must be able to write both the directory and the file. The
-config may contain credentials for remote photo sources, so keep it private. Edit
-it as root, for example with `sudoedit /etc/photo-frame/config.toml`.
-`display.env` remains root-owned with mode `0644`, and the `photo-frame` user can
-still read it through the directory.
-
-### Building the Package Locally
-
-If you have `cargo-deb` installed:
-
-```bash
-make deb
-```
-
-This produces `target/debian/photo-frame_*.deb`.

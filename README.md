@@ -1,10 +1,8 @@
 # Digital Photo Frame
 
-This is a small Rust program that runs a photo slideshow on a Raspberry Pi Zero 2 W. It pairs with a tiny C graphics app that actually draws the pictures to the screen. No desktop environment needed. It talks to the GPU directly.
+This is a set of services that runs a photo slideshow on a Raspberry Pi Zero 2 W (and possibly other devices). There's a small Rust service that manages the photos, and that pairs with a tiny C graphics app that actually draws the pictures to the screen. No desktop environment needed. It talks to the GPU directly.
 
-## What it does
-
-The Rust side runs four worker threads in the background:
+## What It Does
 
 Photo display reads a CSV list of photos and sends paths to the C app over a Unix socket. The C app loads each image, fades it in, and shows it for a while. The socket naturally paces things: if the C app is busy, the Rust side blocks until it can send the next photo.
 
@@ -16,17 +14,23 @@ Config mode is the setup UI. When the frame has no photos and no remote sources,
 
 Storage cleanup kicks in automatically if the photo partition fills up. It deletes the oldest batch of photos to make room, whether the write that ran out of space was a USB import or a remote download.
 
+## Feature List
+
+-- TODO --
+
+## Documentation
+
+- [Installation](docs/deployment.md)
+- [Updates](docs/updates.md)
+- [Configuration Details](docs/config.md)
+- [Hardware](docs/hardware.md)
+- [Security](docs/security.md)
+
 ## Private Google Drive
 
 For a private Drive folder, the frame uses a **service account**: you create one in your own Google Cloud project, share the folder with its synthetic email address as Viewer, and paste the JSON key into the admin UI. See [docs/google-drive-setup.md](docs/google-drive-setup.md) for the steps. A service account cannot own files, so create the folder with your normal Google account and share it. Public folders can use an API key instead.
 
 A web OAuth callback and the device flow are not supported: the admin UI is plain HTTP, and Google's device flow cannot read an existing folder. HTTPS for the admin UI is future work (see [plans/SYNC_SOURCES.md](plans/SYNC_SOURCES.md)).
-
-## Where it runs
-
-- Raspberry Pi Zero 2 W is the main target. The C app uses the VideoCore GPU for OpenGL ES rendering.
-- Debian VM (UTM/QEMU) works too. GPU acceleration helps; without it, Mesa falls back to CPU rendering (llvmpipe) and fades get choppy.
-- Other Linux boards probably work if they have DRM/GBM/EGL support and a Mesa driver. Hardware acceleration helps a lot at 1080p.
 
 ## Updates
 
