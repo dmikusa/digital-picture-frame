@@ -16,15 +16,10 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... 2026-10
 `photo-frame-update`. Files in this directory are public; never put a private key
 here.
 
-Generate a PEM private key, then derive the matching OpenSSH public key:
+Create an Ed25519 SSH key in Bitwarden (or with `ssh-keygen -t ed25519`) and
+copy its public-key line into this directory. The matching private key stays in
+Bitwarden and is copied into the `release-signing` GitHub environment as the
+`UPDATE_SIGNING_KEY` secret. The private key must be an OpenSSH key and must be
+usable without an interactive passphrase in CI.
 
-```bash
-openssl genpkey -algorithm ED25519 -out update-signing-2026-10.pem
-chmod 600 update-signing-2026-10.pem
-
-scripts/openssh-public-key.sh update-signing-2026-10.pem 2026-10 \
-  > packaging/update-keys/2026-10.pub
-```
-
-Keep `update-signing-2026-10.pem` out of the repository. The signing workflow
-uses its contents as the `UPDATE_SIGNING_KEY` environment secret.
+Never commit a private key.

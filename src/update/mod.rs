@@ -29,9 +29,9 @@
 //!
 //! A bundle is a `.tar.gz` with `manifest.json` and `bin/photo-frame-{manager,
 //! display,update}`. It is accompanied by `<bundle>.sha256` and
-//! `<bundle>.sha256.sig`; the latter is a raw Ed25519 signature over the exact
-//! bytes of the checksum file. Nothing is extracted or activated until the
-//! signature, sidecar checksum, and caller-supplied checksum all match.
+//! `<bundle>.sha256.sig`; the latter is an OpenSSH Ed25519 signature over the
+//! exact bytes of the checksum file. Nothing is extracted or activated until
+//! the signature, sidecar checksum, and caller-supplied checksum all match.
 
 mod archive;
 mod audit;
@@ -41,6 +41,7 @@ mod health;
 mod install;
 mod keys;
 mod signature;
+mod ssh_signature;
 mod state;
 
 use std::cmp::Ordering;

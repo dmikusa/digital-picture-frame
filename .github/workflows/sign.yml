@@ -6,8 +6,8 @@ name: Sign Release Checksums
 # docs/updates.md.
 #
 # It downloads each `*.sha256` asset from an existing release, signs the exact
-# bytes with the Ed25519 key held in the environment secret, and uploads the
-# `<bundle>.sha256.sig` envelope next to it. photo-frame-update fetches
+# bytes with the Ed25519 OpenSSH key held in the environment secret, and uploads
+# the `<bundle>.sha256.sig` signature next to it. photo-frame-update fetches
 # `<bundle>.sha256` and `<bundle>.sha256.sig` from the same location.
 
 on:
@@ -35,15 +35,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check OpenSSL supports raw Ed25519 signing
+      - name: Check OpenSSH signing support
         run: |
-          if ! command -v openssl >/dev/null 2>&1 ||
-            ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends openssl
-          fi
-          openssl version
-          openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'
+          command -v ssh-keygen
+          ssh-keygen -Y sign -h >/dev/null 2>&1 || true
 
       - name: Download checksum assets
         env:
@@ -58,7 +53,6 @@ jobs:
       - name: Sign checksum assets
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-          UPDATE_SIGNING_KEY_ID: ${{ secrets.UPDATE_SIGNING_KEY_ID }}
         run: |
           set -euo pipefail
           shopt -s nullglob

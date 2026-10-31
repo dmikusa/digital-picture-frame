@@ -14,12 +14,16 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Raw Ed25519 verification of the `.sha256.sig` envelope.
+//! Ed25519 verification of `.sha256.sig` files.
 //!
-//! The envelope is small JSON: `{"key_id":"2026-10","signature":"<base64url>"}`.
-//! The signature covers the exact bytes of the adjacent `.sha256` file, which in
-//! turn covers the bundle. There are no certificates, expiry dates, or online
-//! lookups: only the compile-time key list matters.
+//! The release workflow writes an OpenSSH `SSHSIG` file with
+//! `ssh-keygen -Y sign`. Verification is done in-process against the pinned raw
+//! Ed25519 key; there is no `ssh-keygen`, `allowed_signers`, certificate,
+//! expiry date, or online lookup at install time.
+//!
+//! For compatibility, the original JSON envelope
+//! `{"key_id":"2026-10","signature":"<base64url>"}` is still accepted. New
+//! releases use the SSHSIG format.
 
 use crate::update::keys::TrustedKey;
 use crate::update::{Result, UpdateError};
@@ -65,6 +69,10 @@ pub fn verify_signature(
             "signature envelope is larger than {} bytes",
             MAX_SIGNATURE_ENVELOPE_BYTES
         )));
+    }
+
+    if is_ssh_signature(envelope_bytes) {
+        return super::ssh_signature::verify_ssh_signature(trusted, message, envelope_bytes);
     }
 
     let envelope: SignatureEnvelope = serde_json::from_slice(envelope_bytes).map_err(|e| {
@@ -114,6 +122,11 @@ pub fn verify_signature(
     Ok(VerifiedSignature {
         key_id: envelope.key_id,
     })
+}
+
+/// True when the file starts with the OpenSSH signature armor.
+pub(crate) fn is_ssh_signature(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"-----BEGIN SSH SIGNATURE-----")
 }
 
 fn decode_base64url(encoded: &str) -> Result<Vec<u8>> {

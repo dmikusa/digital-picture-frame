@@ -21,9 +21,9 @@ exact bytes of the checksum file.
 
 The device trusts a fixed list of Ed25519 public keys compiled into
 `photo-frame-update` from `packaging/update-keys/*.pub`. Each key has a short ID
-taken from its filename, such as `2026-10`. The signature envelope names the key
-ID; the updater looks that ID up in the compiled list, verifies the signature
-against the raw 32-byte public key, and refuses the bundle if the ID is unknown.
+taken from its filename, such as `2026-10`. The signature contains the signing
+public key; the updater matches it against the compiled list, verifies the
+signature, and refuses the bundle if the key is unknown.
 
 The compiled list starts empty on purpose. A build with no pinned key refuses
 every install. Adding a key and rebuilding the tool is a required provisioning
@@ -121,16 +121,23 @@ the digest and the file name:
 The updater accepts exactly one non-empty line, requires the filename column, and
 ignores the recorded filename when locating the bundle.
 
-The `.sha256.sig` file is a small JSON envelope holding the raw signature:
+The `.sha256.sig` file is a standard armored OpenSSH signature:
 
-```json
-{"key_id":"2026-10","signature":"iV7K…"}
+```text
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg...
+-----END SSH SIGNATURE-----
 ```
 
-`signature` is the base64url encoding of 64 raw Ed25519 signature bytes, with or
-without padding. It signs the exact bytes of the `.sha256` file, not the tarball.
-The chain is deliberate: the signature authenticates the checksum, and the
-checksum authenticates the tarball, so all three files are required.
+It is produced by `ssh-keygen -Y sign -n photo-frame-update` and signs the exact
+bytes of the `.sha256` file, not the tarball. The SSHSIG contains the signing
+public key; the updater requires that key to exactly match one in
+`packaging/update-keys/` and derives the key ID from that file. The chain is
+deliberate: the signature authenticates the checksum, and the checksum
+authenticates the tarball, so all three files are required.
+
+Older bundles that use the original JSON envelope
+`{"key_id":"…","signature":"…"}` are still accepted.
 
 Extraction and parsing have hard caps and an allowlist:
 
@@ -140,7 +147,7 @@ Extraction and parsing have hard caps and an allowlist:
 | Total extracted size | 512 MiB |
 | Archive entries | 10,000 |
 | `manifest.json` size | 1 MiB |
-| Signature envelope | 64 KiB |
+| Signature file | 64 KiB |
 | Checksum sidecar | 8 KiB |
 
 Only regular files and directories are extracted. Absolute paths, `..`,
@@ -283,9 +290,9 @@ into staging, then flips one symlink.
 
 1. Load `/var/lib/photo-frame/update/state.json`. A missing file is an empty
    state; a corrupt one aborts the install.
-2. Verify the signature over the `.sha256` bytes using the key named by
-   `key_id`. An unknown key ID, an empty compiled key list, or a bad signature
-   ends the install here.
+2. Verify the SSH signature over the `.sha256` bytes. The embedded public key
+   must match a pinned key; an empty compiled key list, an untrusted key, or a
+   bad signature ends the install here.
 3. Copy (local) or download (HTTPS) the bundle into
    `/opt/photo-frame/.staging` (mode 0700), then hash that copy.
 4. Compare the hash with the sidecar and, when supplied, with `--sha256`.
@@ -362,32 +369,19 @@ does not change, so rolling back does not authorize an older bundle later.
 
 ## 5. Generating a signing key and pinning it
 
-Keys are Ed25519. OpenSSL 3 is enough to generate one and sign a checksum; the
-`sign-checksum.sh` script wraps the OpenSSL calls and adds validation.
-
-Generate a key pair:
-
-```bash
-openssl genpkey -algorithm ED25519 -out update-signing-2026-10.pem
-chmod 600 update-signing-2026-10.pem
-```
-
-The private key is a small PEM file. Keep it in a password manager or encrypted
-volume, never in the repository and never on the frame. Back it up. A lost key
-cannot sign anything the device will accept; recovery means a second trusted key
-or a reflash.
-
-Derive the public key and write it to `packaging/update-keys/<key-id>.pub`:
+Keys are Ed25519 OpenSSH keys. Generate one in Bitwarden (or with
+`ssh-keygen -t ed25519`), then copy the public-key line into a file named by its
+key ID:
 
 ```bash
-scripts/openssh-public-key.sh update-signing-2026-10.pem 2026-10 \
-  > packaging/update-keys/2026-10.pub
+# Public key from Bitwarden or `cat update-signing-2026-10.pub`
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... 2026-10
 ```
 
-The file contains one standard OpenSSH public-key line:
+Save that line as:
 
 ```text
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... 2026-10
+packaging/update-keys/2026-10.pub
 ```
 
 The filename without `.pub` is the key ID. `build.rs` parses every `*.pub` file
@@ -395,20 +389,21 @@ in that directory and compiles the raw 32-byte keys into `photo-frame-update`;
 there is no hex array to edit and no runtime key-file lookup. Commit only the
 `.pub` file. Multiple `.pub` files mean multiple trusted IDs.
 
-The private key stays in PEM form because `scripts/sign-checksum.sh` uses it
-with OpenSSL. The public file is the easier-to-inspect OpenSSH form.
+The private key stays in Bitwarden and is copied into the
+`release-signing` environment as `UPDATE_SIGNING_KEY`. It must be an OpenSSH
+private key and must be usable without an interactive passphrase in CI. Never
+commit it or copy it to the frame. Back it up: a lost key cannot sign anything
+the device will accept; recovery means a second trusted key or a reflash.
 
 Rebuild `photo-frame-update` and include the rebuilt binary in the release
 bundle. The trusted set lives in the binary, so adding a key is a file addition
 plus a rebuild, not an installed key file. There is no public-key file installed
 by apt and no key directory used at runtime.
 
-The fingerprint to compare against the signing machine is the SHA-256 of the same
-32 bytes:
+The fingerprint to compare against the signing environment is:
 
 ```bash
-openssl pkey -in update-signing-2026-10.pem -pubout -outform DER \
-  | tail -c 32 | sha256sum
+ssh-keygen -lf packaging/update-keys/2026-10.pub
 ```
 
 `photo-frame-update keys` does not print fingerprints; compare IDs only there,
@@ -428,16 +423,15 @@ higher.
 Sign the checksum:
 
 ```bash
-UPDATE_SIGNING_KEY="$(cat update-signing-2026-10.pem)" \
-UPDATE_SIGNING_KEY_ID=2026-10 \
+UPDATE_SIGNING_KEY="$(cat update-signing-2026-10)" \
   scripts/sign-checksum.sh \
     dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
 ```
 
-The script reads the key from the environment only, checks that OpenSSL supports
-`pkeyutl -rawin`, verifies the key is Ed25519 by its PKCS#8 OID, requires a
-64-byte signature, and writes the JSON envelope with mode 0600. The output is
-`photo-frame-0.2.0-arm64.tar.gz.sha256.sig`.
+The script reads the OpenSSH private key from the environment only, runs
+`ssh-keygen -Y sign -n photo-frame-update`, requires the key to be usable
+without an interactive passphrase, and writes the armored SSH signature with
+mode 0600. The output is `photo-frame-0.2.0-arm64.tar.gz.sha256.sig`.
 
 There is no separate verify-only command. The same verification path runs at the
 start of `install`; to exercise a signature without touching the real install,
@@ -481,8 +475,14 @@ The release tag and `Cargo.toml` use `X.Y.Z`. Builds use
    file (section 5). Rebuild so both the `.deb` and the bundle contain an
    updater that trusts it.
 2. Configure the `release-signing` environment (see
-   [Workflow behavior](#workflow-behavior)). Until the public key is pinned,
-   every `photo-frame-update install` fails closed.
+   [Workflow behavior](#workflow-behavior)). Add the OpenSSH private key as an
+   environment secret:
+   ```bash
+   gh secret set UPDATE_SIGNING_KEY --env release-signing \
+     < update-signing-2026-10
+   ```
+   Until the public key is pinned, every `photo-frame-update install` fails
+   closed.
 3. Configure the repository settings used by the bump workflow:
    - `RENOVATE_TOKEN` secret with Contents and Pull requests write access.
    - Auto-merge enabled.
@@ -605,7 +605,7 @@ the build job.
   can upload signatures.
 - It checks out the repository to get `scripts/sign-checksum.sh`, with
   `persist-credentials: false`.
-- It ensures OpenSSL supports `-rawin`, downloading/updating OpenSSL if not.
+- It uses the runner's `ssh-keygen -Y sign`.
 - It runs `gh release download "$TAG" --pattern '*.sha256' --dir dist`.
 - It fails if the release has no checksum assets.
 - It uploads `dist/*.sha256.sig` back to the same release.
@@ -616,10 +616,9 @@ The `release-signing` environment must be configured before the first run:
 2. Add required reviewers. A signing run then waits for a human approval.
 3. Restrict deployment to protected branches or tags as appropriate for the
    repository. The workflow is manual, so the environment is the only gate.
-4. Add `UPDATE_SIGNING_KEY` as an environment secret holding the PEM private key.
-5. Add `UPDATE_SIGNING_KEY_ID` as an environment secret or variable holding the
-   key ID, for example `2026-10`.
-6. Pin every action to a full commit SHA. The workflow already pins
+4. Add `UPDATE_SIGNING_KEY` as an environment secret holding the OpenSSH
+   private key. It must be usable without an interactive passphrase in CI.
+5. Pin every action to a full commit SHA. The workflow already pins
    `actions/checkout`.
 
 Pull requests do not run this workflow, and environment secrets are not exposed
@@ -656,8 +655,8 @@ device has installed that release.
 3. Build a bundle containing the new updater with both keys.
 4. Sign that bundle with the **old** key and publish it as usual.
 5. Install it on the device. `photo-frame-update keys` now prints both IDs.
-6. Replace `UPDATE_SIGNING_KEY` and `UPDATE_SIGNING_KEY_ID` in the
-   `release-signing` environment with the new values.
+6. Replace `UPDATE_SIGNING_KEY` in the `release-signing` environment with the
+   new private key.
 7. Sign subsequent releases with the new key. Devices that installed step 4
    accept them. A device that skipped step 4 cannot verify them and stays on its
    current release, which is the intended fail-closed behavior.

@@ -186,11 +186,13 @@ bin/photo-frame-update
 There is no `product`, `size`, or `mode` field. The extractor sets `0755` for
 files under `bin/` and `0644` for everything else.
 
-The `.sha256` file is `sha256sum` output. The `.sha256.sig` file is a JSON
-envelope over the exact bytes of the checksum file:
+The `.sha256` file is `sha256sum` output. The `.sha256.sig` file is a standard
+armored OpenSSH signature over the exact bytes of the checksum file:
 
-```json
-{"key_id":"2026-10","signature":"<base64url>"}
+```text
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg...
+-----END SSH SIGNATURE-----
 ```
 
 **Why the signature covers the checksum file** rather than a field inside the
@@ -205,13 +207,12 @@ links, or device nodes.
 
 ### 3.3 Signing
 
-**Ed25519, raw signature, no certificate.** OpenSSL generates the key and the
-repository's `scripts/sign-checksum.sh` produces the envelope:
+**Ed25519, OpenSSH signature, no certificate.** Generate an Ed25519 SSH key in
+Bitwarden or with `ssh-keygen -t ed25519`; the repository's
+`scripts/sign-checksum.sh` runs `ssh-keygen -Y sign`:
 
 ```bash
-openssl genpkey -algorithm ED25519 -out update-signing-2026-10.pem
-UPDATE_SIGNING_KEY="$(cat update-signing-2026-10.pem)" \
-UPDATE_SIGNING_KEY_ID=2026-10 \
+UPDATE_SIGNING_KEY="$(cat update-signing-2026-10)" \
   scripts/sign-checksum.sh dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
 ```
 
@@ -230,9 +231,9 @@ the commands.
 The updater runs as root (it must replace binaries and flip the symlink) but
 performs all of this **before** touching the live install:
 
-1. Verify the signature over the `.sha256` bytes with the key named by `key_id`.
-   **Fail closed** on an empty compiled key list, an unknown key ID, or an
-   invalid signature (M1, M5).
+1. Verify the SSH signature over the `.sha256` bytes against a pinned public key.
+   **Fail closed** on an empty compiled key list, an untrusted signing key, or
+   an invalid signature (M1, M5).
 2. Copy (local) or download (HTTPS) the bundle into
    `/opt/photo-frame/.staging` (0700) and hash that copy. An interrupted copy is
    never a candidate.
@@ -388,7 +389,7 @@ message.
 | Failure | Result |
 |---------|--------|
 | Bad/missing signature | Refuse before install; audit entry |
-| Unknown key ID | Refuse; the bundle was signed with a key this build does not trust |
+| Untrusted signing key | Refuse; the bundle was signed with a key this build does not trust |
 | Rejected URL | Plain HTTP, or an HTTPS-to-HTTP redirect, refusing before download |
 | Hash mismatch / truncated bundle | Refuse; the staged copy is discarded |
 | Wrong arch | Refuse with a specific message |
@@ -619,13 +620,10 @@ Not scheduled. If the decision is ever revisited, this is the shape of the work:
 
 ### 7.1 Format
 
-**Ed25519 with a raw signature, wrapped in a JSON envelope.** The signature is
-made with `openssl pkeyutl -sign -rawin` over the exact bytes of the `.sha256`
-sidecar. The envelope names the key:
-
-```json
-{"key_id":"2026-10","signature":"<base64url>"}
-```
+**Ed25519 with a standard OpenSSH signature.** The signature is made with
+`ssh-keygen -Y sign -n photo-frame-update` over the exact bytes of the `.sha256`
+sidecar. The SSHSIG includes the signing public key; the updater matches it
+against the pinned keys and derives the key ID from the trusted key entry.
 
 There is no certificate, no expiry, no CA, no keyserver, and no trust path. A GPG
 detached signature was considered and rejected: it brings keyring and expiry
@@ -671,8 +669,8 @@ self-hosted runner the build cannot reach.
   verification.
 - `photo-frame-update` ships inside the release bundle, so the trusted key set
   travels with the app. Adding or removing a key requires rebuilding the tool.
-- The `.sha256.sig` envelope carries `key_id`; the updater looks that ID up and
-  refuses unknown IDs.
+- The `.sha256.sig` SSHSIG contains the signing public key; the updater matches
+  it against the pinned keys and refuses unknown keys.
 - `photo-frame-update keys` prints key IDs only, one per line. It does not print
   fingerprints; compute the SHA-256 of the raw 32-byte public key on the signing
   machine and compare it there.
@@ -936,8 +934,8 @@ Not scheduled. Kept here only so the analysis is not lost.
 1. **Is app-only updating enough, or must the OS/kernel/ImageMagick be
    patchable?** App-only. OS and kernel fixes come from `unattended-upgrades`
    and a manual kernel refresh about twice a year.
-2. **Signing tool:** OpenSSL Ed25519 with a raw signature over the `.sha256`
-   sidecar. Not minisign, not GPG.
+2. **Signing tool:** Ed25519 OpenSSH signatures over the `.sha256` sidecar,
+   produced with `ssh-keygen -Y sign`. Not minisign, not GPG.
 3. **Hardware token or offline machine?** Neither. The key lives in a protected
    GitHub environment; a KMS/HSM is a possible later step.
 4. **Where do releases live?** GitHub Releases, with the tarball and both
@@ -985,9 +983,9 @@ Not scheduled. Kept here only so the analysis is not lost.
   rollback, a boot guard, and an audit log.
 - **Bundle format:** `photo-frame-<version>-<arch>.tar.gz` with `manifest.json`
   (`format`, `version`, `sequence`, `arch`, `min_version`, `files[]`) and the
-  three binaries, plus `.sha256` and `.sha256.sig` sidecars. The signature is
-  Ed25519 over the checksum bytes, in a JSON envelope naming the key ID. No
-  certificate, no expiry, no CA, no network.
+  three binaries, plus `.sha256` and `.sha256.sig` sidecars. The signature is a
+  standard OpenSSH Ed25519 signature over the checksum bytes. No certificate, no
+  expiry, no CA, no network.
 - **Public keys are compiled into `photo-frame-update`** from
   `packaging/update-keys/*.pub`. The directory starts empty and refuses every
   install until a key is added and the tool is rebuilt. No key file is installed
