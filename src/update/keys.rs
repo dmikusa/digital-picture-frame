@@ -16,20 +16,20 @@
 
 //! Compile-time trusted update-signing keys.
 //!
-//! These raw Ed25519 public keys are baked into `photo-frame-update` and are the
-//! only keys that can authorize an install. The private key never ships to the
-//! device, CI, or this repository.
+//! The public keys live in `packaging/update-keys/<key-id>.pub`, one OpenSSH
+//! `ssh-ed25519` public key per file. `build.rs` parses the files and generates
+//! [`TRUSTED_KEYS`] with the raw 32-byte key and the filename as the key ID.
 //!
-//! Key rotation requires adding the new public key to this list, then building
-//! and signing a release with a key that is *already* trusted. A device only
-//! trusts keys listed here in the build it is running, so a release signed only
-//! by an unknown key can never bootstrap itself onto an older device. To remove
-//! a key, delete it from this list and ship a release signed by a remaining
-//! trusted key.
+//! The private key never ships to the device, CI, or this repository. Key
+//! rotation requires adding the new `.pub` file, then building and signing a
+//! release with a key that is *already* trusted. A device only trusts keys in
+//! the build it is running, so a release signed only by an unknown key cannot
+//! bootstrap itself onto an older device. To remove a key, delete its `.pub`
+//! file and ship a release signed by a remaining trusted key.
 //!
-//! The list starts intentionally empty. With no trusted keys every install is
-//! refused (fail closed). The owner must add their public key(s) here before
-//! building a release bundle.
+//! The directory starts empty. With no trusted keys every install is refused
+//! (fail closed). The owner must add a public key file before building a
+//! release bundle.
 
 /// A pinned update-signing public key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,8 +41,5 @@ pub struct TrustedKey {
     pub bytes: [u8; 32],
 }
 
-/// Keys trusted by this build. Empty until the owner pins one.
-pub const TRUSTED_KEYS: &[TrustedKey] = &[
-    // The owner adds their public key(s) here before building a release, e.g.:
-    // TrustedKey { id: "2026-10", bytes: [0u8; 32] },
-];
+// Includes the generated `TRUSTED_KEYS` table.
+include!(concat!(env!("OUT_DIR"), "/trusted_keys.rs"));

@@ -20,10 +20,10 @@ SHA-256 of the tarball. The signature file holds an Ed25519 signature over the
 exact bytes of the checksum file.
 
 The device trusts a fixed list of Ed25519 public keys compiled into
-`photo-frame-update` (`TRUSTED_KEYS` in `src/update/keys.rs`). Each key has a
-short ID such as `2026-10`. The signature envelope names the key ID; the updater
-looks that ID up in the compiled list, verifies the signature against the raw
-32-byte public key, and refuses the bundle if the ID is unknown.
+`photo-frame-update` from `packaging/update-keys/*.pub`. Each key has a short ID
+taken from its filename, such as `2026-10`. The signature envelope names the key
+ID; the updater looks that ID up in the compiled list, verifies the signature
+against the raw 32-byte public key, and refuses the bundle if the ID is unknown.
 
 The compiled list starts empty on purpose. A build with no pinned key refuses
 every install. Adding a key and rebuilding the tool is a required provisioning
@@ -377,32 +377,31 @@ volume, never in the repository and never on the frame. Back it up. A lost key
 cannot sign anything the device will accept; recovery means a second trusted key
 or a reflash.
 
-Derive the raw public key. The last 32 bytes of the DER SubjectPublicKeyInfo are
-the key itself:
+Derive the public key and write it to `packaging/update-keys/<key-id>.pub`:
 
 ```bash
-openssl pkey -in update-signing-2026-10.pem -pubout -outform DER \
-  | tail -c 32 | xxd -p -c 32
+scripts/openssh-public-key.sh update-signing-2026-10.pem 2026-10 \
+  > packaging/update-keys/2026-10.pub
 ```
 
-Add those bytes to the compiled list in `src/update/keys.rs`. The struct field is
-`bytes`:
+The file contains one standard OpenSSH public-key line:
 
-```rust
-pub const TRUSTED_KEYS: &[TrustedKey] = &[
-    TrustedKey {
-        id: "2026-10",
-        bytes: [
-            0x9f, 0x2c, 0x1d, /* … 32 bytes total … */
-        ],
-    },
-];
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... 2026-10
 ```
+
+The filename without `.pub` is the key ID. `build.rs` parses every `*.pub` file
+in that directory and compiles the raw 32-byte keys into `photo-frame-update`;
+there is no hex array to edit and no runtime key-file lookup. Commit only the
+`.pub` file. Multiple `.pub` files mean multiple trusted IDs.
+
+The private key stays in PEM form because `scripts/sign-checksum.sh` uses it
+with OpenSSL. The public file is the easier-to-inspect OpenSSH form.
 
 Rebuild `photo-frame-update` and include the rebuilt binary in the release
-bundle. The trusted set lives in the binary, so adding a key is a code change
-plus a rebuild, not a file drop. There is no public-key file installed by apt and
-no key directory to edit.
+bundle. The trusted set lives in the binary, so adding a key is a file addition
+plus a rebuild, not an installed key file. There is no public-key file installed
+by apt and no key directory used at runtime.
 
 The fingerprint to compare against the signing machine is the SHA-256 of the same
 32 bytes:
@@ -478,9 +477,9 @@ The release tag and `Cargo.toml` use `X.Y.Z`. Builds use
 
 ### Before the first release
 
-1. Generate the update key and pin its public key in `src/update/keys.rs`
-   (section 5). Rebuild so both the `.deb` and the bundle contain an updater
-   that trusts it.
+1. Generate the update key and add its `packaging/update-keys/<key-id>.pub`
+   file (section 5). Rebuild so both the `.deb` and the bundle contain an
+   updater that trusts it.
 2. Configure the `release-signing` environment (see
    [Workflow behavior](#workflow-behavior)). Until the public key is pinned,
    every `photo-frame-update install` fails closed.
@@ -652,8 +651,8 @@ inside a release the old key signed, and removes the old key only after the
 device has installed that release.
 
 1. Generate a new key pair and give it a new ID, for example `2027-04`.
-2. Add the new public key bytes to `TRUSTED_KEYS` in `src/update/keys.rs`,
-   keeping the old entry. Rebuild `photo-frame-update`.
+2. Add its `packaging/update-keys/2027-04.pub` file, keeping the old entry.
+   Rebuild `photo-frame-update`.
 3. Build a bundle containing the new updater with both keys.
 4. Sign that bundle with the **old** key and publish it as usual.
 5. Install it on the device. `photo-frame-update keys` now prints both IDs.
@@ -662,8 +661,9 @@ device has installed that release.
 7. Sign subsequent releases with the new key. Devices that installed step 4
    accept them. A device that skipped step 4 cannot verify them and stays on its
    current release, which is the intended fail-closed behavior.
-8. After the overlap, build and sign a release that removes the old entry from
-   `TRUSTED_KEYS`. Devices that install it now trust only the new key.
+8. After the overlap, build and sign a release that deletes the old
+   `packaging/update-keys/<key-id>.pub` file. Devices that install it now trust
+   only the new key.
 9. Retire the old private key.
 
 The overlap exists because a device can only learn a new key from a release it
@@ -680,8 +680,8 @@ release from yours.
 
 - Remove the key from the `release-signing` environment and rotate the secret.
 - Treat every artifact signed after the suspected leak as hostile.
-- If a second, offline-held key is already in `TRUSTED_KEYS`, use it to sign a
-  recovery release that installs a clean key list.
+- If a second, offline-held key is already in `packaging/update-keys/`, use it
+  to sign a recovery release that installs a clean key list.
 - Otherwise, reflash the device from a known-good SD card and install a freshly
   signed release.
 
@@ -697,11 +697,11 @@ reflash with a new key list.
 
 ### Recovery key
 
-There is no dedicated recovery mode in `photo-frame-update`. A second key ID in
-`TRUSTED_KEYS`, with its private half kept offline and never added to CI, is an
-optional manual recovery mechanism: add it ahead of time, then use it to sign a
-release that installs a clean key list if the CI key is lost or leaked. This is
-not implemented as a separate feature. If you do not provision a second key, the
+There is no dedicated recovery mode in `photo-frame-update`. A second `.pub`
+file, with its private half kept offline and never added to CI, is an optional
+manual recovery mechanism: add it ahead of time, then use it to sign a release
+that installs a clean key list if the CI key is lost or leaked. This is not
+implemented as a separate feature. If you do not provision a second key, the
 only path back is a reflash.
 
 ### Reflash fallback
@@ -907,7 +907,7 @@ The operational logs stay on tmpfs and are lost on reboot:
 
 | Message | Cause |
 |---------|-------|
-| `no trusted update keys are baked into this build; refusing to verify` | `TRUSTED_KEYS` is empty. Add a key and rebuild the updater. |
+| `no trusted update keys are baked into this build; refusing to verify` | `packaging/update-keys/` is empty. Add a `.pub` file and rebuild the updater. |
 | `signature key id '…' is not trusted by this build` | The bundle was signed with a key this build does not have, usually a rotation that has not shipped. |
 | `signature verification failed for key '…'` | Wrong key or a corrupted `.sha256.sig`. |
 | `SHA-256 mismatch for …` | The tarball does not match the `.sha256` file, or `--sha256` was wrong. |

@@ -663,12 +663,12 @@ self-hosted runner the build cannot reach.
 ### 7.3 Distribution and pinning
 
 - The public keys are **compiled into `photo-frame-update`** as a table keyed by
-  key ID, for example `TRUSTED_KEYS` in `src/update/keys.rs`. The field is
-  `bytes`.
-- The bytes are the 32-byte raw Ed25519 public key, not PEM or DER. Get them with
-  `openssl pkey -pubout -outform DER | tail -c 32`.
-- No public-key file is installed by apt, no keyring is read at runtime, and
-  nothing under `/etc/photo-frame` participates in verification.
+  key ID, generated from `packaging/update-keys/<key-id>.pub`. Each file is a
+  standard OpenSSH `ssh-ed25519` public key; `build.rs` parses it and emits
+  `TRUSTED_KEYS` with the raw 32 bytes.
+- The `.pub` files are public. No public-key file is installed by apt, no keyring
+  is read at runtime, and nothing under `/etc/photo-frame` participates in
+  verification.
 - `photo-frame-update` ships inside the release bundle, so the trusted key set
   travels with the app. Adding or removing a key requires rebuilding the tool.
 - The `.sha256.sig` envelope carries `key_id`; the updater looks that ID up and
@@ -681,13 +681,14 @@ self-hosted runner the build cannot reach.
 
 Rotation is a sequence of releases, not a single switch:
 
-1. Generate the new key and add its public half to `TRUSTED_KEYS` alongside the
-   old one. Rebuild `photo-frame-update`.
+1. Generate the new key and add its `.pub` file to `packaging/update-keys/`
+   alongside the old one. Rebuild `photo-frame-update`.
 2. Ship a release signed by the **old** key that contains the new updater.
 3. Let the device install that release, so it now trusts both keys.
 4. Replace the CI environment secrets with the new key.
 5. Sign subsequent releases with the new key.
-6. Ship a later release, signed with the new key, that removes the old entry.
+6. Ship a later release, signed with the new key, that removes the old `.pub`
+   file.
 7. Retire the old private key.
 
 The overlap exists because a device can only learn a new key from a release it
@@ -706,9 +707,10 @@ Use a second trusted key or reflash.
 - **Compromised key:** anything signed after the leak is suspect. Remove the key
   from CI, rotate the environment secrets, and recover with a second trusted key
   or a reflash. There is no online revocation and no expiry date to fall back on.
-- **Recovery key (optional):** there is no dedicated recovery mode. A second key
-  baked into `TRUSTED_KEYS` and held offline is the mechanism you can use. If it
-  is skipped, say so, because the only remaining path is a reflash.
+- **Recovery key (optional):** there is no dedicated recovery mode. A second
+  `.pub` file in `packaging/update-keys/`, with its private key held offline, is
+  the mechanism you can use. If it is skipped, say so, because the only
+  remaining path is a reflash.
 - **No expiry:** a key stays trusted until a release removes it. Expiry would
   create a new failure mode (a device with a wrong clock refusing updates) with
   no matching benefit, since the key can be removed explicitly.
@@ -986,11 +988,11 @@ Not scheduled. Kept here only so the analysis is not lost.
   three binaries, plus `.sha256` and `.sha256.sig` sidecars. The signature is
   Ed25519 over the checksum bytes, in a JSON envelope naming the key ID. No
   certificate, no expiry, no CA, no network.
-- **Public keys are compiled into `photo-frame-update`** as `TrustedKey { id,
-  bytes }` entries in `src/update/keys.rs`. The list starts empty and refuses
-  every install until a key is added and the tool is rebuilt. No key file is
-  installed by apt and nothing in `/etc` participates in verification. The tool
-  ships inside the release bundle.
+- **Public keys are compiled into `photo-frame-update`** from
+  `packaging/update-keys/*.pub`. The directory starts empty and refuses every
+  install until a key is added and the tool is rebuilt. No key file is installed
+  by apt and nothing in `/etc` participates in verification. The tool ships
+  inside the release bundle.
 - **Transports:** a local path (sidecars required in the same directory, optional
   `--sha256`) and an HTTPS URL (required `--sha256`; plain HTTP and HTTPS-to-HTTP
   redirects refused).

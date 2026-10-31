@@ -39,6 +39,9 @@ ed25519-dalek = "2"
 sha2 = "0.10"
 tar = "0.4"
 
+[build-dependencies]
+base64 = "0.22"
+
 [package.metadata.deb]
 maintainer = "Daniel Mikusa <dan@mikusa.com>"
 section = "graphics"
