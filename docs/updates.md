@@ -482,8 +482,15 @@ The release tag and `Cargo.toml` use `X.Y.Z`. Builds use
    (section 5). Rebuild so both the `.deb` and the bundle contain an updater
    that trusts it.
 2. Configure the `release-signing` environment (see
-   [Workflow behavior](#workflow-behavior)). Until the public key is pinned,
-   every `photo-frame-update install` fails closed.
+   [Workflow behavior](#workflow-behavior)). Add the private key as an
+   environment secret, not a repository secret:
+   ```bash
+   gh secret set UPDATE_SIGNING_KEY --env release-signing \
+     < update-signing-2026-10.pem
+   gh secret set UPDATE_SIGNING_KEY_ID --env release-signing --body 2026-10
+   ```
+   The environment must already exist. Until the public key is pinned, every
+   `photo-frame-update install` fails closed.
 3. Configure the repository settings used by the bump workflow:
    - `RENOVATE_TOKEN` secret with Contents and Pull requests write access.
    - Auto-merge enabled.
@@ -618,8 +625,8 @@ The `release-signing` environment must be configured before the first run:
 3. Restrict deployment to protected branches or tags as appropriate for the
    repository. The workflow is manual, so the environment is the only gate.
 4. Add `UPDATE_SIGNING_KEY` as an environment secret holding the PEM private key.
-5. Add `UPDATE_SIGNING_KEY_ID` as an environment secret or variable holding the
-   key ID, for example `2026-10`.
+5. Add `UPDATE_SIGNING_KEY_ID` as an environment secret holding the key ID, for
+   example `2026-10`.
 6. Pin every action to a full commit SHA. The workflow already pins
    `actions/checkout`.
 
