@@ -445,32 +445,167 @@ start of `install`; to exercise a signature without touching the real install,
 point the tool at a throwaway root and state directory with `--root`,
 `--state-dir`, `--log`, and `--no-restart`.
 
-## 6. Building and signing a release
+## 6. Cutting, building, and signing a release
 
-The release process is manual. Nothing in CI builds or uploads the update bundle
-today.
+The release process is split between GitHub Actions and manual steps. CI builds
+and uploads the `.deb` packages; the update bundle and its signature are manual.
+The short version is: bump the version, create the release, let CI attach the
+`.deb` files, build and upload the bundle, run the signing workflow, then verify
+on a device.
 
-1. Build and upload the bundle and its checksum:
+The `.deb` package and the update bundle are different artifacts with different
+version strings:
 
-   ```bash
-   make update-bundle VERSION=0.2.0 SEQUENCE=7
-   gh release upload v0.2.0 \
-     dist/update/photo-frame-0.2.0-arm64.tar.gz \
-     dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
-   ```
+- The `.deb` is the initial install path. Its version is `X.Y.Z-<short-sha>`;
+  it seeds a release at sequence 0.
+- The update bundle is the app-update path. Its version is normally `X.Y.Z`;
+  its sequence is the value passed to `make update-bundle`.
 
-2. Run the **Sign Release Checksums** workflow manually
-   (`.github/workflows/sign.yml`) with the release tag, for example `v0.2.0`.
+Both are valid release directory names. The first bundle install records the
+seeded `.deb` release as `previous`.
 
-3. The workflow downloads every `*.sha256` asset from the release, signs each
-   one with `scripts/sign-checksum.sh`, and uploads the resulting `*.sha256.sig`
-   assets with `--clobber`.
+### Before the first release
 
-There is no build→sign→publish chain in the repository. `.github/workflows/build.yml`
-still only builds `.deb` packages; it does not produce an update bundle or a
-checksum. The owner has to build and upload the bundle and `.sha256` before the
-signing workflow has anything to sign. Putting unrelated `.sha256` assets on the
-release will make the workflow sign them too, which is harmless but noisy.
+1. Generate the update key and pin its public key in `src/update/keys.rs`
+   (section 5). Rebuild so both the `.deb` and the bundle contain an updater
+   that trusts it.
+2. Configure the `release-signing` environment (see
+   [Workflow behavior](#workflow-behavior)). Until the public key is pinned,
+   every `photo-frame-update install` fails closed.
+
+### 1. Choose the version and sequence
+
+- Pick the release version `X.Y.Z`. It must match `version` in `Cargo.toml` and
+  the release tag `vX.Y.Z`.
+- Pick a sequence `N` greater than the last published sequence. Sequence 0 is
+  reserved for the `.deb` seed. The sequence is not derived from the version,
+  so keep a record of the last one used.
+
+### 2. Bump and merge
+
+Set `version = "X.Y.Z"` in `Cargo.toml` and merge the change to `main`.
+`.github/workflows/build.yml` computes the full `.deb` version
+`X.Y.Z-<short-sha>`, builds `amd64` and `arm64` packages, and uploads them to the
+release.
+
+### 3. Create the release and attach the `.deb` files
+
+`build.yml` uploads to an **existing** release; it does not create the tag or
+release. After the merge, create a draft release at that commit:
+
+```bash
+gh release create v0.2.0 --draft --target "$(git rev-parse HEAD)" \
+  --title "v0.2.0" --notes-file release-notes.md
+```
+
+If the push-triggered build already ran and failed at its release step because
+the release did not exist, rerun that workflow run after creating the release:
+
+```bash
+gh run list --workflow=build.yml --limit 5
+gh run rerun <run-id>
+```
+
+`build.yml` has no `workflow_dispatch` trigger, so use **Re-run jobs** in
+GitHub Actions or `gh run rerun`; `gh workflow run build.yml` will not work.
+
+### 4. Build the update bundle on arm64 Linux
+
+The bundle must contain Linux `arm64` binaries. `make update-bundle` calls the
+host C and Rust compilers; `ARCH` only labels the manifest and filename, it does
+not cross-compile. Do this on an arm64 Linux host, container, or runner, from
+the same tag:
+
+```bash
+git checkout v0.2.0
+make update-bundle VERSION=0.2.0 SEQUENCE=7 ARCH=arm64
+```
+
+That writes:
+
+```text
+dist/update/photo-frame-0.2.0-arm64.tar.gz
+dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
+```
+
+This build is not currently automated. Running it on macOS or an x86 host
+produces the wrong binaries even if `ARCH=arm64`.
+
+### 5. Upload the bundle and checksum
+
+```bash
+gh release upload v0.2.0 \
+  dist/update/photo-frame-0.2.0-arm64.tar.gz \
+  dist/update/photo-frame-0.2.0-arm64.tar.gz.sha256
+```
+
+The release can be a draft at this point. Do not upload the signature by hand;
+the signing workflow produces it.
+
+### 6. Sign the checksums
+
+Run the **Sign Release Checksums** workflow (`.github/workflows/sign.yml`) with
+the release tag, from the Actions UI or:
+
+```bash
+gh workflow run sign.yml -f tag=v0.2.0
+```
+
+Approve the `release-signing` environment deployment when prompted. The workflow
+downloads every `*.sha256` asset from the release, signs each one with
+`scripts/sign-checksum.sh`, and uploads the resulting `*.sha256.sig` assets with
+`--clobber`.
+
+Putting unrelated `.sha256` assets on the release will make the workflow sign
+them too, which is harmless but noisy.
+
+### 7. Verify the release
+
+Confirm the release has the expected assets:
+
+```bash
+gh release view v0.2.0 --json assets --jq '.assets[].name'
+```
+
+Expect both `.deb` files, the bundle, the bundle's `.sha256`, and the
+`.sha256.sig`. On a test device, install the HTTPS bundle and then check status
+and rollback:
+
+```bash
+SHA=$(awk '{print $1}' photo-frame-0.2.0-arm64.tar.gz.sha256)
+sudo photo-frame-update install \
+  https://github.com/dmikusa/digital-picture-frame/releases/download/v0.2.0/photo-frame-0.2.0-arm64.tar.gz \
+  --sha256 "$SHA"
+sudo photo-frame-update status
+sudo photo-frame-update list
+```
+
+The install must pass verification, activate, and pass the 30-second health
+check. If it fails, the previous release should still be active.
+
+### 8. Publish and roll out
+
+If the release is a draft, publish it after the assets and signature are
+verified:
+
+```bash
+gh release edit v0.2.0 --draft=false
+```
+
+Install it on the frame using the same HTTPS command with the hash from the
+published `.sha256` file. Keep the previous release on disk; `photo-frame-update
+rollback` returns to it. Record the sequence used so the next release uses a
+higher one.
+
+### Current automation gaps
+
+There is no build→sign→publish chain in the repository. The manual steps above
+exist because:
+
+- `.github/workflows/build.yml` only builds and uploads `.deb` packages.
+- It does not create the release, and it has no manual-dispatch trigger.
+- Nothing builds the update bundle or chooses the monotonic sequence.
+- `.github/workflows/sign.yml` is deliberately manual and environment-gated.
 
 ### Workflow behavior
 
